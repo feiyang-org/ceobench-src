@@ -55,6 +55,10 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                        value = value[1:-1]
                     env_vars[key] = value
     return env_vars
 
@@ -180,10 +184,9 @@ class BashAgentRunner:
         env_file = Path(__file__).parent.parent.parent.parent.parent / ".env"
         env_vars = load_env_file(env_file)
 
-        for key in ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION',
-                    'AWS_SESSION_TOKEN', 'NMDB_KEY']:
-            if key in env_vars and key not in os.environ:
-                os.environ[key] = env_vars[key]
+        for key, value in env_vars.items():
+            if key not in os.environ:
+                os.environ[key] = value
 
         # The .nmdb session database is SQLCipher-encrypted. The engine resolves
         # the key from saas_bench._embedded_key (committed in the source tree
@@ -215,6 +218,10 @@ class BashAgentRunner:
             self.api_key = env_vars.get("MODAL_API_KEY") or os.environ.get("MODAL_API_KEY")
         elif self.provider == "together":
             self.api_key = env_vars.get("TOGETHER_API_KEY") or os.environ.get("TOGETHER_API_KEY")
+        elif self.provider == "deepseek":
+            self.api_key = env_vars.get("DEEPSEEK_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+        elif self.provider == "opencode":
+            self.api_key = env_vars.get("OPENCODE_API_KEY") or os.environ.get("OPENCODE_API_KEY")
         elif self.provider == "ai_sandbox":
             self.api_key = env_vars.get("AI_SANDBOX_KEY") or os.environ.get("AI_SANDBOX_KEY")
         else:
@@ -233,6 +240,10 @@ class BashAgentRunner:
             self.base_url = os.environ.get("MODAL_BASE_URL")
         elif self.provider == "together":
             self.base_url = "https://api.together.xyz/v1"
+        elif self.provider == "deepseek":
+            self.base_url = "https://api.deepseek.com"
+        elif self.provider == "opencode":
+            self.base_url = "https://opencode.ai/zen/go/v1"
         else:
             self.base_url = None
 
@@ -549,6 +560,12 @@ __pycache__/
         """Environment for host-side simulator processes."""
         env = os.environ.copy()
         env["NOVAMIND_SERVER_MODE"] = "1"
+        # DeepSeek / OpenCode agent runs keep the simulator on official DeepSeek
+        # so social/enterprise LLM calls do not require Anthropic and do not
+        # burn the OpenCode Go subscription quota.
+        if self.provider in ("deepseek", "opencode"):
+            env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", "deepseek")
+            env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", "deepseek-v4-flash")
         return env
 
     def _launch_server(self):
@@ -1381,7 +1398,7 @@ def main():
     parser.add_argument("--model", default=None,
                         help=f"Model name (default: BenchmarkConfig.agent_llm_model={default_config.agent_llm_model})")
     parser.add_argument("--provider", default=None,
-                        choices=["openai", "xai", "google", "anthropic", "bedrock", "modal", "together", "ai_sandbox"],
+                        choices=["openai", "xai", "google", "anthropic", "bedrock", "modal", "together", "deepseek", "opencode", "ai_sandbox"],
                         help=f"API provider (default: BenchmarkConfig.agent_llm_provider={default_config.agent_llm_provider})")
     parser.add_argument("--base-url", help="Custom API base URL")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")

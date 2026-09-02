@@ -157,12 +157,15 @@ AWS_REGION="us-east-2"
 ```
 
 Other providers read `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`,
-`XAI_API_KEY`, `TOGETHER_API_KEY`, or `MODAL_TOKEN_*`. No `NMDB_KEY` is needed:
-the SQLCipher key is embedded in the engine.
+`XAI_API_KEY`, `TOGETHER_API_KEY`, `DEEPSEEK_API_KEY`, `OPENCODE_API_KEY`,
+or `MODAL_TOKEN_*`. No `NMDB_KEY` is needed: the SQLCipher key is embedded
+in the engine.
 
 If you configure simulator LLMs to use direct `anthropic` or `openai`, export
 `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in the shell before running. The
-simulator does not receive the agent-only `--api-key`.
+simulator does not receive the agent-only `--api-key`. DeepSeek / OpenCode
+agent runs automatically point the simulator at official DeepSeek
+(`deepseek-v4-flash`, thinking off) so they do not need Anthropic.
 
 **3. Run.** `public/` ships prebuilt, so there is no build step:
 
@@ -175,6 +178,23 @@ uv run python -m saas_bench.agents.bash_agent.run_test \
     --days 500 \
     --workspace bash_agent_runs
 ```
+
+DeepSeek V4 Flash (thinking off) via the official API or OpenCode Go:
+
+```bash
+# Official DeepSeek
+uv run python -m saas_bench.agents.bash_agent.run_test \
+    --provider deepseek --model deepseek-v4-flash \
+    --reasoning-effort none --days 7 --seed 42 --workspace deepseek_runs
+
+# OpenCode Go (same model; simulator still uses official DeepSeek)
+uv run python -m saas_bench.agents.bash_agent.run_test \
+    --provider opencode --model deepseek-v4-flash \
+    --reasoning-effort none --days 7 --seed 42 --workspace deepseek_runs
+```
+
+Or `bash scripts/start_deepseek_flash_smoke.sh official` / `opencode`.
+`--days` rounds down to a whole week, so use at least 7.
 
 **4. Output.** Each run lands at `bash_agent_runs/run_<id>/`: `world.nmdb`
 (encrypted ledger), `config.json`, `checkpoint.json`, `agent_workspace/` (the

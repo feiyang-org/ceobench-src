@@ -80,7 +80,12 @@ class BashAgent(BaseAgent):
         # forwards to OpenAI for gpt-* models so /v1/responses works there too —
         # in fact, gpt-5.x with reasoning_effort + tools REQUIRES /v1/responses.
         base_url = str(getattr(client, 'base_url', '') or '')
-        _non_responses_hosts = ('generativelanguage.googleapis.com', 'api.together.xyz')
+        _non_responses_hosts = (
+            'generativelanguage.googleapis.com',
+            'api.together.xyz',
+            'api.deepseek.com',
+            'opencode.ai',
+        )
         self.supports_responses_api = not any(h in base_url for h in _non_responses_hosts)
 
         # Build system prompt
@@ -449,11 +454,15 @@ class BashAgent(BaseAgent):
             print(f"[snapshot] WARN failed to load conversation snapshot: {e}")
             return False
 
+    def _wants_reasoning(self) -> bool:
+        """True when a non-empty reasoning effort other than 'none' is set."""
+        return bool(self.reasoning_effort) and self.reasoning_effort != 'none'
+
     def _call_llm(self) -> Optional[Action]:
         """Call the LLM and parse the response into an action."""
         if self.use_anthropic:
             return self._call_anthropic()
-        elif self.reasoning_effort and self.supports_responses_api:
+        elif self._wants_reasoning() and self.supports_responses_api:
             return self._call_openai_responses()
         else:
             return self._call_openai()
@@ -498,17 +507,26 @@ class BashAgent(BaseAgent):
             ]
 
             try:
+                _base_url = str(getattr(self.client, 'base_url', '') or '')
+                _is_together = 'api.together.xyz' in _base_url
+                _is_together_deepseek = _is_together and 'deepseek' in self.model.lower()
+                _is_deepseek_compat = (
+                    'api.deepseek.com' in _base_url or 'opencode.ai' in _base_url
+                )
                 api_kwargs = {
                     'model': self.model,
                     'messages': messages,
                     'tools': tools,
                     'tool_choice': 'auto',
-                    'max_completion_tokens': 16384,
                     'temperature': 1.0,
                 }
-                _is_together = 'api.together.xyz' in (str(getattr(self.client, 'base_url', '') or ''))
-                _is_together_deepseek = _is_together and 'deepseek' in self.model.lower()
-                if self.reasoning_effort:
+                # OpenAI-compat gateways (DeepSeek, OpenCode Go) reject
+                # max_completion_tokens; native OpenAI accepts both.
+                if _is_deepseek_compat:
+                    api_kwargs['max_tokens'] = 16384
+                else:
+                    api_kwargs['max_completion_tokens'] = 16384
+                if self._wants_reasoning():
                     api_kwargs['reasoning_effort'] = self.reasoning_effort
                 if _is_together_deepseek:
                     # Together's DeepSeek-V4 thinking is gated on the chat-template flag,
@@ -516,6 +534,14 @@ class BashAgent(BaseAgent):
                     # 500 for medium, and silently ignores for low/high). The flag below
                     # produces real chain-of-thought in `message.reasoning`.
                     api_kwargs['extra_body'] = {'chat_template_kwargs': {'thinking': True}}
+                elif _is_deepseek_compat:
+                    # V4 Flash/Pro default thinking ON. Smoke runs disable it.
+                    # Official DeepSeek honors extra_body; OpenCode Go also needs
+                    # reasoning_effort=none or it still emits reasoning_content.
+                    thinking_type = 'enabled' if self._wants_reasoning() else 'disabled'
+                    api_kwargs['extra_body'] = {'thinking': {'type': thinking_type}}
+                    if not self._wants_reasoning():
+                        api_kwargs['reasoning_effort'] = 'none'
 
                 # Set hard wall-clock timeout via signal.alarm
                 old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)

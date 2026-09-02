@@ -196,7 +196,82 @@ class CustomerSimulator:
             return self.anthropic_client
         raise ValueError(
             f"social_post_client only supports 'bedrock' or 'anthropic'; got {provider!r}. "
-            f"For OpenAI, dispatch via self.client.responses.create()."
+            f"Use complete_text() for openai/deepseek providers."
+        )
+
+    def complete_text(
+        self,
+        *,
+        provider: str,
+        model: str,
+        user: str,
+        max_tokens: int,
+        temperature: float = 0.7,
+        system: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> tuple:
+        """Single-turn completion. Returns (text, input_tokens, output_tokens)."""
+        if provider in ("bedrock", "anthropic"):
+            client = self.bedrock_client if provider == "bedrock" else self.anthropic_client
+            kwargs = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "messages": [{"role": "user", "content": user}],
+            }
+            if system:
+                kwargs["system"] = system
+            response = client.messages.create(**kwargs)
+            return (
+                response.content[0].text.strip(),
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+            )
+
+        if provider == "deepseek":
+            if self.client is None:
+                raise RuntimeError("DeepSeek simulator client is not configured")
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": user})
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            text = (response.choices[0].message.content or "").strip()
+            usage = response.usage
+            return (
+                text,
+                getattr(usage, "prompt_tokens", 0) or 0,
+                getattr(usage, "completion_tokens", 0) or 0,
+            )
+
+        # OpenAI Responses API fallback
+        if self.client is None:
+            raise RuntimeError("OpenAI simulator client is not configured")
+        effort = reasoning_effort or "low"
+        response = self.client.responses.create(
+            model=model,
+            reasoning={"effort": effort},
+            input=(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+                if system
+                else [{"role": "user", "content": user}]
+            ),
+            max_output_tokens=max_tokens,
+        )
+        usage = response.usage
+        return (
+            (response.output_text or "").strip(),
+            getattr(usage, "input_tokens", 0) or 0,
+            getattr(usage, "output_tokens", 0) or 0,
         )
 
     def set_event_logger(self, event_logger):
@@ -509,35 +584,14 @@ Output ONLY the post text, nothing else."""
                 output_tokens=0,
             )
 
-        if social_provider in ("bedrock", "anthropic"):
-            # Bedrock or direct Anthropic — both share the .messages.create() API
-            response = self.social_post_client.messages.create(
-                model=social_model,
-                max_tokens=self.config.social_post_llm_max_tokens,
-                temperature=social_temperature,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_prompt}
-                ],
-            )
-            post_text = response.content[0].text.strip()
-            input_tokens = response.usage.input_tokens
-            output_tokens = response.usage.output_tokens
-        else:
-            # Fallback to OpenAI
-            print(f"[WARN] Social post using OpenAI fallback (provider={social_provider}, model={social_model}). Set social_post_llm_provider='bedrock' or 'anthropic' for Haiku 4.5.")
-            response = self.client.responses.create(
-                model=social_model,
-                reasoning={"effort": "low"},
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_output_tokens=1000,
-            )
-            post_text = response.output_text.strip()
-            input_tokens = response.usage.input_tokens
-            output_tokens = response.usage.output_tokens
+        post_text, input_tokens, output_tokens = self.complete_text(
+            provider=social_provider,
+            model=social_model,
+            system=system_prompt,
+            user=user_prompt,
+            max_tokens=self.config.social_post_llm_max_tokens,
+            temperature=social_temperature,
+        )
 
         # Debug: Log if empty response
         if not post_text:
@@ -745,36 +799,15 @@ Output JSON:
         enterprise_provider = self.config.enterprise_llm_provider
 
         try:
-            if enterprise_provider in ("bedrock", "anthropic"):
-                # Bedrock and direct Anthropic share the .messages.create() API.
-                client = self.bedrock_client if enterprise_provider == "bedrock" else self.anthropic_client
-                response = client.messages.create(
-                    model=enterprise_model,
-                    max_tokens=self.config.enterprise_llm_max_tokens,
-                    temperature=self.config.enterprise_llm_temperature,
-                    system=system_prompt,
-                    messages=[
-                        {"role": "user", "content": user_prompt}
-                    ],
-                )
-                response_text = response.content[0].text.strip()
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
-            else:
-                # Fallback to OpenAI
-                print(f"[WARN] Negotiation response using OpenAI fallback (provider={enterprise_provider}, model={enterprise_model}). Set enterprise_llm_provider='bedrock' or 'anthropic' for Sonnet 4.5.")
-                response = self.client.responses.create(
-                    model=enterprise_model,
-                    reasoning={"effort": self.reasoning_effort},
-                    input=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    max_output_tokens=300
-                )
-                response_text = response.output_text.strip()
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
+            response_text, input_tokens, output_tokens = self.complete_text(
+                provider=enterprise_provider,
+                model=enterprise_model,
+                system=system_prompt,
+                user=user_prompt,
+                max_tokens=self.config.enterprise_llm_max_tokens,
+                temperature=self.config.enterprise_llm_temperature,
+                reasoning_effort=self.reasoning_effort,
+            )
 
             self._log_cost(day, 'customer_negotiation', input_tokens, output_tokens, model=enterprise_model)
 
@@ -901,36 +934,15 @@ Output ONLY the message text."""
         enterprise_provider = self.config.enterprise_llm_provider
 
         try:
-            if enterprise_provider in ("bedrock", "anthropic"):
-                # Bedrock and direct Anthropic share the .messages.create() API.
-                client = self.bedrock_client if enterprise_provider == "bedrock" else self.anthropic_client
-                response = client.messages.create(
-                    model=enterprise_model,
-                    max_tokens=150,
-                    temperature=self.config.enterprise_llm_temperature,
-                    system=system_prompt,
-                    messages=[
-                        {"role": "user", "content": "Write your initial outreach message."}
-                    ],
-                )
-                text = response.content[0].text.strip()
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
-            else:
-                # Fallback to OpenAI
-                print(f"[WARN] Initial outreach using OpenAI fallback (provider={enterprise_provider}, model={enterprise_model}). Set enterprise_llm_provider='bedrock' or 'anthropic' for Sonnet 4.5.")
-                response = self.client.responses.create(
-                    model=enterprise_model,
-                    reasoning={"effort": self.reasoning_effort},
-                    input=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": "Write your initial outreach message."}
-                    ],
-                    max_output_tokens=150
-                )
-                text = response.output_text.strip()
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
+            text, input_tokens, output_tokens = self.complete_text(
+                provider=enterprise_provider,
+                model=enterprise_model,
+                system=system_prompt,
+                user="Write your initial outreach message.",
+                max_tokens=150,
+                temperature=self.config.enterprise_llm_temperature,
+                reasoning_effort=self.reasoning_effort,
+            )
 
             self._log_cost(day, 'customer_initial_outreach', input_tokens, output_tokens, model=enterprise_model)
 
@@ -1034,7 +1046,7 @@ def generate_churn_message(
 # =========================================================================
 
 def judge_agent_social_post(
-    bedrock_client,
+    simulator,
     config,
     post_content: str,
     group_id: str,
@@ -1047,10 +1059,10 @@ def judge_agent_social_post(
 ) -> tuple:
     """Judge an agent's social media post from a specific customer group's perspective.
 
-    Uses Haiku 4.5 on Bedrock. Returns (effect, reasoning) where effect is [-1.0, 1.0].
+    Returns (effect, reasoning) where effect is [-1.0, 1.0].
 
     Args:
-        bedrock_client: AnthropicBedrock client
+        simulator: CustomerSimulator used for the completion
         config: BenchmarkConfig
         post_content: The agent's post text
         group_id: Customer group being judged from
@@ -1131,16 +1143,13 @@ SCORE: <number between -1.0 and 1.0>
 REASON: <one sentence why>"""
 
     social_model = config.social_post_llm_model
-    response = bedrock_client.messages.create(
+    text, input_tokens, output_tokens = simulator.complete_text(
+        provider=config.social_post_llm_provider,
         model=social_model,
+        user=prompt,
         max_tokens=100,
         temperature=0.3,
-        messages=[{"role": "user", "content": prompt}],
     )
-
-    text = response.content[0].text.strip()
-    input_tokens = response.usage.input_tokens
-    output_tokens = response.usage.output_tokens
 
     # Parse structured response: "SCORE: <number>\nREASON: <text>"
     effect = 0.0
@@ -1158,7 +1167,7 @@ REASON: <one sentence why>"""
 
 
 def generate_customer_reply_to_agent(
-    bedrock_client,
+    simulator,
     config,
     agent_post_content: str,
     group_id: str,
@@ -1172,7 +1181,7 @@ def generate_customer_reply_to_agent(
     Only called for viral reactions (|effect| >= threshold).
 
     Args:
-        bedrock_client: AnthropicBedrock client
+        simulator: CustomerSimulator used for the completion
         config: BenchmarkConfig
         agent_post_content: The agent's post text
         group_id: Customer group replying
@@ -1209,15 +1218,13 @@ The NovaMind CEO posted:
 Your reaction is {sentiment_desc} (score: {effect_score:.2f}). Write ONLY the reply tweet. Nothing else. Keep it SHORT — real people don't write essays in tweet replies. Do not include any meta-commentary or explanation."""
 
     social_model = config.social_post_llm_model
-    response = bedrock_client.messages.create(
+    text, input_tokens, output_tokens = simulator.complete_text(
+        provider=config.social_post_llm_provider,
         model=social_model,
+        user=prompt,
         max_tokens=150,
         temperature=0.9,
-        messages=[{"role": "user", "content": prompt}],
     )
-
-    text = response.content[0].text.strip()
-    # Clean up any quotes/formatting artifacts
     text = text.strip('"').strip("'").strip()
 
-    return text, response.usage.input_tokens, response.usage.output_tokens
+    return text, input_tokens, output_tokens

@@ -125,7 +125,16 @@ def _resolve_session(base: Path, session_id: Optional[str]) -> str:
 
 def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
     """Validate and serialize simulator-side LLM provider/model config."""
-    valid_providers = {"bedrock", "anthropic", "openai"}
+    override_provider = os.environ.get("CEOBENCH_SIMULATOR_LLM_PROVIDER")
+    override_model = os.environ.get("CEOBENCH_SIMULATOR_LLM_MODEL")
+    if override_provider:
+        config.social_post_llm_provider = override_provider
+        config.enterprise_llm_provider = override_provider
+    if override_model:
+        config.social_post_llm_model = override_model
+        config.enterprise_llm_model = override_model
+
+    valid_providers = {"bedrock", "anthropic", "openai", "deepseek"}
     for attr in ("social_post_llm_provider", "enterprise_llm_provider"):
         provider = getattr(config, attr)
         if provider not in valid_providers:
@@ -154,6 +163,17 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
         )
         sys.exit(1)
 
+    if (
+        config.social_post_llm_provider == "deepseek"
+        or config.enterprise_llm_provider == "deepseek"
+    ) and not os.environ.get("DEEPSEEK_API_KEY"):
+        print(
+            "Error: simulator DeepSeek provider requires DEEPSEEK_API_KEY. "
+            "It does not use agent-only credentials such as --api-key.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     return {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
 
 
@@ -166,14 +186,17 @@ def _restore_simulator_llm_config(config: BenchmarkConfig, meta: dict) -> None:
 
 
 def _create_simulator_openai_client(config: BenchmarkConfig):
-    if (
-        config.social_post_llm_provider != "openai"
-        and config.enterprise_llm_provider != "openai"
-    ):
+    providers = {config.social_post_llm_provider, config.enterprise_llm_provider}
+    if not providers.intersection({"openai", "deepseek"}):
         return None
 
     from openai import OpenAI
 
+    if "deepseek" in providers:
+        return OpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com",
+        )
     return OpenAI()
 
 

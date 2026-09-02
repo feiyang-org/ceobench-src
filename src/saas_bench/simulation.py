@@ -4143,26 +4143,14 @@ class Simulator:
                     social_model = config.social_post_llm_model
                     social_provider = config.social_post_llm_provider
 
-                    if social_provider in ("bedrock", "anthropic"):
-                        llm_response = self.customer_simulator.social_post_client.messages.create(
-                            model=social_model,
-                            max_tokens=300,
-                            temperature=config.social_media_temperature,
-                            system="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
-                            messages=[{"role": "user", "content": item['prompt']}],
-                        )
-                        text = llm_response.content[0].text.strip()
-                    else:
-                        llm_response = self.customer_simulator.client.responses.create(
-                            model=social_model,
-                            reasoning={"effort": "low"},
-                            input=[
-                                {"role": "system", "content": "You are a social media content generator simulating realistic business professionals posting about economic conditions."},
-                                {"role": "user", "content": item['prompt']}
-                            ],
-                            max_output_tokens=300,
-                        )
-                        text = llm_response.output_text.strip()
+                    text, in_tok, out_tok = self.customer_simulator.complete_text(
+                        provider=social_provider,
+                        model=social_model,
+                        system="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
+                        user=item['prompt'],
+                        max_tokens=300,
+                        temperature=config.social_media_temperature,
+                    )
 
                     # Clean: strip numbering/bullets if LLM added them
                     import re
@@ -4171,8 +4159,8 @@ class Simulator:
                     text = text.strip('"').strip("'")
 
                     return {'type': 'macro', **item, 'text': text, 'success': True,
-                            'input_tokens': llm_response.usage.input_tokens,
-                            'output_tokens': llm_response.usage.output_tokens}
+                            'input_tokens': in_tok,
+                            'output_tokens': out_tok}
                 except Exception as e:
                     import sys
                     print(f"[sim] macro post LLM failed: {e}", file=sys.stderr)
@@ -4310,26 +4298,14 @@ class Simulator:
                     social_model = config.social_post_llm_model
                     social_provider = config.social_post_llm_provider
 
-                    if social_provider in ("bedrock", "anthropic"):
-                        llm_response = self.customer_simulator.social_post_client.messages.create(
-                            model=social_model,
-                            max_tokens=300,
-                            temperature=config.social_media_temperature,
-                            system="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
-                            messages=[{"role": "user", "content": item['prompt']}],
-                        )
-                        text = llm_response.content[0].text.strip()
-                    else:
-                        llm_response = self.customer_simulator.client.responses.create(
-                            model=social_model,
-                            reasoning={"effort": "low"},
-                            input=[
-                                {"role": "system", "content": "You are a social media content generator simulating realistic business professionals posting about economic conditions."},
-                                {"role": "user", "content": item['prompt']}
-                            ],
-                            max_output_tokens=300,
-                        )
-                        text = llm_response.output_text.strip()
+                    text, in_tok, out_tok = self.customer_simulator.complete_text(
+                        provider=social_provider,
+                        model=social_model,
+                        system="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
+                        user=item['prompt'],
+                        max_tokens=300,
+                        temperature=config.social_media_temperature,
+                    )
 
                     import re
                     text = re.sub(r'^\d+[\.\)]\s*', '', text).strip()
@@ -4337,8 +4313,8 @@ class Simulator:
                     text = text.strip('"').strip("'")
 
                     return {'type': 'macro', **item, 'text': text, 'success': True,
-                            'input_tokens': llm_response.usage.input_tokens,
-                            'output_tokens': llm_response.usage.output_tokens}
+                            'input_tokens': in_tok,
+                            'output_tokens': out_tok}
                 except Exception as e:
                     import sys
                     print(f"[sim] macro post LLM failed: {e}", file=sys.stderr)
@@ -4637,8 +4613,6 @@ class Simulator:
             WHERE s.status = 'subscribed' AND s.end_day IS NULL
         """).fetchone()[0]
 
-        # Use social_post_client (bedrock or direct anthropic) — both expose the same .messages.create() API
-        bedrock_client = self.customer_simulator.social_post_client
         social_model = self.config.social_post_llm_model
         viral_threshold = 0.6
 
@@ -4671,7 +4645,7 @@ class Simulator:
 
                     future = executor.submit(
                         judge_agent_social_post,
-                        bedrock_client, self.config, content,
+                        self.customer_simulator, self.config, content,
                         gid, desc, tone, total_subs, mrr,
                         recent_posts, reply_to_content
                     )
@@ -4765,7 +4739,7 @@ class Simulator:
 
                         future = executor.submit(
                             generate_customer_reply_to_agent,
-                            bedrock_client, self.config, content,
+                            self.customer_simulator, self.config, content,
                             gid, desc, tone, eff, reply_to_content
                         )
                         reply_futures[future] = gid
@@ -5807,36 +5781,19 @@ Guidelines:
         social_temperature = self.customer_simulator.config.social_media_temperature
 
         post_max_tokens = self.config.competitor_post_llm_max_tokens
-        if self.customer_simulator.config.social_post_llm_provider in ("bedrock", "anthropic"):
-            response = self.customer_simulator.social_post_client.messages.create(
-                model=social_model,
-                max_tokens=post_max_tokens,
-                temperature=social_temperature,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            post_text = response.content[0].text.strip()
-            self.customer_simulator._log_cost(
-                self.current_day, 'competitor_event_post',
-                response.usage.input_tokens, response.usage.output_tokens,
-                model=social_model
-            )
-        else:
-            response = self.customer_simulator.client.responses.create(
-                model=social_model,
-                reasoning={"effort": "low"},
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_output_tokens=post_max_tokens,
-            )
-            post_text = response.output_text.strip()
-            self.customer_simulator._log_cost(
-                self.current_day, 'competitor_event_post',
-                response.usage.input_tokens, response.usage.output_tokens,
-                model=social_model
-            )
+        post_text, in_tok, out_tok = self.customer_simulator.complete_text(
+            provider=self.customer_simulator.config.social_post_llm_provider,
+            model=social_model,
+            system=system_prompt,
+            user=user_prompt,
+            max_tokens=post_max_tokens,
+            temperature=social_temperature,
+        )
+        self.customer_simulator._log_cost(
+            self.current_day, 'competitor_event_post',
+            in_tok, out_tok,
+            model=social_model
+        )
 
         return post_text
 

@@ -57,6 +57,7 @@ Thumbs.db
 # Run data (large, per-run state)
 baseline_runs/
 bash_agent_runs/
+deepseek_runs/
 opencode_runs/
 workspace/
 workspace_*/
