@@ -395,6 +395,8 @@ def cmd_start_server(args, base: Path):
         day_callback=_day_callback,
         shock_manager=shock_manager,
         event_logger=event_logger,
+        script_workspace=base,
+        require_sandbox=os.environ.get('CEOBENCH_RUN_KIND') == 'formal',
     )
     api_server.start()
 

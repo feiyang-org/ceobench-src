@@ -631,8 +631,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             name = body.get('name', '')
             content = body.get('content', '')
-            if not name:
-                self._send_json({"success": False, "error": "name required"}, 400)
+            if not isinstance(name, str) or not name or not isinstance(content, str):
+                self._send_json({"success": False, "error": "name and content must be strings; name cannot be empty"}, 400)
                 return
             server: NovaMindAPIServer = self.server._api_server
             with server._lock:
@@ -760,7 +760,8 @@ class NovaMindAPIServer:
 
     def __init__(self, tools: AgentTools, simulator=None, conn=None,
                  day_callback=None, dashboard_callback=None,
-                 shock_manager=None, event_logger=None):
+                 shock_manager=None, event_logger=None, script_workspace=None,
+                 require_sandbox=False):
         """Initialize the API server.
 
         Args:
@@ -786,6 +787,9 @@ class NovaMindAPIServer:
         self._last_dashboard: str = ""
         self._last_day_result = None
         self._daily_scripts: Dict[str, str] = {}  # name -> content snapshot
+        self.script_workspace = script_workspace or tools.workspace_path
+        self.require_sandbox = require_sandbox
+        self.last_script_results = []
         self._step_day_timed_out: bool = False  # Set when step_day exceeds timeout
 
         # Per-query wall-clock deadline (monotonic seconds; 0 = disabled).
@@ -944,11 +948,11 @@ class NovaMindAPIServer:
 
         # Build dashboard OUTSIDE the lock so weekly scripts can call back
         # to the API server (e.g., nm.query()) without deadlocking.
+        calc_outputs = self._run_daily_scripts_internal()
         if self.dashboard_callback:
             dashboard = self.dashboard_callback(new_day, week_result)
         elif self.conn:
             # Run weekly scripts if available
-            calc_outputs = self._run_daily_scripts_internal() if hasattr(self, '_daily_script_snapshots') else None
             dashboard = build_weekly_dashboard(self.conn, new_day, week_result, calc_outputs, inbox)
         else:
             week = (new_day + 6) // 7
@@ -974,6 +978,25 @@ class NovaMindAPIServer:
         """Get all registered daily script snapshots (name -> content)."""
         with self._lock:
             return dict(self._daily_scripts)
+
+    def _run_daily_scripts_internal(self):
+        import hashlib
+        import shlex
+        from pathlib import Path
+        from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+        workspace = Path(self.script_workspace)
+        executor = BashAgentToolExecutor(workspace, bash_timeout=300,
+            require_sandbox=self.require_sandbox,
+            env={'NOVAMIND_API_PORT': str(self.port), 'PYTHONHASHSEED': '0',
+                 'PYTHONPATH': os.pathsep.join((str(workspace / 'docs'), str(workspace)))})
+        results = {}
+        self.last_script_results = []
+        for name, code in self.get_daily_scripts().items():
+            output = executor.execute('bash', {'command': shlex.quote(sys.executable) + ' -c ' + shlex.quote(code)})
+            results[name] = output
+            self.last_script_results.append(dict(name=name,
+                sha256=hashlib.sha256(code.encode()).hexdigest(), output=output))
+        return results
 
     def set_daily_scripts(self, scripts: Dict[str, str]):
         """Restore daily scripts from checkpoint."""

@@ -338,6 +338,17 @@ class BashAgentToolExecutor:
         # fixed path inside the sandbox and prepended to PYTHONPATH so
         # site.py picks up sitecustomize on every interpreter start.
         sandbox_init_host = self._SANDBOX_INIT_DIR
+        if not sandbox_init_host.is_dir():
+            # The server also uses this executor from inside the zipapp.
+            import pkgutil
+            import tempfile
+            if not hasattr(self, '_sandbox_resources'):
+                self._sandbox_resources = tempfile.TemporaryDirectory(prefix='novamind-sandbox-')
+                data = pkgutil.get_data('saas_bench.agents.bash_agent', '_sandbox_init/sitecustomize.py')
+                if data is None:
+                    raise RuntimeError('Sandbox import blocker is missing')
+                (Path(self._sandbox_resources.name) / 'sitecustomize.py').write_bytes(data)
+            sandbox_init_host = Path(self._sandbox_resources.name)
         sandbox_init_guest = "/opt/_sandbox_init"
         if sandbox_init_host.is_dir():
             cmd.extend(['--ro-bind', str(sandbox_init_host), sandbox_init_guest])

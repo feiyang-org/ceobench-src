@@ -261,6 +261,16 @@ def _build_zipapp():
             )
             compiled += 1
 
+        # Weekly registered scripts use the same executor as the CEO's Bash tool.
+        for relative in ('agents/__init__.py', 'agents/base.py',
+                         'agents/bash_agent/__init__.py', 'agents/bash_agent/tools.py'):
+            target_module = engine_dir / Path(relative).with_suffix('.pyc')
+            target_module.parent.mkdir(parents=True, exist_ok=True)
+            _compile_pyc(SRC_DIR / relative, target_module, 'saas_bench/' + relative)
+        resource = Path('agents/bash_agent/_sandbox_init/sitecustomize.py')
+        (engine_dir / resource).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SRC_DIR / resource, engine_dir / resource)
+
         print(f"  Compiled {compiled} modules into zipapp")
 
         # Create the zipapp with shebang
