@@ -333,12 +333,6 @@ def cmd_start_server(args, base: Path):
     simulator.initialize(resume=True)  # resume=True: skip DB writes, just set up _group_rngs
     current_day = meta.get("current_day", 0)
 
-    # Restore RNG states from database for deterministic resume
-    if current_day > 0:
-        simulator.current_day = current_day
-        if not simulator.restore_rng_states():
-            print(f"WARNING: No saved RNG states found — RNG will NOT match continuous run", file=sys.stderr)
-
     workspace = _session_workspace(base, session_id)
     tools = AgentTools(conn, current_day, workspace, rng=rng, config=config, seed=seed)
 
@@ -348,6 +342,13 @@ def cmd_start_server(args, base: Path):
         name='Default', description='Balanced scenario'
     ))
     shock_manager = ShockManager(conn, rng, scenario_pack)
+    simulator.shock_manager = shock_manager
+    # Construct all random streams before restoring the saved positions.
+    restored = simulator.restore_rng_states()
+    if current_day > 0 and not restored:
+        raise ValueError('Cannot resume: checkpoint has no random states')
+    if restored and simulator.current_day != current_day:
+        raise ValueError('Checkpoint metadata and simulator day differ')
 
     # Event logger
     logs_dir = sdir / "logs"
