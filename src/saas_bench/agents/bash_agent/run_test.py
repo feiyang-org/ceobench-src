@@ -88,19 +88,24 @@ class BashAgentRunner:
         reasoning_effort: Optional[str] = None,
         continue_from: Optional[Path] = None,
         label: Optional[str] = None,
+        run_kind: Optional[str] = None,
     ):
         default_config = BenchmarkConfig()
         if continue_from:
             saved = json.loads((Path(continue_from) / 'manifest.json').read_text())['configuration']
             supplied = dict(model=model, provider=provider, base_url=base_url,
                             seed=seed, scenario=scenario, total_days=total_days,
-                            initial_cash=initial_cash, reasoning_effort=reasoning_effort)
+                            initial_cash=initial_cash, reasoning_effort=reasoning_effort, run_kind=run_kind)
             for key, value in supplied.items():
                 if value is not None and value != saved[key]:
                     raise ValueError(f'Resume configuration mismatch: {key}')
             model, provider, base_url = (saved[k] for k in ('model', 'provider', 'base_url'))
             seed, scenario, total_days, initial_cash, reasoning_effort = (
                 saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
+            run_kind = saved['run_kind']
+        self.run_kind = run_kind or 'engineering'
+        if self.run_kind not in ('engineering', 'pilot', 'formal'):
+            raise ValueError('Invalid run kind')
         seed = 42 if seed is None else seed
         scenario = 'default' if scenario is None else scenario
         total_days = 3650 if total_days is None else total_days
@@ -577,6 +582,7 @@ __pycache__/
         env = os.environ.copy()
         env["NOVAMIND_SERVER_MODE"] = "1"
         env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
+        env['CEOBENCH_RUN_KIND'] = self.run_kind
         # DeepSeek / OpenCode agent runs keep the simulator on official DeepSeek
         # so social/enterprise LLM calls do not require Anthropic and do not
         # burn the OpenCode Go subscription quota.
@@ -592,7 +598,7 @@ __pycache__/
         build = verify_build(self._public_dir())
         configuration = {key: getattr(self, key) for key in (
             'model', 'provider', 'base_url', 'seed', 'scenario', 'total_days',
-            'initial_cash', 'reasoning_effort', 'anthropic_fallback_model')}
+            'initial_cash', 'reasoning_effort', 'anthropic_fallback_model', 'run_kind')}
         configuration['bedrock_region'] = os.environ.get('AWS_REGION', 'us-east-2')
         config = BenchmarkConfig(seed=self.seed, total_days=self.total_days, initial_cash=self.initial_cash)
         env = self._server_environment()
@@ -929,8 +935,12 @@ __pycache__/
         workspace — they stay in public/ on the host side.
         """
         from .agent import BashAgent
-        self._prepare_manifest()
         from .tools import get_bash_agent_tool_descriptions, BashAgentToolExecutor, NextDayTimeoutError
+        if self.run_kind == 'formal':
+            BashAgentToolExecutor(self.agent_workspace, require_sandbox=True).verify_sandbox()
+            if os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1':
+                raise ValueError('Formal runs cannot enable replay or oracle mode')
+        self._prepare_manifest()
         self._NextDayTimeoutError = NextDayTimeoutError
 
         # Belt-and-suspenders: if a pre-patch run left legacy files in the
@@ -1010,6 +1020,7 @@ __pycache__/
         self.tool_executor = BashAgentToolExecutor(
             workspace_path=self.agent_workspace,
             env={"NOVAMIND_API_PORT": str(self._server_port)},
+            require_sandbox=self.run_kind == 'formal',
         )
 
         tool_descriptions = get_bash_agent_tool_descriptions()
@@ -1461,6 +1472,7 @@ def main():
                         help="Variant tag stored in config.json and shown on the dashboard "
                              "(e.g. 'leads_x1.25'). Lets multiple config variants be "
                              "distinguished without forking the run_id scheme.")
+    parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
     args = parser.parse_args()
 
     runner = BashAgentRunner(
@@ -1475,6 +1487,7 @@ def main():
         reasoning_effort=args.reasoning_effort,
         continue_from=args.continue_from,
         label=args.label,
+        run_kind=args.run_kind,
     )
 
     result = runner.run(verbose=not args.quiet)

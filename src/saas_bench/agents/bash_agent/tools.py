@@ -197,7 +197,7 @@ class BashAgentToolExecutor:
     """Executes bash_agent tools within a working directory."""
 
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
-                 bash_timeout: int = 1200):
+                 bash_timeout: int = 1200, require_sandbox: bool = False):
         """Initialize the tool executor.
 
         Args:
@@ -208,6 +208,19 @@ class BashAgentToolExecutor:
         self.workspace_path = workspace_path
         self.extra_env = env or {}
         self.bash_timeout = bash_timeout
+        self.require_sandbox = require_sandbox
+
+    def verify_sandbox(self):
+        if sys.platform != 'linux':
+            raise RuntimeError('Formal runs require Linux and bubblewrap')
+        self.workspace_path.mkdir(parents=True, exist_ok=True)
+        env = {'PATH': os.path.join(sys.prefix, 'bin') + os.pathsep + os.defpath}
+        command = self._build_bwrap_cmd('true', str(self.workspace_path), env)
+        if command is None:
+            raise RuntimeError('Formal runs require bubblewrap')
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise RuntimeError('Bubblewrap startup failed: ' + result.stderr)
 
     def execute(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Execute a tool and return the result string."""
@@ -272,6 +285,8 @@ class BashAgentToolExecutor:
         import shutil
         bwrap = shutil.which('bwrap')
         if not bwrap:
+            if self.require_sandbox:
+                raise RuntimeError('Formal runs require bubblewrap')
             return None  # Fall back to unsandboxed execution
 
         env = self._scrub_sandbox_env(env)
