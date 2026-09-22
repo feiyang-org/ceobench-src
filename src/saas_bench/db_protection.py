@@ -385,12 +385,14 @@ class AsyncSaver:
         cleanly within the timeout, False otherwise.
         """
         ok = True
-        if wait:
-            ok = self.drain(timeout=timeout)
-        with self._cond:
-            self._shutdown = True
-            self._cond.notify_all()
-        self._thread.join(timeout=timeout)
+        try:
+            if wait:
+                ok = self.drain(timeout=timeout)
+        finally:
+            with self._cond:
+                self._shutdown = True
+                self._cond.notify_all()
+            self._thread.join(timeout=timeout)
         return ok and not self._thread.is_alive()
 
 

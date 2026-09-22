@@ -20,7 +20,9 @@ def test_async_failure_is_not_a_successful_drain(tmp_path, monkeypatch):
         with pytest.raises(RuntimeError, match='save failed'):
             saver.drain(timeout=2)
     finally:
-        saver.shutdown(wait=False)
+        with pytest.raises(RuntimeError, match='save failed'):
+            saver.shutdown()
+        assert not saver._thread.is_alive()
 
 
 def test_async_drain_waits_and_times_out(tmp_path, monkeypatch):

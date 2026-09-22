@@ -197,7 +197,7 @@ class BashAgentToolExecutor:
     """Executes bash_agent tools within a working directory."""
 
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
-                 bash_timeout: int = 1200, require_sandbox: bool = False):
+                 bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False):
         """Initialize the tool executor.
 
         Args:
@@ -209,6 +209,7 @@ class BashAgentToolExecutor:
         self.extra_env = env or {}
         self.bash_timeout = bash_timeout
         self.require_sandbox = require_sandbox
+        self.stop_on_timeout = stop_on_timeout
 
     def verify_sandbox(self):
         if sys.platform != 'linux':
@@ -251,7 +252,7 @@ class BashAgentToolExecutor:
             resolved = (self.workspace_path / p).resolve()
         # Ensure it's within workspace
         ws_resolved = self.workspace_path.resolve()
-        if not str(resolved).startswith(str(ws_resolved)):
+        if not resolved.is_relative_to(ws_resolved):
             raise ValueError(f"Path escapes workspace: {path_str}")
         return resolved
 
@@ -491,43 +492,18 @@ class BashAgentToolExecutor:
             return output
 
         except subprocess.TimeoutExpired:
-            # Capture any partial output before killing
-            partial_stdout = ""
-            partial_stderr = ""
-            try:
-                # Read whatever's in the pipe buffers
-                import selectors
-                sel = selectors.DefaultSelector()
-                sel.register(proc.stdout, selectors.EVENT_READ)
-                sel.register(proc.stderr, selectors.EVENT_READ)
-                while sel.select(timeout=0.1):
-                    for key, _ in sel.select(timeout=0):
-                        data = key.fileobj.read1(65536) if hasattr(key.fileobj, 'read1') else ''
-                        if key.fileobj == proc.stdout:
-                            partial_stdout += data if isinstance(data, str) else data.decode('utf-8', errors='replace')
-                        else:
-                            partial_stderr += data if isinstance(data, str) else data.decode('utf-8', errors='replace')
-                sel.close()
-            except Exception:
-                pass
-
             # Kill the entire process group (bash + all children)
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
             proc.kill()  # Fallback: kill the direct child
-            try:
-                proc.wait(timeout=5)  # Reap the zombie
-            except Exception:
-                pass
-
-            # If command is ./novamind-operation next-week, raise to kill the run
-            if './novamind-operation next-week' in command:
+            partial_stdout, partial_stderr = proc.communicate(timeout=5)
+            if self.stop_on_timeout or './novamind-operation next-week' in command:
                 raise NextDayTimeoutError(
-                    f"next_week timed out after {self.bash_timeout}s",
-                    partial_stdout=partial_stdout,
-                    partial_stderr=partial_stderr,
+                    f"Tool timed out after {self.bash_timeout}s; outcome unknown",
+                    partial_stdout=partial_stdout or "",
+                    partial_stderr=partial_stderr or "",
                 )
 
             # For all other commands: return partial output + timeout message

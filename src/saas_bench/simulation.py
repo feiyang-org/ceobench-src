@@ -894,6 +894,13 @@ class Simulator:
         missing = required - states.keys()
         if states.get('version') != 2 or missing:
             raise ValueError(f'Incomplete RNG checkpoint; missing {sorted(missing)}; version 2 required')
+        required_state = {'current_day', 'shutdown_mode', 'consecutive_negative_cash_days',
+                          '_involuntary_churn_seed', '_leads_drift_seed', '_macro_pmi_current',
+                          '_macro_cycle_phase_offset', '_macro_last_update_day', '_macro_last_social_post_day',
+                          '_macro_next_social_post_day', '_macro_multipliers', '_macro_pmi_daily_history',
+                          '_macro_pending_publications', '_customer_quality_noise', '_leads_per_1k_overrides'}
+        if required_state - states['_sim_state'].keys() or states['_group_rngs'].keys() != self._group_rngs.keys():
+            raise ValueError('Incomplete simulation memory or group random states')
 
         def _restore_state(rng_obj, saved):
             """Restore a numpy Generator's bit_generator state from saved dict."""

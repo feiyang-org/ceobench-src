@@ -704,6 +704,8 @@ class BenchmarkConfig:
     # Exact served-model IDs -> USD/1k input, output, cache_read, cache_write.
     # Empty means no registered price; receipts retain an unknown cost.
     model_pricing: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    simulator_openai_base_url: str = 'https://api.openai.com/v1'
+    simulator_anthropic_base_url: str = 'https://api.anthropic.com'
 
     # Temperature settings
     agent_llm_temperature: float = 0.7  # For agent responses

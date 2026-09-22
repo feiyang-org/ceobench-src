@@ -6,6 +6,7 @@ is via HTTP on localhost with a random OS-assigned port.
 """
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -495,6 +496,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                         "error": f"Prediction '{key}' fields point/lower/upper must all be numbers, got {entry!r}.",
                     }, 400)
                     return
+                if not all(math.isfinite(v) for v in (point, lower, upper)):
+                    self._send_json({'success': False, 'error': f"Prediction '{key}' must contain finite numbers."}, 400)
+                    return
                 if lower > upper:
                     self._send_json({
                         "success": False,
@@ -705,7 +709,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         server: NovaMindAPIServer = self.server._api_server
         cash = 0
         subs = 0
-        if server.conn:
+        if server.conn and not (server._advance_lock.locked() or server._operation_failed or server._step_day_timed_out):
             cash = get_cash(server.conn)
             subs = get_active_subscriber_count(server.conn)
         self._send_json({
@@ -713,6 +717,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             "cash": cash,
             "subscribers": subs,
             "timed_out": server._step_day_timed_out,
+            "operation_failed": server._operation_failed,
+            "operation_in_progress": server._advance_lock.locked(),
         })
 
 

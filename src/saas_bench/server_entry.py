@@ -216,7 +216,7 @@ def _create_simulator_openai_client(config: BenchmarkConfig):
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com",
         )
-    return OpenAI()
+    return OpenAI(base_url=config.simulator_openai_base_url)
 
 
 # =========================================================================
@@ -413,6 +413,7 @@ def cmd_start_server(args, base: Path):
             if not async_saver.drain(timeout=180):
                 raise TimeoutError('Background database save did not finish')
             simulator.save_rng_states()
+            event_logger.save_incremental()
             save_session_db(conn, target / 'world.nmdb')
             saved_meta = dict(meta, current_day=simulator.current_day, status='created')
             for field in ('port', 'pid'):
@@ -421,7 +422,9 @@ def cmd_start_server(args, base: Path):
             write_json(target / 'server_state.json', {
                 'day': simulator.current_day, 'dashboard': api_server.last_dashboard,
                 'script_results': api_server.last_script_results,
-                'usage': customer_sim.usage_recorder.summary})
+                'usage': customer_sim.usage_recorder.summary,
+                'event_logger': {name: getattr(event_logger, name) for name in
+                                 ('current_day', '_event_count', '_total_llm_cost', '_missing_llm_cost')}})
             return {'success': True, 'snapshot_id': snapshot_id, 'day': simulator.current_day,
                     'files': {name: file_hash(target / name) for name in
                               ('world.nmdb', 'session.json', 'server_state.json')}}
@@ -435,6 +438,8 @@ def cmd_start_server(args, base: Path):
         api_server._last_dashboard = state['dashboard']
         api_server.last_script_results = state['script_results']
         customer_sim.usage_recorder.summary = state['usage']
+        for name, value in state['event_logger'].items():
+            setattr(event_logger, name, value)
     api_server.start()
 
     # Set API port on tools so Python sandbox routes queries through HTTP
@@ -632,6 +637,9 @@ def main():
 
     args = parser.parse_args()
     base = Path(args.base).resolve()
+    if args.command in ('new-session', 'start-server') and os.environ.get('CEOBENCH_RUN_KIND') == 'formal':
+        from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+        BashAgentToolExecutor(base, require_sandbox=True).verify_sandbox()
 
     cmd_map = {
         "new-session": cmd_new_session,

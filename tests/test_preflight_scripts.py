@@ -50,3 +50,18 @@ def test_registered_snapshot_executes_and_can_call_server(tmp_path):
         assert server._run_daily_scripts_internal() == {}
     finally:
         server.stop()
+
+
+def test_script_timeout_is_visible_and_does_not_stall_following_script(tmp_path, monkeypatch):
+    from saas_bench.agents.bash_agent import tools
+    real_executor = tools.BashAgentToolExecutor
+    def short_executor(*args, **kwargs):
+        kwargs['bash_timeout'] = 0.2
+        return real_executor(*args, **kwargs)
+    monkeypatch.setattr(tools, 'BashAgentToolExecutor', short_executor)
+    server = NovaMindAPIServer(SimpleNamespace(workspace_path=tmp_path))
+    server.set_daily_scripts({'slow': "import time; print('started', flush=True); time.sleep(30)", 'after': "print('finished')"})
+    outputs = server._run_daily_scripts_internal()
+    assert 'timed out' in outputs['slow']
+    assert 'started' in outputs['slow']
+    assert outputs['after'] == 'finished\n'

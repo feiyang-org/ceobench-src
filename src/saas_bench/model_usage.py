@@ -120,17 +120,17 @@ class ModelUsage:
 
         @functools.wraps(send)
         def recorded_send(request, *args, **kwargs):
-            call_id = _CALL.get()
+            recorder, call_id = _CALL.get() or (self, None)
             attempt_id = uuid.uuid4().hex
             failure_recorded = False
-            with self.lock:
-                self.summary['http_attempts'] += 1
+            with recorder.lock:
+                recorder.summary['http_attempts'] += 1
             body = request.read().decode('utf-8')
             try:
                 body = json.loads(body)
             except ValueError:
                 pass
-            self.write('http_request', call_id=call_id, attempt_id=attempt_id,
+            recorder.write('http_request', call_id=call_id, attempt_id=attempt_id,
                        method=request.method, endpoint=str(request.url.copy_with(query=None, username='', password='')),
                        sdk_retry=request.headers.get('x-stainless-retry-count'), body=body)
             try:
@@ -148,11 +148,11 @@ class ModelUsage:
                             reported = json.loads(content).get('usage')
                         except (ValueError, AttributeError):
                             reported = None
-                        with self.lock:
-                            self.summary['failed_http_attempts'] += 1
-                            self.summary['failed_attempts_without_usage'] += not bool(reported)
+                        with recorder.lock:
+                            recorder.summary['failed_http_attempts'] += 1
+                            recorder.summary['failed_attempts_without_usage'] += not bool(reported)
                         failure_recorded = True
-                    self.write('http_response', call_id=call_id, attempt_id=attempt_id,
+                    recorder.write('http_response', call_id=call_id, attempt_id=attempt_id,
                                status=response.status_code, request_id=response.headers.get('request-id') or response.headers.get('x-request-id'),
                                body=body, error=error)
                 if response.is_stream_consumed:
@@ -164,10 +164,10 @@ class ModelUsage:
                 return response
             except BaseException as exc:
                 if not failure_recorded:
-                    with self.lock:
-                        self.summary['failed_http_attempts'] += 1
-                        self.summary['failed_attempts_without_usage'] += 1
-                self.write('http_error', call_id=call_id, attempt_id=attempt_id, error=type(exc).__name__)
+                    with recorder.lock:
+                        recorder.summary['failed_http_attempts'] += 1
+                        recorder.summary['failed_attempts_without_usage'] += 1
+                recorder.write('http_error', call_id=call_id, attempt_id=attempt_id, error=type(exc).__name__)
                 raise
 
         http_client.send = recorded_send
@@ -176,7 +176,7 @@ class ModelUsage:
 
     def call(self, api, request, invoke, **context):
         call_id = uuid.uuid4().hex
-        token = _CALL.set(call_id)
+        token = _CALL.set((self, call_id))
         response, error = None, None
         self.write('request', call_id=call_id, api=api, request=request, **context)
         try:

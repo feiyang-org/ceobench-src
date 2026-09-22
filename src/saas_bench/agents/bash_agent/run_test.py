@@ -97,7 +97,14 @@ class BashAgentRunner:
                             seed=seed, scenario=scenario, total_days=total_days,
                             initial_cash=initial_cash, reasoning_effort=reasoning_effort, run_kind=run_kind)
             for key, value in supplied.items():
-                if value is not None and value != saved[key]:
+                if key == 'total_days' and value is not None:
+                    value = value // 7 * 7
+                if key == 'base_url' and value is not None:
+                    value = value.rstrip('/') + '/'
+                expected = saved[key]
+                if key == 'base_url' and expected is not None:
+                    expected = expected.rstrip('/') + '/'
+                if value is not None and value != expected:
                     raise ValueError(f'Resume configuration mismatch: {key}')
             model, provider, base_url = (saved[k] for k in ('model', 'provider', 'base_url'))
             seed, scenario, total_days, initial_cash, reasoning_effort = (
@@ -276,11 +283,12 @@ class BashAgentRunner:
                 aws_secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
                 aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
                 aws_region=os.environ.get("AWS_REGION", "us-east-2"),
+                base_url=self.base_url,
             )
         elif self.provider == "anthropic":
             if not ANTHROPIC_AVAILABLE:
                 raise ImportError("anthropic package required")
-            self.client = anthropic.Anthropic(api_key=self.api_key)
+            self.client = anthropic.Anthropic(api_key=self.api_key, base_url=self.base_url)
         elif self.provider == "ai_sandbox":
             try:
                 from portkey_ai import Portkey
@@ -297,6 +305,8 @@ class BashAgentRunner:
                 client_kwargs["base_url"] = self.base_url
             client_kwargs["timeout"] = httpx.Timeout(600.0)  # 10min max per LLM call; retry on timeout
             self.client = OpenAI(**client_kwargs)
+
+        self.base_url = str(self.client.base_url)
 
         # Components (initialized in setup)
         self.agent = None
@@ -328,20 +338,17 @@ class BashAgentRunner:
 
     def _get_cash(self) -> float:
         """Get current cash balance via HTTP query."""
-        try:
-            result = self._http_post('/query', {'sql': 'SELECT SUM(amount) FROM ledger'})
-            if result.get('success') and result.get('data', {}).get('rows'):
-                return result['data']['rows'][0][0] or 0
-        except Exception:
-            pass
-        return 0
+        result = self._http_post('/query', {'sql': 'SELECT SUM(amount) FROM ledger'})
+        if not result.get('success') or not result.get('data', {}).get('rows'):
+            raise RuntimeError('Cash query failed')
+        return result['data']['rows'][0][0] or 0
 
     def _get_game_status(self) -> Dict:
         """Get game status (day, cash, subs, timeout) via HTTP."""
-        try:
-            return self._http_get('/game-status')
-        except Exception:
-            return {"day": 0, "cash": 0, "subscribers": 0, "timed_out": False}
+        result = self._http_get('/game-status')
+        if result.get('operation_failed') or result.get('timed_out') or result.get('operation_in_progress'):
+            raise RuntimeError('World operation outcome unknown; branch stopped')
+        return result
 
     def _get_dashboard(self) -> str:
         """Get current dashboard via HTTP."""
@@ -597,7 +604,7 @@ __pycache__/
 
     def _prepare_manifest(self):
         from dataclasses import asdict
-        from saas_bench.config import SCENARIO_PACKS
+        from saas_bench.config import SCENARIO_PACKS, ScenarioPack
         from saas_bench.run_state import verify_build, write_json
         build = verify_build(self._public_dir())
         configuration = {key: getattr(self, key) for key in (
@@ -605,6 +612,8 @@ __pycache__/
             'initial_cash', 'reasoning_effort', 'anthropic_fallback_model', 'run_kind')}
         configuration['bedrock_region'] = os.environ.get('AWS_REGION', 'us-east-2')
         config = BenchmarkConfig(seed=self.seed, total_days=self.total_days, initial_cash=self.initial_cash)
+        config.simulator_openai_base_url = os.environ.get('OPENAI_BASE_URL', config.simulator_openai_base_url)
+        config.simulator_anthropic_base_url = os.environ.get('ANTHROPIC_BASE_URL', config.simulator_anthropic_base_url)
         env = self._server_environment()
         for suffix in ('provider', 'model'):
             value = env.get('CEOBENCH_SIMULATOR_LLM_' + suffix.upper())
@@ -612,7 +621,8 @@ __pycache__/
                 for prefix in ('social_post_llm_', 'enterprise_llm_'):
                     setattr(config, prefix + suffix, value)
         manifest = dict(version=1, build=build, configuration=configuration,
-                        benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS[self.scenario]))
+                        benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
+                            self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
         manifest = json.loads(json.dumps(manifest))
         self._pricing = manifest['benchmark_config']['model_pricing']
         path = self.workspace_dir / 'manifest.json'
@@ -746,11 +756,23 @@ __pycache__/
         for name in ('world.nmdb', 'session.json', 'server_state.json'):
             if file_hash(directory / name) != receipt['files'].get(name):
                 raise ValueError('Server snapshot checksum mismatch: ' + name)
+        shutil.copy2(self.workspace_dir / 'manifest.json', directory / 'manifest.json')
+        receipt['files']['manifest.json'] = file_hash(directory / 'manifest.json')
         copy_workspace(self.agent_workspace, directory / 'agent_workspace')
+        request_logs = {}
+        for name in ('agent_requests.jsonl', 'simulator_requests.jsonl'):
+            source = self.logs_dir / name
+            if source.exists():
+                (directory / 'request_logs').mkdir(exist_ok=True)
+                shutil.copy2(source, directory / 'request_logs' / name)
+                request_logs[name] = file_hash(directory / 'request_logs' / name)
         checkpoint = dict(version=2, day=day, run_id=self.run_id,
                           session_id=self._session_id, snapshot_id=snapshot_id,
-                          files=receipt['files'], workspace_sha256=tree_hash(directory / 'agent_workspace'))
+                          files=receipt['files'], request_logs=request_logs,
+                          workspace_sha256=tree_hash(directory / 'agent_workspace'))
         checkpoint['context_boundary'] = 'same_week' if self.agent and self.agent.current_day == day else 'new_week'
+        progress = self.workspace_dir / 'operation.json'
+        checkpoint['operation_id'] = json.loads(progress.read_text())['id'] if progress.exists() else None
         checkpoint['usage'] = self.agent.usage_recorder.summary if self.agent else None
         for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
                       'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
@@ -764,6 +786,8 @@ __pycache__/
     def _restore_checkpoint_files(self, checkpoint):
         from saas_bench.run_state import checkpoint_directory, copy_workspace
         directory = checkpoint_directory(self.workspace_dir, checkpoint)
+        if json.loads((directory / 'manifest.json').read_text()) != json.loads((self.workspace_dir / 'manifest.json').read_text()):
+            raise ValueError('Checkpoint configuration differs from run manifest')
         staged = self.workspace_dir / ('restore-' + uuid.uuid4().hex)
         copy_workspace(directory / 'agent_workspace', staged)
         self._session_id = checkpoint['session_id']
@@ -782,6 +806,8 @@ __pycache__/
             raise
         if previous.exists():
             shutil.rmtree(previous)
+        for name in checkpoint['request_logs']:
+            shutil.copy2(directory / 'request_logs' / name, self.logs_dir / name)
         self._restored_snapshot_dir = directory
 
     def _load_checkpoint(self) -> Optional[Dict]:
@@ -789,8 +815,16 @@ __pycache__/
         checkpoint_file = self.workspace_dir / "checkpoint.json"
         if checkpoint_file.exists():
             with open(checkpoint_file) as f:
-                return json.load(f)
+                checkpoint = json.load(f)
+            progress = self.workspace_dir / 'operation.json'
+            if progress.exists() and json.loads(progress.read_text())['id'] != checkpoint.get('operation_id'):
+                raise ValueError('Uncheckpointed operation outcome unknown; branch cannot resume')
+            return checkpoint
         return None
+
+    def _begin_operation(self, kind, day):
+        from saas_bench.run_state import write_json
+        write_json(self.workspace_dir / 'operation.json', {'id': uuid.uuid4().hex, 'kind': kind, 'day': day})
 
     def _restore_from_checkpoint(self, checkpoint: Dict):
         """Restore agent accounting after the server has loaded the saved world."""
@@ -830,55 +864,6 @@ __pycache__/
         self._prepare_manifest()
         self._NextDayTimeoutError = NextDayTimeoutError
 
-        # Belt-and-suspenders: if a pre-patch run left legacy files in the
-        # workspace, purge them so the agent always sees the latest layout.
-        # Never let simulator bytecode leak into the workspace.
-        if self.agent_workspace.exists():
-            stale_names = [
-                "_engine",          # pre-L1: bundled engine bytecode
-                "novamind-server",  # pre-zipapp: separate server launcher
-                "novamind_api",     # pre-zipapp: top-level SDK (now docs/novamind_api)
-                "examples",         # pre-zipapp: top-level examples (removed 2026-05-10)
-                "install.sh",       # pre-zipapp: PyInstaller bootstrap
-            ]
-            for stale_name in stale_names:
-                stale_path = self.agent_workspace / stale_name
-                if stale_path.is_dir():
-                    shutil.rmtree(stale_path, ignore_errors=True)
-                elif stale_path.is_file() or stale_path.is_symlink():
-                    try:
-                        stale_path.unlink()
-                    except OSError:
-                        pass
-
-            # Refresh docs/ and novamind-operation from the published build so
-            # resumed sessions pick up the new zipapp + relocated SDK source.
-            # Safe to overwrite: the agent never writes into docs/, and the
-            # old novamind-operation script is incompatible with the new
-            # NOVAMIND_SERVER_MODE dispatch.
-            if self.continue_from:
-                public_dir = self._public_dir()
-                src_docs = public_dir / "docs"
-                dst_docs = self.agent_workspace / "docs"
-                if src_docs.exists():
-                    if dst_docs.exists():
-                        shutil.rmtree(dst_docs, ignore_errors=True)
-                    shutil.copytree(
-                        src_docs, dst_docs,
-                        ignore=shutil.ignore_patterns('__pycache__'),
-                    )
-                src_op = public_dir / "novamind-operation"
-                dst_op = self.agent_workspace / "novamind-operation"
-                if src_op.exists():
-                    if dst_op.exists():
-                        try:
-                            dst_op.unlink()
-                        except OSError:
-                            pass
-                    shutil.copy2(src_op, dst_op)
-                    import stat as _stat
-                    dst_op.chmod(dst_op.stat().st_mode | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH)
-
         # ── Step 1: Copy public/ and create session via CLI ──
         if not self.continue_from:
             session_info = self._initialize_from_public_repo()
@@ -889,14 +874,6 @@ __pycache__/
                 self._restore_checkpoint_files(checkpoint)
             else:
                 raise ValueError('Cannot resume without a complete checkpoint')
-            if not self._session_id:
-                # Fallback: find session in workspace
-                sessions_dir = self.agent_workspace / "sessions"
-                if sessions_dir.exists():
-                    dirs = sorted(sessions_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True)
-                    if dirs:
-                        self._session_id = dirs[0].name
-
         if not self._session_id:
             raise RuntimeError("No session ID found. Cannot proceed.")
 
@@ -909,7 +886,7 @@ __pycache__/
         self.tool_executor = BashAgentToolExecutor(
             workspace_path=self.agent_workspace,
             env={"NOVAMIND_API_PORT": str(self._server_port)},
-            require_sandbox=self.run_kind == 'formal',
+            require_sandbox=self.run_kind == 'formal', stop_on_timeout=True,
         )
 
         tool_descriptions = get_bash_agent_tool_descriptions()
@@ -975,7 +952,17 @@ __pycache__/
     # =========================================================================
 
     def run(self, verbose: bool = True) -> Dict[str, Any]:
-        """Run the full simulation."""
+        """Stop the branch on any unknown outcome; never publish partial state."""
+        from saas_bench.run_state import write_json
+        try:
+            return self._run(verbose)
+        except BaseException as exc:
+            write_json(self.workspace_dir / 'branch_stop.json', {'error': type(exc).__name__, 'reason': str(exc)})
+            raise
+        finally:
+            self._stop_server()
+
+    def _run(self, verbose=True):
         self.setup()
 
         start_day = 1
@@ -1068,6 +1055,7 @@ __pycache__/
 
                 # LLM call (timed)
                 _t0 = _time.monotonic()
+                self._begin_operation('model_and_tool', sim_day)
                 action = self.agent.act(observation, 0, False, info)
                 _llm_elapsed = _time.monotonic() - _t0
                 _day_llm_total += _llm_elapsed
@@ -1119,11 +1107,7 @@ __pycache__/
                 except self._NextDayTimeoutError as e:
                     _tool_elapsed = _time.monotonic() - _t0
                     print(f"\n⚠️  next_week timed out on sim day {sim_day} ({e})")
-                    print(f"Auto-quitting. Saving checkpoint...")
-                    self._save_checkpoint(sim_day)
-                    game_ended = True
-                    game_outcome = 'timeout'
-                    break
+                    raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
                 _tool_elapsed = _time.monotonic() - _t0
                 _day_tool_total += _tool_elapsed
                 observation = result if isinstance(result, str) else json.dumps(result)
@@ -1165,11 +1149,7 @@ __pycache__/
 
                 if status.get('timed_out'):
                     print(f"\n⚠️  step_day timed out on sim day {sim_day}")
-                    print(f"Auto-quitting. Saving checkpoint...")
-                    self._save_checkpoint(sim_day)
-                    game_ended = True
-                    game_outcome = 'timeout'
-                    break
+                    raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
 
                 _cash_inner = status.get('cash', 0)
                 info = {'day': sim_day, 'cash': _cash_inner}
@@ -1305,8 +1285,7 @@ __pycache__/
         if final_cash is None:
             final_cash = self._get_cash() if self._server_port else _cash
 
-        # Stop server, then checkpoint so world.nmdb is copied after shutdown
-        # has drained async saves and written the fresh session DB.
+        # Publish while the server can synchronize its complete state.
         self._save_checkpoint(sim_day)
         self._stop_server()
 

@@ -133,7 +133,7 @@ def _create_bedrock_client(config: BenchmarkConfig):
 def _create_anthropic_client(config: BenchmarkConfig):
     """Create a direct Anthropic API client. Reads ANTHROPIC_API_KEY from env."""
     from anthropic import Anthropic
-    return Anthropic()
+    return Anthropic(base_url=config.simulator_anthropic_base_url)
 
 
 @dataclass
@@ -395,8 +395,10 @@ Customer Segment ({group_id}):
 """
 
         # V2.2: Select random format directive and writing angle for diversity
-        format_directive = _random.choice(POST_FORMAT_DIRECTIVES)
-        writing_angle = _random.choice(WRITING_ANGLE_POOL)
+        # Per-post stream keeps prompt diversity independent of worker scheduling.
+        post_rng = _random.Random(f'{self.config.seed}:{day}:{customer_id}:{post_type}')
+        format_directive = post_rng.choice(POST_FORMAT_DIRECTIVES)
+        writing_angle = post_rng.choice(WRITING_ANGLE_POOL)
 
         # Build event context based on post type
         event_context_text = ""
@@ -406,7 +408,7 @@ Customer Segment ({group_id}):
             # V2.2: Use varied event descriptions instead of hardcoded strings
             variants = EVENT_DESCRIPTION_VARIANTS.get(event_type)
             if variants:
-                event_desc = _random.choice(variants)
+                event_desc = post_rng.choice(variants)
             else:
                 event_desc = "I'm having issues with the service"
 
@@ -459,7 +461,7 @@ The customer feels deceived and wants to warn others. The post should be a warni
             comp_desc = event_context.get('competitor_event_description',
                                           'A competitor launched a notable update')
             variants = EVENT_DESCRIPTION_VARIANTS.get('competitor_product', [])
-            angle = _random.choice(variants) if variants else "I'm seeing better options in the market"
+            angle = post_rng.choice(variants) if variants else "I'm seeing better options in the market"
 
             event_context_text = f"""
 IMPORTANT - This post is about a COMPETITOR PRODUCT:

@@ -18,6 +18,11 @@ def write_json(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def file_hash(path):
@@ -73,12 +78,15 @@ def checkpoint_directory(run, checkpoint):
     if len(snapshot_id) != 32 or any(c not in '0123456789abcdef' for c in snapshot_id):
         raise ValueError('Invalid snapshot identifier')
     directory = Path(run) / 'checkpoints' / snapshot_id
-    required = {'world.nmdb', 'session.json', 'server_state.json'}
+    required = {'world.nmdb', 'session.json', 'server_state.json', 'manifest.json'}
     if not required.issubset(checkpoint['files']):
         raise ValueError('Incomplete checkpoint file list')
     for name, checksum in checkpoint['files'].items():
         if name not in required or file_hash(directory / name) != checksum:
             raise ValueError('Checkpoint checksum mismatch: ' + name)
+    for name, checksum in checkpoint['request_logs'].items():
+        if name not in ('agent_requests.jsonl', 'simulator_requests.jsonl') or file_hash(directory / 'request_logs' / name) != checksum:
+            raise ValueError('Checkpoint request log checksum mismatch: ' + name)
     if tree_hash(directory / 'agent_workspace') != checkpoint['workspace_sha256']:
         raise ValueError('Checkpoint workspace checksum mismatch')
     return directory
