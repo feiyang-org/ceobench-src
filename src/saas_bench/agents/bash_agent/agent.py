@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, asdict
 
 from ..base import BaseAgent
 from ...environment import Action
+from ...model_usage import ModelUsage, usage_values
 
 
 @dataclass
@@ -57,9 +58,12 @@ class BashAgent(BaseAgent):
         workspace_path: Optional[Path] = None,
         total_days: int = 3650,
         anthropic_fallback_model: Optional[str] = None,
+        usage_recorder: Optional[ModelUsage] = None,
     ):
         super().__init__(tool_descriptions)
         self.client = client
+        self.usage_recorder = usage_recorder or ModelUsage(None, 'agent')
+        self.usage_recorder.attach(client)
         self.model = model
         self.max_turns_per_day = max_turns_per_day
         self.response_callback = response_callback
@@ -107,10 +111,12 @@ class BashAgent(BaseAgent):
         self.total_output_tokens: int = 0
         self.total_cached_tokens: int = 0
         self.total_reasoning_tokens: int = 0
-        self.last_input_tokens: int = 0
-        self.last_output_tokens: int = 0
-        self.last_cached_tokens: int = 0
-        self.last_reasoning_tokens: int = 0
+        self.total_cache_creation_tokens = 0
+        self.last_input_tokens = None
+        self.last_output_tokens = None
+        self.last_cached_tokens = None
+        self.last_reasoning_tokens = None
+        self.last_cache_creation_tokens = None
         self.last_serving_model: str = model
         self.last_anthropic_fallback_used: bool = False
         self.last_anthropic_fallbacks: List[Dict[str, str]] = []
@@ -204,6 +210,7 @@ class BashAgent(BaseAgent):
         self.turns_today = 0
         self._pending_tool_calls = []
         self._last_observation = ""
+        self._observation_recorded = False
         self._day_advanced = False
         self._new_dashboard = ""
 
@@ -292,6 +299,7 @@ class BashAgent(BaseAgent):
             self._observation_recorded = False
 
         # Call LLM
+        self._llm_attempt = 0
         action = self._call_llm()
         self.turns_today += 1
 
@@ -301,6 +309,18 @@ class BashAgent(BaseAgent):
         self._save_conversation_snapshot()
 
         return action
+
+    def _request_model(self, api, request, invoke):
+        self._llm_attempt = getattr(self, '_llm_attempt', 0) + 1
+        try:
+            response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
+                                                turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
+        finally:
+            for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens'):
+                setattr(self, 'total_' + field, self.usage_recorder.summary['known'][field] or 0)
+        for field, value in usage_values(response, api).items():
+            setattr(self, 'last_' + field, value)
+        return response
 
     def record_tool_result(self, observation):
         """Attach a completed result before making a resumable checkpoint."""
@@ -406,10 +426,8 @@ class BashAgent(BaseAgent):
     def load_conversation_snapshot(self, path: Path) -> bool:
         """Restore self.conversation + turn state from a snapshot file.
 
-        Drops any trailing assistant message that contains tool_calls (the
-        in-flight tool was never executed/recorded, so we discard it). Clears
-        _pending_tool_calls. Sets _skip_next_refresh so the next act() does
-        not wipe the restored conversation.
+        Rejects unresolved tool calls. Completed tool results are kept and
+        the same-week observation is not inserted a second time.
 
         Returns True if restoration succeeded, False otherwise.
         """
@@ -536,32 +554,13 @@ class BashAgent(BaseAgent):
                 old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
                 signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
                 try:
-                    response = self.client.chat.completions.create(**api_kwargs)
+                    response = self._request_model('chat', api_kwargs,
+                                                   lambda: self.client.chat.completions.create(**api_kwargs))
                 finally:
                     signal.alarm(0)  # Cancel alarm
                     signal.signal(signal.SIGALRM, old_handler)  # Restore handler
                 self.total_turns += 1
                 self._consecutive_errors = 0
-
-                # Capture token usage (OpenAI chat completions format)
-                usage = getattr(response, 'usage', None)
-                if usage:
-                    self.last_input_tokens = getattr(usage, 'prompt_tokens', 0) or 0
-                    self.last_output_tokens = getattr(usage, 'completion_tokens', 0) or 0
-                    # Cache and reasoning details
-                    ptd = getattr(usage, 'prompt_tokens_details', None)
-                    self.last_cached_tokens = getattr(ptd, 'cached_tokens', 0) or 0 if ptd else 0
-                    ctd = getattr(usage, 'completion_tokens_details', None)
-                    self.last_reasoning_tokens = getattr(ctd, 'reasoning_tokens', 0) or 0 if ctd else 0
-                else:
-                    self.last_input_tokens = 0
-                    self.last_output_tokens = 0
-                    self.last_cached_tokens = 0
-                    self.last_reasoning_tokens = 0
-                self.total_input_tokens += self.last_input_tokens
-                self.total_output_tokens += self.last_output_tokens
-                self.total_cached_tokens += self.last_cached_tokens
-                self.total_reasoning_tokens += self.last_reasoning_tokens
 
                 if self.response_callback:
                     self.response_callback(
@@ -775,33 +774,14 @@ class BashAgent(BaseAgent):
                 old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
                 signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
                 try:
-                    response = self.client.responses.create(**api_kwargs)
+                    response = self._request_model('responses', api_kwargs,
+                                                   lambda: self.client.responses.create(**api_kwargs))
                 finally:
                     signal.alarm(0)
                     signal.signal(signal.SIGALRM, old_handler)
 
                 self.total_turns += 1
                 self._consecutive_errors = 0
-
-                # Capture token usage (Responses API uses input_tokens/output_tokens)
-                usage = getattr(response, 'usage', None)
-                if usage:
-                    self.last_input_tokens = getattr(usage, 'input_tokens', 0) or 0
-                    self.last_output_tokens = getattr(usage, 'output_tokens', 0) or 0
-                    # Cache and reasoning details
-                    itd = getattr(usage, 'input_tokens_details', None)
-                    self.last_cached_tokens = getattr(itd, 'cached_tokens', 0) or 0 if itd else 0
-                    otd = getattr(usage, 'output_tokens_details', None)
-                    self.last_reasoning_tokens = getattr(otd, 'reasoning_tokens', 0) or 0 if otd else 0
-                else:
-                    self.last_input_tokens = 0
-                    self.last_output_tokens = 0
-                    self.last_cached_tokens = 0
-                    self.last_reasoning_tokens = 0
-                self.total_input_tokens += self.last_input_tokens
-                self.total_output_tokens += self.last_output_tokens
-                self.total_cached_tokens += self.last_cached_tokens
-                self.total_reasoning_tokens += self.last_reasoning_tokens
 
                 if self.response_callback:
                     self.response_callback(
@@ -1119,33 +1099,16 @@ class BashAgent(BaseAgent):
                 use_streaming = True
 
             try:
-                if use_streaming:
-                    with anthropic_messages.stream(**api_kwargs) as stream:
-                        response = stream.get_final_message()
-                else:
-                    response = anthropic_messages.create(**api_kwargs)
+                def invoke():
+                    if use_streaming:
+                        with anthropic_messages.stream(**api_kwargs) as stream:
+                            return stream.get_final_message()
+                    return anthropic_messages.create(**api_kwargs)
+                response = self._request_model('messages', dict(api_kwargs, stream=use_streaming), invoke)
 
                 self.total_turns += 1
                 self._consecutive_errors = 0
                 self._record_anthropic_response_metadata(response)
-
-                # Capture token usage (Anthropic format)
-                usage = getattr(response, 'usage', None)
-                if usage:
-                    self.last_input_tokens = getattr(usage, 'input_tokens', 0) or 0
-                    self.last_output_tokens = getattr(usage, 'output_tokens', 0) or 0
-                    # Anthropic cache tracking: cache_creation_input_tokens + cache_read_input_tokens
-                    self.last_cached_tokens = getattr(usage, 'cache_read_input_tokens', 0) or 0
-                    self.last_reasoning_tokens = 0  # Anthropic doesn't expose reasoning tokens separately
-                else:
-                    self.last_input_tokens = 0
-                    self.last_output_tokens = 0
-                    self.last_cached_tokens = 0
-                    self.last_reasoning_tokens = 0
-                self.total_input_tokens += self.last_input_tokens
-                self.total_output_tokens += self.last_output_tokens
-                self.total_cached_tokens += self.last_cached_tokens
-                self.total_reasoning_tokens += self.last_reasoning_tokens
 
                 if self.response_callback:
                     self.response_callback(

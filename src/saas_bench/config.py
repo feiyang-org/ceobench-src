@@ -701,6 +701,10 @@ class BenchmarkConfig:
     # Bedrock configuration
     bedrock_region: str = "us-east-2"  # Ohio — AWS Bedrock region
 
+    # Exact served-model IDs -> USD/1k input, output, cache_read, cache_write.
+    # Empty means no registered price; receipts retain an unknown cost.
+    model_pricing: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
     # Temperature settings
     agent_llm_temperature: float = 0.7  # For agent responses
 

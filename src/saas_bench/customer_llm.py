@@ -11,6 +11,7 @@ Both default to AWS Bedrock, but can fall back to OpenAI if configured.
 """
 
 import sqlite3
+import os
 import json
 import random as _random
 from typing import Optional, Dict, Any, List
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 from .config import BenchmarkConfig, CUSTOMER_GROUPS, ChurnReason
+from .model_usage import ModelUsage, usage_values
 from .database import (
     get_customer_persona, get_group_characteristics, get_world_context,
     add_social_media_post, add_notification
@@ -154,7 +156,8 @@ class CustomerSimulator:
     """
 
     def __init__(self, client: OpenAI, conn: sqlite3.Connection, config: BenchmarkConfig):
-        self.client = client  # OpenAI client (fallback / legacy)
+        self.usage_recorder = ModelUsage(os.environ.get('CEOBENCH_SIMULATOR_USAGE_LOG'), 'simulator', config.model_pricing)
+        self.client = self.usage_recorder.attach(client)
         self.conn = conn
         self.config = config
         self.model = config.agent_llm_model  # Fallback model (used when provider != bedrock)
@@ -170,14 +173,14 @@ class CustomerSimulator:
     def bedrock_client(self):
         """Lazy-initialize the AnthropicBedrock client (AWS Bedrock)."""
         if self._bedrock_client is None:
-            self._bedrock_client = _create_bedrock_client(self.config)
+            self._bedrock_client = self.usage_recorder.attach(_create_bedrock_client(self.config))
         return self._bedrock_client
 
     @property
     def anthropic_client(self):
         """Lazy-initialize the direct Anthropic API client."""
         if self._anthropic_client is None:
-            self._anthropic_client = _create_anthropic_client(self.config)
+            self._anthropic_client = self.usage_recorder.attach(_create_anthropic_client(self.config))
         return self._anthropic_client
 
     @property
@@ -213,66 +216,35 @@ class CustomerSimulator:
         """Single-turn completion. Returns (text, input_tokens, output_tokens)."""
         if provider in ("bedrock", "anthropic"):
             client = self.bedrock_client if provider == "bedrock" else self.anthropic_client
-            kwargs = {
-                "model": model,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "messages": [{"role": "user", "content": user}],
-            }
+            api = 'messages'
+            kwargs = dict(model=model, max_tokens=max_tokens, temperature=temperature,
+                          messages=[{"role": "user", "content": user}])
             if system:
-                kwargs["system"] = system
-            response = client.messages.create(**kwargs)
-            return (
-                response.content[0].text.strip(),
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-            )
-
-        if provider == "deepseek":
+                kwargs['system'] = system
+            invoke = lambda: client.messages.create(**kwargs)
+        else:
             if self.client is None:
-                raise RuntimeError("DeepSeek simulator client is not configured")
-            messages = []
-            if system:
-                messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": user})
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                extra_body={"thinking": {"type": "disabled"}},
-            )
-            text = (response.choices[0].message.content or "").strip()
-            usage = response.usage
-            return (
-                text,
-                getattr(usage, "prompt_tokens", 0) or 0,
-                getattr(usage, "completion_tokens", 0) or 0,
-            )
-
-        # OpenAI Responses API fallback
-        if self.client is None:
-            raise RuntimeError("OpenAI simulator client is not configured")
-        effort = reasoning_effort or "low"
-        response = self.client.responses.create(
-            model=model,
-            reasoning={"effort": effort},
-            input=(
-                [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ]
-                if system
-                else [{"role": "user", "content": user}]
-            ),
-            max_output_tokens=max_tokens,
-        )
-        usage = response.usage
-        return (
-            (response.output_text or "").strip(),
-            getattr(usage, "input_tokens", 0) or 0,
-            getattr(usage, "output_tokens", 0) or 0,
-        )
+                raise RuntimeError(f'{provider} simulator client is not configured')
+            messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+            if provider == 'deepseek':
+                api = 'chat'
+                kwargs = dict(model=model, messages=messages, max_tokens=max_tokens,
+                              temperature=temperature, extra_body={"thinking": {"type": "disabled"}})
+                invoke = lambda: self.client.chat.completions.create(**kwargs)
+            else:
+                api = 'responses'
+                kwargs = dict(model=model, reasoning={"effort": reasoning_effort or "low"},
+                              input=messages, max_output_tokens=max_tokens)
+                invoke = lambda: self.client.responses.create(**kwargs)
+        response = self.usage_recorder.call(api, kwargs, invoke, day=self.current_day, provider=provider)
+        usage = usage_values(response, api)
+        if api == 'messages':
+            text = response.content[0].text
+        elif api == 'chat':
+            text = response.choices[0].message.content
+        else:
+            text = response.output_text
+        return (text or '').strip(), usage['input_tokens'], usage['output_tokens']
 
     def set_event_logger(self, event_logger):
         """Set the event logger for detailed LLM cost logging."""
@@ -283,19 +255,13 @@ class CustomerSimulator:
         self.current_day = day
 
     def _calculate_cost(self, input_tokens: int, output_tokens: int, model: str = None) -> float:
-        """Calculate cost based on model used."""
-        used_model = model or self.model
-        if 'haiku' in used_model:
-            input_cost = input_tokens * self.config.bedrock_haiku_input_cost_per_1k / 1000
-            output_cost = output_tokens * self.config.bedrock_haiku_output_cost_per_1k / 1000
-        elif 'sonnet' in used_model:
-            input_cost = input_tokens * self.config.bedrock_sonnet_input_cost_per_1k / 1000
-            output_cost = output_tokens * self.config.bedrock_sonnet_output_cost_per_1k / 1000
-        else:
-            # Fallback to OpenAI/GPT pricing
-            input_cost = input_tokens * self.config.gpt52_medium_thinking_input_cost_per_1k / 1000
-            output_cost = output_tokens * self.config.gpt52_medium_thinking_output_cost_per_1k / 1000
-        return input_cost + output_cost
+        """Legacy DB callers omit cache counts; exact costs live in SDK receipts."""
+        rates = self.config.model_pricing.get(model or self.model, {})
+        if input_tokens is None or output_tokens is None or not rates:
+            return None
+        if any(rates.get(k) != rates.get('input') for k in ('cache_read', 'cache_write')) or 'output' not in rates:
+            return None
+        return (input_tokens * rates['input'] + output_tokens * rates['output']) / 1000
 
     def _log_cost(self, day: int, purpose: str, input_tokens: int, output_tokens: int, model: str = None):
         """Log API cost to database and event logger."""

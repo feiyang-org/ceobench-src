@@ -1,0 +1,210 @@
+"""Private SDK call and HTTP attempt receipts; unknown usage stays unknown."""
+
+from contextvars import ContextVar
+from datetime import datetime, timezone
+import base64
+import functools
+import json
+import os
+from pathlib import Path
+import threading
+import uuid
+
+import httpx
+
+
+_CALL = ContextVar('model_call', default=None)
+FIELDS = ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens')
+_SECRETS = {'authorization', 'proxy-authorization', 'api_key', 'api-key', 'x-api-key',
+            'aws_access_key', 'aws_secret_key', 'aws_session_token'}
+
+
+def plain(value):
+    if hasattr(value, 'model_dump'):
+        value = value.model_dump(mode='json', exclude_unset=True)
+    if isinstance(value, dict):
+        return {k: '[REDACTED]' if k.lower() in _SECRETS else plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain(v) for v in value]
+    return value
+
+
+def usage_values(response, api):
+    raw = plain(response) or {}
+    usage = raw.get('usage') or {}
+    chat = api == 'chat'
+    anthropic = api == 'messages'
+    input_tokens = usage.get('prompt_tokens' if chat else 'input_tokens')
+    output_tokens = usage.get('completion_tokens' if chat else 'output_tokens')
+    read = (usage.get('cache_read_input_tokens') if anthropic else
+            (usage.get('prompt_tokens_details' if chat else 'input_tokens_details') or {}).get('cached_tokens'))
+    write = usage.get('cache_creation_input_tokens')
+    # Anthropic reports uncached input separately; the common input count includes caches.
+    if anthropic:
+        input_tokens = sum((input_tokens, read, write)) if all(v is not None for v in (input_tokens, read, write)) else None
+    reasoning = (usage.get('completion_tokens_details' if chat else 'output_tokens_details') or {}).get('reasoning_tokens')
+    return dict(zip(FIELDS, (input_tokens, output_tokens, read, write, reasoning)))
+
+
+def cost_usd(usage, api, rates):
+    """Rates are explicit dollars per 1k tokens for this exact served model."""
+    if not rates or any(usage[k] is None for k in ('input_tokens', 'output_tokens', 'cached_tokens')):
+        return None
+    write = usage['cache_creation_tokens'] if api == 'messages' else 0
+    if write is None:
+        return None
+    counts = {'input': usage['input_tokens'] - usage['cached_tokens'] - write,
+              'output': usage['output_tokens'], 'cache_read': usage['cached_tokens'], 'cache_write': write}
+    if any(n < 0 or (n and k not in rates) for k, n in counts.items()):
+        return None
+    return sum(n * rates.get(k, 0) / 1000 for k, n in counts.items())
+
+
+class _Stream(httpx.SyncByteStream):
+    def __init__(self, source, finish):
+        self.source, self.finish = source, finish
+        self.chunks = []
+        self.finished = False
+
+    def _finish(self, error=None):
+        if not self.finished:
+            self.finished = True
+            self.finish(b''.join(self.chunks), error)
+
+    def __iter__(self):
+        try:
+            for chunk in self.source:
+                self.chunks.append(chunk)
+                yield chunk
+        except BaseException as exc:
+            self._finish(type(exc).__name__)
+            raise
+        else:
+            self._finish()
+
+    def close(self):
+        try:
+            self.source.close()
+        finally:
+            self._finish('stream_closed_before_completion')
+
+
+class ModelUsage:
+    def __init__(self, path, role, pricing=None):
+        self.path = Path(path) if path else None
+        self.role = role
+        self.pricing = pricing or {}
+        self.lock = threading.RLock()
+        self.summary = {'calls': 0, 'errors': 0, 'known': {k: None for k in FIELDS},
+                        'missing': {k: 0 for k in FIELDS}, 'known_cost_usd': None, 'missing_cost': 0,
+                        'http_attempts': 0, 'failed_http_attempts': 0, 'failed_attempts_without_usage': 0}
+
+    def write(self, event, **values):
+        if self.path:
+            entry = dict(event=event, role=self.role, timestamp=datetime.now(timezone.utc).isoformat(), **values)
+            with self.lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open('a') as stream:
+                    stream.write(json.dumps(plain(entry), ensure_ascii=False, allow_nan=False) + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+    def attach(self, client):
+        """Keep SDK retry policy and its configured transport, including test transports."""
+        http_client = getattr(client, '_client', None)
+        if not isinstance(http_client, httpx.Client):
+            return client
+        if getattr(http_client, '_ceobench_recorded', False):
+            return client
+        send = http_client.send
+
+        @functools.wraps(send)
+        def recorded_send(request, *args, **kwargs):
+            call_id = _CALL.get()
+            attempt_id = uuid.uuid4().hex
+            failure_recorded = False
+            with self.lock:
+                self.summary['http_attempts'] += 1
+            body = request.read().decode('utf-8')
+            try:
+                body = json.loads(body)
+            except ValueError:
+                pass
+            self.write('http_request', call_id=call_id, attempt_id=attempt_id,
+                       method=request.method, endpoint=str(request.url.copy_with(query=None, username='', password='')),
+                       sdk_retry=request.headers.get('x-stainless-retry-count'), body=body)
+            try:
+                # Read through our stream wrapper, so interrupted SSE bodies are retained too.
+                streaming = kwargs.get('stream', False)
+                response = send(request, *args, **dict(kwargs, stream=True))
+                def finish(content, error):
+                    nonlocal failure_recorded
+                    try:
+                        body = content.decode('utf-8')
+                    except UnicodeDecodeError:
+                        body = {'base64': base64.b64encode(content).decode('ascii')}
+                    if response.status_code >= 400 or error:
+                        try:
+                            reported = json.loads(content).get('usage')
+                        except (ValueError, AttributeError):
+                            reported = None
+                        with self.lock:
+                            self.summary['failed_http_attempts'] += 1
+                            self.summary['failed_attempts_without_usage'] += not bool(reported)
+                        failure_recorded = True
+                    self.write('http_response', call_id=call_id, attempt_id=attempt_id,
+                               status=response.status_code, request_id=response.headers.get('request-id') or response.headers.get('x-request-id'),
+                               body=body, error=error)
+                if response.is_stream_consumed:
+                    finish(response.content, None)
+                else:
+                    response.stream = _Stream(response.stream, finish)
+                    if not streaming:
+                        response.read()
+                return response
+            except BaseException as exc:
+                if not failure_recorded:
+                    with self.lock:
+                        self.summary['failed_http_attempts'] += 1
+                        self.summary['failed_attempts_without_usage'] += 1
+                self.write('http_error', call_id=call_id, attempt_id=attempt_id, error=type(exc).__name__)
+                raise
+
+        http_client.send = recorded_send
+        http_client._ceobench_recorded = True
+        return client
+
+    def call(self, api, request, invoke, **context):
+        call_id = uuid.uuid4().hex
+        token = _CALL.set(call_id)
+        response, error = None, None
+        self.write('request', call_id=call_id, api=api, request=request, **context)
+        try:
+            response = invoke()
+            return response
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            try:
+                raw = plain(response)
+                usage = usage_values(raw, api)
+                served_model = raw.get('model') if isinstance(raw, dict) else None
+                cost = cost_usd(usage, api, self.pricing.get(served_model))
+                with self.lock:
+                    summary = self.summary
+                    summary['calls'] += 1
+                    summary['errors'] += error is not None
+                    for field, value in usage.items():
+                        if value is None:
+                            summary['missing'][field] += 1
+                        else:
+                            summary['known'][field] = (summary['known'][field] or 0) + value
+                    if cost is None:
+                        summary['missing_cost'] += 1
+                    else:
+                        summary['known_cost_usd'] = (summary['known_cost_usd'] or 0) + cost
+                    self.write('response', call_id=call_id, api=api, response=raw, usage=usage,
+                               error=error, cost_usd=cost, pricing=self.pricing.get(served_model))
+            finally:
+                _CALL.reset(token)

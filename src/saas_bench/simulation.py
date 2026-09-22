@@ -7519,6 +7519,8 @@ Guidelines:
                 self._group_rngs[gid] = Generator(PCG64(group_seed ^ gid_hash))
 
         self.current_day += 1
+        if self.customer_simulator:
+            self.customer_simulator.set_current_day(self.current_day)
         config = self.get_current_config()
 
         # LLM-replay: if source had an agent_social_media_post on (current_day - 1)

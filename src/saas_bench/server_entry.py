@@ -420,7 +420,8 @@ def cmd_start_server(args, base: Path):
             write_json(target / 'session.json', saved_meta)
             write_json(target / 'server_state.json', {
                 'day': simulator.current_day, 'dashboard': api_server.last_dashboard,
-                'script_results': api_server.last_script_results})
+                'script_results': api_server.last_script_results,
+                'usage': customer_sim.usage_recorder.summary})
             return {'success': True, 'snapshot_id': snapshot_id, 'day': simulator.current_day,
                     'files': {name: file_hash(target / name) for name in
                               ('world.nmdb', 'session.json', 'server_state.json')}}
@@ -433,6 +434,7 @@ def cmd_start_server(args, base: Path):
             raise ValueError('Restored dashboard day differs from world')
         api_server._last_dashboard = state['dashboard']
         api_server.last_script_results = state['script_results']
+        customer_sim.usage_recorder.summary = state['usage']
     api_server.start()
 
     # Set API port on tools so Python sandbox routes queries through HTTP

@@ -367,7 +367,7 @@ class BashAgentRunner:
             "timestamp": now(),
             "turn": turn,
             "day": day,
-            "messages_count": len(messages),
+            "messages": messages,
             "raw_response": raw_response,
         }
         with open(self.response_log_file, 'a') as f:
@@ -584,6 +584,7 @@ __pycache__/
         env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
         env['CEOBENCH_RUN_KIND'] = self.run_kind
         env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
+        env['CEOBENCH_SIMULATOR_USAGE_LOG'] = str(self.logs_dir / 'simulator_requests.jsonl')
         if getattr(self, '_restored_snapshot_dir', None):
             env['CEOBENCH_RESTORE_SERVER_STATE'] = str(self._restored_snapshot_dir / 'server_state.json')
         # DeepSeek / OpenCode agent runs keep the simulator on official DeepSeek
@@ -613,6 +614,7 @@ __pycache__/
         manifest = dict(version=1, build=build, configuration=configuration,
                         benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS[self.scenario]))
         manifest = json.loads(json.dumps(manifest))
+        self._pricing = manifest['benchmark_config']['model_pricing']
         path = self.workspace_dir / 'manifest.json'
         if self.continue_from:
             if json.loads(path.read_text()) != manifest:
@@ -749,11 +751,15 @@ __pycache__/
                           session_id=self._session_id, snapshot_id=snapshot_id,
                           files=receipt['files'], workspace_sha256=tree_hash(directory / 'agent_workspace'))
         checkpoint['context_boundary'] = 'same_week' if self.agent and self.agent.current_day == day else 'new_week'
+        checkpoint['usage'] = self.agent.usage_recorder.summary if self.agent else None
         for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
-                      'total_cached_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
+                      'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
             checkpoint[field] = getattr(self.agent, field, 0)
         write_json(directory / 'checkpoint.json', checkpoint)
         write_json(self.workspace_dir / 'checkpoint.json', checkpoint)
+        write_json(self.workspace_dir / 'usage_summary.json', {
+            'snapshot_id': snapshot_id, 'day': day, 'agent': checkpoint['usage'],
+            'simulator': json.loads((directory / 'server_state.json').read_text())['usage']})
 
     def _restore_checkpoint_files(self, checkpoint):
         from saas_bench.run_state import checkpoint_directory, copy_workspace
@@ -790,8 +796,9 @@ __pycache__/
         """Restore agent accounting after the server has loaded the saved world."""
         if self.agent:
             for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
-                          'total_cached_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
+                          'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
                 setattr(self.agent, field, checkpoint[field])
+            self.agent.usage_recorder.summary = checkpoint['usage']
             if checkpoint['context_boundary'] == 'same_week':
                 if not self.agent.load_conversation_snapshot(self.agent._snapshot_path):
                     raise ValueError('Cannot restore the checkpoint conversation')
@@ -906,6 +913,7 @@ __pycache__/
         )
 
         tool_descriptions = get_bash_agent_tool_descriptions()
+        from saas_bench.model_usage import ModelUsage
 
         self.agent = BashAgent(
             tool_descriptions=tool_descriptions,
@@ -918,6 +926,7 @@ __pycache__/
             workspace_path=self.agent_workspace,
             total_days=self.total_days,
             anthropic_fallback_model=self.anthropic_fallback_model,
+            usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing),
         )
 
         # Wire the per-session conversation snapshot path. The agent writes
@@ -1062,10 +1071,10 @@ __pycache__/
                 action = self.agent.act(observation, 0, False, info)
                 _llm_elapsed = _time.monotonic() - _t0
                 _day_llm_total += _llm_elapsed
-                _day_input_tokens += self.agent.last_input_tokens
-                _day_output_tokens += self.agent.last_output_tokens
-                _day_cached_tokens += self.agent.last_cached_tokens
-                _day_reasoning_tokens += self.agent.last_reasoning_tokens
+                _day_input_tokens += self.agent.last_input_tokens or 0
+                _day_output_tokens += self.agent.last_output_tokens or 0
+                _day_cached_tokens += self.agent.last_cached_tokens or 0
+                _day_reasoning_tokens += self.agent.last_reasoning_tokens or 0
 
                 if action is None:
                     # With the agent's retry-with-feedback loop, _call_* should no
@@ -1310,7 +1319,7 @@ __pycache__/
             print(f"Outcome: {game_outcome}")
             print(f"Total Turns: {self.agent.total_turns}")
             _total_cache_pct = (self.agent.total_cached_tokens / self.agent.total_input_tokens * 100) if self.agent.total_input_tokens > 0 else 0
-            print(f"Total Tokens: {self.agent.total_input_tokens:,} input / {self.agent.total_output_tokens:,} output")
+            print('Usage (known subtotals and missing counts): ' + json.dumps(self.agent.usage_recorder.summary))
             print(f"Cached Tokens: {self.agent.total_cached_tokens:,} ({_total_cache_pct:.0f}% of input)")
             print(f"Reasoning Tokens: {self.agent.total_reasoning_tokens:,}")
             if self.anthropic_fallback_model or self.agent.total_anthropic_fallbacks:

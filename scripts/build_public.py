@@ -54,6 +54,7 @@ _ENGINE_MODULES = [
     "event_logger",
     "llm",
     "llm_replay",
+    "model_usage",
     "novamind_cli",
     "personas",
     "run_state",
