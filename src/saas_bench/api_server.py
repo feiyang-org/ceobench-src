@@ -636,7 +636,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                 return
             server: NovaMindAPIServer = self.server._api_server
             with server._lock:
-                server._daily_scripts[name] = content
+                scripts = server.get_daily_scripts()
+                scripts[name] = content
+                server.set_daily_scripts(scripts)
             self._send_json({"success": True, "data": {"name": name, "registered": True}})
         except Exception as e:
             self._send_internal_error(e, op="daily-scripts:post")
@@ -658,7 +660,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                 if name not in server._daily_scripts:
                     self._send_json({"success": False, "error": f"Script not found: {name}"}, 404)
                     return
-                del server._daily_scripts[name]
+                scripts = server.get_daily_scripts()
+                del scripts[name]
+                server.set_daily_scripts(scripts)
             self._send_json({"success": True, "data": {"removed": name}})
         except Exception as e:
             self._send_internal_error(e, op="daily-scripts:delete")
@@ -790,6 +794,14 @@ class NovaMindAPIServer:
         self.script_workspace = script_workspace or tools.workspace_path
         self.require_sandbox = require_sandbox
         self.last_script_results = []
+        if conn is not None:
+            conn.execute('CREATE TABLE IF NOT EXISTS _registered_scripts (position INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, content TEXT NOT NULL, sha256 TEXT NOT NULL)')
+            saved_scripts = conn.execute('SELECT name, content, sha256 FROM _registered_scripts ORDER BY position').fetchall()
+            import hashlib
+            for name, content, checksum in saved_scripts:
+                if hashlib.sha256(content.encode()).hexdigest() != checksum:
+                    raise ValueError('Registered script checksum mismatch: ' + name)
+                self._daily_scripts[name] = content
         self._step_day_timed_out: bool = False  # Set when step_day exceeds timeout
 
         # Per-query wall-clock deadline (monotonic seconds; 0 = disabled).
@@ -1001,4 +1013,20 @@ class NovaMindAPIServer:
     def set_daily_scripts(self, scripts: Dict[str, str]):
         """Restore daily scripts from checkpoint."""
         with self._lock:
+            import hashlib
+            if not isinstance(scripts, dict) or any(not isinstance(n, str) or not n or not isinstance(c, str)
+                                                    for n, c in scripts.items()):
+                raise ValueError('Invalid registered script snapshots')
+            if self.conn is not None:
+                self.conn.execute('SAVEPOINT registered_scripts')
+                try:
+                    self.conn.execute('DELETE FROM _registered_scripts')
+                    self.conn.executemany('INSERT INTO _registered_scripts VALUES (?, ?, ?, ?)',
+                        [(i, n, c, hashlib.sha256(c.encode()).hexdigest())
+                         for i, (n, c) in enumerate(scripts.items())])
+                    self.conn.execute('RELEASE registered_scripts')
+                except Exception:
+                    self.conn.execute('ROLLBACK TO registered_scripts')
+                    self.conn.execute('RELEASE registered_scripts')
+                    raise
             self._daily_scripts = dict(scripts)

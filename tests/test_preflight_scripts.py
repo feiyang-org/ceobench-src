@@ -6,6 +6,28 @@ import json
 from saas_bench.api_server import NovaMindAPIServer
 
 
+def test_registered_versions_survive_database_backup(tmp_path):
+    import sqlite3
+    import pytest
+    tools = SimpleNamespace(workspace_path=tmp_path)
+    conn = sqlite3.connect(':memory:')
+    server = NovaMindAPIServer(tools, conn=conn)
+    server.set_daily_scripts({'first': "print('A')", 'second': "print('two')"})
+    clone = sqlite3.connect(':memory:')
+    conn.backup(clone)
+    restored = NovaMindAPIServer(tools, conn=clone)
+    assert list(restored.get_daily_scripts()) == ['first', 'second']
+    assert restored._run_daily_scripts_internal()['first'] == 'A\n'
+    restored.set_daily_scripts({'first': "print('B')"})
+    assert restored._run_daily_scripts_internal()['first'] == 'B\n'
+    assert server.get_daily_scripts()['first'] == "print('A')"
+    restored.set_daily_scripts({})
+    assert NovaMindAPIServer(tools, conn=clone).get_daily_scripts() == {}
+    conn.execute("UPDATE _registered_scripts SET content='corrupt' WHERE name='first'")
+    with pytest.raises(ValueError, match='checksum'):
+        NovaMindAPIServer(tools, conn=conn)
+
+
 def test_registered_snapshot_executes_and_can_call_server(tmp_path):
     tools = SimpleNamespace(workspace_path=tmp_path, current_day=0)
     server = NovaMindAPIServer(tools)
