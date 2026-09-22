@@ -185,6 +185,25 @@ def _restore_simulator_llm_config(config: BenchmarkConfig, meta: dict) -> None:
             setattr(config, attr, value)
 
 
+def _session_config(seed, total_days, initial_cash, meta=None):
+    frozen = (meta or {}).get('benchmark_config')
+    manifest_path = os.environ.get('CEOBENCH_RUN_MANIFEST')
+    if manifest_path:
+        requested = json.loads(Path(manifest_path).read_text())['benchmark_config']
+        if frozen and frozen != requested:
+            raise ValueError('Session configuration differs from run manifest')
+        frozen = requested
+    config = BenchmarkConfig(**frozen) if frozen else BenchmarkConfig(
+        seed=seed, total_days=total_days, initial_cash=initial_cash)
+    if meta and not frozen:
+        _restore_simulator_llm_config(config, meta)
+    before = {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
+    effective = _apply_simulator_llm_config(config)
+    if frozen and effective != before:
+        raise ValueError('Simulator environment would change frozen model configuration')
+    return config
+
+
 def _create_simulator_openai_client(config: BenchmarkConfig):
     providers = {config.social_post_llm_provider, config.enterprise_llm_provider}
     if not providers.intersection({"openai", "deepseek"}):
@@ -215,11 +234,7 @@ def cmd_new_session(args, base: Path):
 
     # Initialize RNG and config
     rng = Generator(PCG64(seed))
-    config = BenchmarkConfig(
-        seed=seed,
-        total_days=total_days,
-        initial_cash=args.cash,
-    )
+    config = _session_config(seed, total_days, args.cash)
     simulator_llm = _apply_simulator_llm_config(config)
 
     # Initialize database in memory (never writes plain SQLite to disk)
@@ -255,6 +270,8 @@ def cmd_new_session(args, base: Path):
         "status": "created",
         "simulator_llm": simulator_llm,
     }
+    from dataclasses import asdict
+    meta['benchmark_config'] = asdict(config)
     _session_meta_path(base, session_id).write_text(json.dumps(meta, indent=2))
 
     # Initialize empty history
@@ -304,12 +321,7 @@ def cmd_start_server(args, base: Path):
 
     # Reconstruct simulator state
     rng = Generator(PCG64(seed))
-    config = BenchmarkConfig(
-        seed=seed,
-        total_days=total_days,
-        initial_cash=meta["initial_cash"],
-    )
-    _restore_simulator_llm_config(config, meta)
+    config = _session_config(seed, total_days, meta['initial_cash'], meta)
     meta["simulator_llm"] = _apply_simulator_llm_config(config)
 
     customer_sim = CustomerSimulator(

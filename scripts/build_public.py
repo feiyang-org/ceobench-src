@@ -56,6 +56,7 @@ _ENGINE_MODULES = [
     "llm_replay",
     "novamind_cli",
     "personas",
+    "run_state",
     "server_entry",
     "shocks",
     "simulation",
@@ -157,6 +158,8 @@ def build():
     # ── Step 3: Build the novamind-operation zipapp ──
     step("3. Building novamind-operation zipapp")
     _build_zipapp()
+    from saas_bench.run_state import build_manifest, write_json
+    write_json(PUBLIC_DIR / 'build.json', build_manifest(PROJECT_ROOT, PUBLIC_DIR))
     print("✅ Wrote public/novamind-operation (zipapp)")
 
     # ── Step 4: Purge legacy artifacts left by the pre-zipapp layout ──

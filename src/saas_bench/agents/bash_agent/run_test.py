@@ -80,16 +80,31 @@ class BashAgentRunner:
         provider: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        seed: int = 42,
-        scenario: str = "default",
-        total_days: int = 3650,
-        initial_cash: float = 1_000_000.0,
+        seed: Optional[int] = None,
+        scenario: Optional[str] = None,
+        total_days: Optional[int] = None,
+        initial_cash: Optional[float] = None,
         workspace_base: Optional[Path] = None,
         reasoning_effort: Optional[str] = None,
         continue_from: Optional[Path] = None,
         label: Optional[str] = None,
     ):
         default_config = BenchmarkConfig()
+        if continue_from:
+            saved = json.loads((Path(continue_from) / 'manifest.json').read_text())['configuration']
+            supplied = dict(model=model, provider=provider, base_url=base_url,
+                            seed=seed, scenario=scenario, total_days=total_days,
+                            initial_cash=initial_cash, reasoning_effort=reasoning_effort)
+            for key, value in supplied.items():
+                if value is not None and value != saved[key]:
+                    raise ValueError(f'Resume configuration mismatch: {key}')
+            model, provider, base_url = (saved[k] for k in ('model', 'provider', 'base_url'))
+            seed, scenario, total_days, initial_cash, reasoning_effort = (
+                saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
+        seed = 42 if seed is None else seed
+        scenario = 'default' if scenario is None else scenario
+        total_days = 3650 if total_days is None else total_days
+        initial_cash = 1_000_000.0 if initial_cash is None else initial_cash
         self.model = model or default_config.agent_llm_model
         self.provider = provider or default_config.agent_llm_provider
         self.seed = seed
@@ -514,6 +529,7 @@ __pycache__/
                 "--days", str(self.total_days),
                 "--seed", str(self.seed),
                 "--cash", str(self.initial_cash),
+                "--scenario", self.scenario,
             ],
             capture_output=True, text=True, env=env,
         )
@@ -560,6 +576,7 @@ __pycache__/
         """Environment for host-side simulator processes."""
         env = os.environ.copy()
         env["NOVAMIND_SERVER_MODE"] = "1"
+        env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
         # DeepSeek / OpenCode agent runs keep the simulator on official DeepSeek
         # so social/enterprise LLM calls do not require Anthropic and do not
         # burn the OpenCode Go subscription quota.
@@ -567,6 +584,32 @@ __pycache__/
             env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", "deepseek")
             env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", "deepseek-v4-flash")
         return env
+
+    def _prepare_manifest(self):
+        from dataclasses import asdict
+        from saas_bench.config import SCENARIO_PACKS
+        from saas_bench.run_state import verify_build, write_json
+        build = verify_build(self._public_dir())
+        configuration = {key: getattr(self, key) for key in (
+            'model', 'provider', 'base_url', 'seed', 'scenario', 'total_days',
+            'initial_cash', 'reasoning_effort', 'anthropic_fallback_model')}
+        configuration['bedrock_region'] = os.environ.get('AWS_REGION', 'us-east-2')
+        config = BenchmarkConfig(seed=self.seed, total_days=self.total_days, initial_cash=self.initial_cash)
+        env = self._server_environment()
+        for suffix in ('provider', 'model'):
+            value = env.get('CEOBENCH_SIMULATOR_LLM_' + suffix.upper())
+            if value:
+                for prefix in ('social_post_llm_', 'enterprise_llm_'):
+                    setattr(config, prefix + suffix, value)
+        manifest = dict(version=1, build=build, configuration=configuration,
+                        benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS[self.scenario]))
+        manifest = json.loads(json.dumps(manifest))
+        path = self.workspace_dir / 'manifest.json'
+        if self.continue_from:
+            if json.loads(path.read_text()) != manifest:
+                raise ValueError('Run manifest differs: artifacts or effective configuration changed')
+        else:
+            write_json(path, manifest)
 
     def _launch_server(self):
         """Launch the host-side novamind-operation zipapp in server mode.
@@ -886,6 +929,7 @@ __pycache__/
         workspace — they stay in public/ on the host side.
         """
         from .agent import BashAgent
+        self._prepare_manifest()
         from .tools import get_bash_agent_tool_descriptions, BashAgentToolExecutor, NextDayTimeoutError
         self._NextDayTimeoutError = NextDayTimeoutError
 
@@ -1401,9 +1445,9 @@ def main():
                         choices=["openai", "xai", "google", "anthropic", "bedrock", "modal", "together", "deepseek", "opencode", "ai_sandbox"],
                         help=f"API provider (default: BenchmarkConfig.agent_llm_provider={default_config.agent_llm_provider})")
     parser.add_argument("--base-url", help="Custom API base URL")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--scenario", default="default", help="Scenario name")
-    parser.add_argument("--days", type=int, default=3650, help="Total simulation days")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (new run: 42)")
+    parser.add_argument("--scenario", default=None, help="Scenario name (new run: default)")
+    parser.add_argument("--days", type=int, default=None, help="Total simulation days (new run: 3650)")
     parser.add_argument("--workspace", type=Path, help="Workspace base directory")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     parser.add_argument("--reasoning-effort",
