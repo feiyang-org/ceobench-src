@@ -89,10 +89,17 @@ class BashAgentRunner:
         continue_from: Optional[Path] = None,
         label: Optional[str] = None,
         run_kind: Optional[str] = None,
+        pricing_file: Optional[Path] = None,
     ):
+        from saas_bench.model_usage import load_pricing
+        self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
         default_config = BenchmarkConfig()
         if continue_from:
-            saved = json.loads((Path(continue_from) / 'manifest.json').read_text())['configuration']
+            saved_manifest = json.loads((Path(continue_from) / 'manifest.json').read_text())
+            saved = saved_manifest['configuration']
+            if pricing_file and self.pricing_registration != saved_manifest.get('pricing'):
+                raise ValueError('Resume pricing configuration mismatch')
+            self.pricing_registration = saved_manifest.get('pricing')
             supplied = dict(model=model, provider=provider, base_url=base_url,
                             seed=seed, scenario=scenario, total_days=total_days,
                             initial_cash=initial_cash, reasoning_effort=reasoning_effort, run_kind=run_kind)
@@ -613,6 +620,8 @@ __pycache__/
             'initial_cash', 'reasoning_effort', 'anthropic_fallback_model', 'run_kind')}
         configuration['bedrock_region'] = os.environ.get('AWS_REGION', 'us-east-2')
         config = BenchmarkConfig(seed=self.seed, total_days=self.total_days, initial_cash=self.initial_cash)
+        if self.pricing_registration:
+            config.model_pricing = self.pricing_registration['rates']
         config.simulator_openai_base_url = os.environ.get('OPENAI_BASE_URL', config.simulator_openai_base_url)
         config.simulator_anthropic_base_url = os.environ.get('ANTHROPIC_BASE_URL', config.simulator_anthropic_base_url)
         env = self._server_environment()
@@ -624,6 +633,8 @@ __pycache__/
         manifest = dict(version=1, build=build, configuration=configuration,
                         benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
+        if self.pricing_registration:
+            manifest['pricing'] = self.pricing_registration
         manifest = json.loads(json.dumps(manifest))
         self._pricing = manifest['benchmark_config']['model_pricing']
         path = self.workspace_dir / 'manifest.json'
@@ -1347,6 +1358,7 @@ def main():
                              "(e.g. 'leads_x1.25'). Lets multiple config variants be "
                              "distinguished without forking the run_id scheme.")
     parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
+    parser.add_argument('--pricing-file', type=Path, help='JSON with source, basis, and exact-model USD/1k token rates')
     args = parser.parse_args()
 
     runner = BashAgentRunner(
@@ -1362,6 +1374,7 @@ def main():
         continue_from=args.continue_from,
         label=args.label,
         run_kind=args.run_kind,
+        pricing_file=args.pricing_file,
     )
 
     result = runner.run(verbose=not args.quiet)

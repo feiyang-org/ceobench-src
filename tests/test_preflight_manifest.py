@@ -95,3 +95,26 @@ def test_opencode_routes_both_roles_without_deepseek_credentials(tmp_path, monke
         _create_simulator_openai_client(config)
     runner.client.close()
     client.close()
+
+
+def test_registered_pricing_is_frozen_and_survives_source_file_removal(tmp_path, monkeypatch):
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    monkeypatch.setattr('saas_bench.agents.bash_agent.run_test.load_env_file', lambda _: {})
+    monkeypatch.setattr('saas_bench.run_state.verify_build', lambda *a, **k: {})
+    monkeypatch.setenv('OPENCODE_API_KEY', 'offline-only')
+    path = tmp_path / 'price.json'
+    data = dict(source='https://opencode.ai/docs/go/', basis='USD/1k quota', rates={'test-model': {'input': .001}})
+    path.write_text(json.dumps(data))
+    first = BashAgentRunner(provider='opencode', model='test-model', workspace_base=tmp_path, pricing_file=path)
+    first._prepare_manifest()
+    assert json.loads((first.workspace_dir / 'manifest.json').read_text())['pricing'] == data
+    path.unlink()
+    restored = BashAgentRunner(continue_from=first.workspace_dir)
+    restored._prepare_manifest()
+    assert restored._pricing == data['rates']
+    data['rates']['test-model']['input'] = 9
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='pricing configuration mismatch'):
+        BashAgentRunner(continue_from=first.workspace_dir, pricing_file=path)
+    first.client.close()
+    restored.client.close()

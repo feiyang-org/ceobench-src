@@ -91,6 +91,29 @@ def test_missing_usage_cache_prices_and_restored_subtotals(tmp_path):
     assert usage_values({'usage': {'prompt_tokens': 8, 'prompt_cache_hit_tokens': 3}}, 'chat')['cached_tokens'] == 3
 
 
+def test_go_cache_fields_and_sourced_time_bounded_prices(tmp_path):
+    from datetime import datetime, timezone
+    from saas_bench.model_usage import load_pricing
+    response = reply('chat')
+    response['usage']['prompt_tokens_details']['cache_write_tokens'] = 0
+    usage = usage_values(response, 'chat')
+    assert usage['cache_creation_tokens'] == 0
+    response['usage']['prompt_tokens_details']['cache_creation_input_tokens'] = 2
+    assert usage_values(response, 'chat')['cache_creation_tokens'] == 2
+    rates = dict(input=.00015, output=.0006, cache_read=.000003,
+                 valid_from='2026-09-22T10:00:00+00:00', valid_until='2026-09-23T01:00:00+00:00')
+    path = tmp_path / 'pricing.json'
+    path.write_text(json.dumps(dict(source='https://opencode.ai/docs/go/', basis='subscription quota, USD/1k', rates={'test-model': rates})))
+    assert load_pricing(path)['rates']['test-model'] == rates
+    assert cost_usd(usage, 'chat', rates, datetime(2026, 9, 22, 11, tzinfo=timezone.utc)) == pytest.approx(.000002259)
+    assert cost_usd(usage, 'chat', rates, datetime(2026, 9, 23, 1, tzinfo=timezone.utc)) is None
+    for invalid in (-1, float('inf'), True):
+        rates['input'] = invalid
+        path.write_text(json.dumps(dict(source='documented', basis='USD/1k', rates={'test-model': rates})))
+        with pytest.raises(ValueError, match='finite nonnegative'):
+            load_pricing(path)
+
+
 def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch):
     monkeypatch.setattr('time.sleep', lambda _: None)
     attempts = []

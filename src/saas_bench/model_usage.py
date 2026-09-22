@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import base64
 import functools
 import json
+import math
 import os
 from pathlib import Path
 import threading
@@ -41,6 +42,9 @@ def usage_values(response, api):
     if chat and read is None:
         read = usage.get('prompt_cache_hit_tokens')
     write = usage.get('cache_creation_input_tokens')
+    if write is None and not anthropic:
+        details = usage.get('prompt_tokens_details' if chat else 'input_tokens_details') or {}
+        write = details.get('cache_creation_input_tokens', details.get('cache_write_tokens'))
     # Anthropic reports uncached input separately; the common input count includes caches.
     if anthropic:
         input_tokens = sum((input_tokens, read, write)) if all(v is not None for v in (input_tokens, read, write)) else None
@@ -48,9 +52,35 @@ def usage_values(response, api):
     return dict(zip(FIELDS, (input_tokens, output_tokens, read, write, reasoning)))
 
 
-def cost_usd(usage, api, rates):
+def load_pricing(path):
+    """Load a sourced price table; the manifest stores its contents, not its path."""
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError('Pricing must be a JSON object')
+    if not all(isinstance(data.get(k), str) and data[k].strip() for k in ('source', 'basis')):
+        raise ValueError('Pricing requires source and basis')
+    if not isinstance(data.get('rates'), dict) or not data['rates']:
+        raise ValueError('Pricing requires model rates')
+    for model, rates in data['rates'].items():
+        if not model or not isinstance(rates, dict) or not rates:
+            raise ValueError('Invalid model pricing')
+        for key, value in rates.items():
+            if key in ('valid_from', 'valid_until'):
+                if datetime.fromisoformat(value).tzinfo is None:
+                    raise ValueError('Price validity requires a timezone')
+            elif key not in ('input', 'output', 'cache_read', 'cache_write') or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError('Price must be a finite nonnegative USD/1k token rate')
+        if 'valid_from' in rates and 'valid_until' in rates and datetime.fromisoformat(rates['valid_from']) >= datetime.fromisoformat(rates['valid_until']):
+            raise ValueError('Invalid price validity interval')
+    return data
+
+
+def cost_usd(usage, api, rates, at=None):
     """Rates are explicit dollars per 1k tokens for this exact served model."""
     if not rates or any(usage[k] is None for k in ('input_tokens', 'output_tokens', 'cached_tokens')):
+        return None
+    at = at or datetime.now(timezone.utc)
+    if ('valid_from' in rates and at < datetime.fromisoformat(rates['valid_from'])) or ('valid_until' in rates and at >= datetime.fromisoformat(rates['valid_until'])):
         return None
     write = usage['cache_creation_tokens'] if api == 'messages' else 0
     if write is None:
@@ -134,6 +164,7 @@ class ModelUsage:
                 pass
             recorder.write('http_request', call_id=call_id, attempt_id=attempt_id,
                        method=request.method, endpoint=str(request.url.copy_with(query=None, username='', password='')),
+                       client_headers={k: request.headers[k] for k in ('user-agent', 'x-opencode-session') if k in request.headers},
                        sdk_retry=request.headers.get('x-stainless-retry-count'), body=body)
             try:
                 # Read through our stream wrapper, so interrupted SSE bodies are retained too.
@@ -178,6 +209,7 @@ class ModelUsage:
 
     def call(self, api, request, invoke, **context):
         call_id = uuid.uuid4().hex
+        started = datetime.now(timezone.utc)
         token = _CALL.set((self, call_id))
         response, error = None, None
         self.write('request', call_id=call_id, api=api, request=request, **context)
@@ -192,7 +224,7 @@ class ModelUsage:
                 raw = plain(response)
                 usage = usage_values(raw, api)
                 served_model = raw.get('model') if isinstance(raw, dict) else None
-                cost = cost_usd(usage, api, self.pricing.get(served_model))
+                cost = cost_usd(usage, api, self.pricing.get(served_model), at=started)
                 with self.lock:
                     summary = self.summary
                     summary['calls'] += 1
