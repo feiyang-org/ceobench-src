@@ -307,6 +307,12 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._handle_query()
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_post()
+            elif self.path == '/checkpoint':
+                body = self._read_body()
+                if set(body) != {'expected_day'} or not isinstance(body['expected_day'], int):
+                    self._send_json({'success': False, 'error': 'expected_day is required; no other fields allowed'}, 400)
+                    return
+                self._send_json(self.server._api_server.checkpoint(body['expected_day']))
             elif self.path == '/reinitialize':
                 self._handle_reinitialize()
             else:
@@ -788,6 +794,9 @@ class NovaMindAPIServer:
         self._thread: Optional[threading.Thread] = None
         self.port: int = 0
         self._lock = threading.RLock()
+        self._advance_lock = threading.Lock()
+        self._operation_failed = False
+        self.checkpoint_callback = None
         self._last_dashboard: str = ""
         self._last_day_result = None
         self._daily_scripts: Dict[str, str] = {}  # name -> content snapshot
@@ -853,7 +862,35 @@ class NovaMindAPIServer:
     # released, so a stuck SQL can no longer wedge next-week (line 549 wedge).
     QUERY_TIMEOUT_SECONDS = 120
 
-    def advance_week(self, predictions: Optional[Dict[int, Dict[str, float]]] = None,
+    def checkpoint(self, expected_day):
+        if not self._advance_lock.acquire(blocking=False):
+            raise RuntimeError('Cannot checkpoint an in-flight week')
+        try:
+            with self._lock:
+                if self._operation_failed or self._step_day_timed_out:
+                    raise RuntimeError('Operation outcome unknown; checkpoint refused')
+                if expected_day != self.tools.current_day:
+                    raise ValueError('Checkpoint day mismatch')
+                if self.checkpoint_callback is None:
+                    raise RuntimeError('Harness checkpoint directory is not configured')
+                return self.checkpoint_callback()
+        finally:
+            self._advance_lock.release()
+
+    def advance_week(self, predictions=None, rationale=None):
+        if not self._advance_lock.acquire(blocking=False):
+            raise RuntimeError('Week advancement already in progress')
+        try:
+            if self._operation_failed or self._step_day_timed_out:
+                raise RuntimeError('Previous operation outcome unknown; continuation refused')
+            return self._advance_week(predictions, rationale)
+        except Exception:
+            self._operation_failed = True
+            raise
+        finally:
+            self._advance_lock.release()
+
+    def _advance_week(self, predictions: Optional[Dict[int, Dict[str, float]]] = None,
                      rationale: Optional[str] = None) -> Dict[str, Any]:
         """Advance the simulator by one week (7 days) and return the dashboard.
 
@@ -923,7 +960,8 @@ class NovaMindAPIServer:
         _step_start = _time.monotonic()
 
         def _do_step():
-            return self.simulator.step_week()
+            with self._lock:
+                return self.simulator.step_week()
 
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(_do_step)

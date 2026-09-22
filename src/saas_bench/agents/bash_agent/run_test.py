@@ -583,6 +583,9 @@ __pycache__/
         env["NOVAMIND_SERVER_MODE"] = "1"
         env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
         env['CEOBENCH_RUN_KIND'] = self.run_kind
+        env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
+        if getattr(self, '_restored_snapshot_dir', None):
+            env['CEOBENCH_RESTORE_SERVER_STATE'] = str(self._restored_snapshot_dir / 'server_state.json')
         # DeepSeek / OpenCode agent runs keep the simulator on official DeepSeek
         # so social/enterprise LLM calls do not require Anthropic and do not
         # burn the OpenCode Go subscription quota.
@@ -725,63 +728,50 @@ __pycache__/
         return flagged
 
     def _save_checkpoint(self, day: int, fetch_daily_scripts: bool = True):
-        """Save checkpoint for resume capability."""
-        # Tamper detection: log + persist any suspicious files in workspace.
-        tamper_hits = self._check_tamper(day)
-        if tamper_hits:
-            tamper_log = self.workspace_dir / "tamper_alerts.jsonl"
-            entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "day": day,
-                "files": tamper_hits,
-            }
-            with open(tamper_log, "a") as f:
-                f.write(json.dumps(entry) + "\n")
-            print(f"  ⚠️  TAMPER ALERT day {day}: {len(tamper_hits)} suspicious file(s): {tamper_hits[:5]}")
+        """Publish only a complete, quiescent generation; keep the previous one on failure."""
+        from saas_bench.run_state import copy_workspace, file_hash, tree_hash, write_json
+        receipt = self._http_post('/checkpoint', {'expected_day': day}, timeout=600)
+        if not receipt.get('success') or receipt.get('day') != day:
+            raise RuntimeError('Server did not acknowledge the requested checkpoint')
+        snapshot_id = receipt['snapshot_id']
+        if len(snapshot_id) != 32 or any(c not in '0123456789abcdef' for c in snapshot_id):
+            raise ValueError('Invalid server snapshot identifier')
+        directory = self.workspace_dir / 'checkpoints' / snapshot_id
+        for name in ('world.nmdb', 'session.json', 'server_state.json'):
+            if file_hash(directory / name) != receipt['files'].get(name):
+                raise ValueError('Server snapshot checksum mismatch: ' + name)
+        copy_workspace(self.agent_workspace, directory / 'agent_workspace')
+        checkpoint = dict(version=2, day=day, run_id=self.run_id,
+                          session_id=self._session_id, snapshot_id=snapshot_id,
+                          files=receipt['files'], workspace_sha256=tree_hash(directory / 'agent_workspace'))
+        for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
+                      'total_cached_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
+            checkpoint[field] = getattr(self.agent, field, 0)
+        write_json(directory / 'checkpoint.json', checkpoint)
+        write_json(self.workspace_dir / 'checkpoint.json', checkpoint)
 
-        # Get daily scripts from server
-        daily_scripts = {}
-        if fetch_daily_scripts:
-            try:
-                resp = self._http_get('/daily-scripts')
-                if resp.get('success'):
-                    # The GET endpoint returns script names/sizes, not content
-                    # For full content we need to query differently
-                    # For now, save empty — the scripts are also in the session dir
-                    pass
-            except Exception:
-                pass
-
-        checkpoint = {
-            'day': day,
-            'run_id': self.run_id,
-            'model': self.model,
-            'provider': self.provider,
-            'reasoning_effort': self.reasoning_effort,
-            'anthropic_fallback_model': self.anthropic_fallback_model,
-            'seed': self.seed,
-            'scenario': self.scenario,
-            'agent_total_turns': self.agent.total_turns if self.agent else 0,
-            'total_input_tokens': self.agent.total_input_tokens if self.agent else 0,
-            'total_output_tokens': self.agent.total_output_tokens if self.agent else 0,
-            'total_cached_tokens': self.agent.total_cached_tokens if self.agent else 0,
-            'total_reasoning_tokens': self.agent.total_reasoning_tokens if self.agent else 0,
-            'total_anthropic_fallbacks': self.agent.total_anthropic_fallbacks if self.agent else 0,
-            'daily_scripts': daily_scripts,
-            'session_id': self._session_id,
-        }
-        checkpoint_file = self.workspace_dir / "checkpoint.json"
-        with open(checkpoint_file, 'w') as f:
-            json.dump(checkpoint, f, indent=2)
-
-        # Copy session nmdb to run directory for analysis / resume
-        session_nmdb = self.agent_workspace / "sessions" / self._session_id / "world.nmdb"
-        harness_nmdb = self.workspace_dir / "world.nmdb"
+    def _restore_checkpoint_files(self, checkpoint):
+        from saas_bench.run_state import checkpoint_directory, copy_workspace
+        directory = checkpoint_directory(self.workspace_dir, checkpoint)
+        staged = self.workspace_dir / ('restore-' + uuid.uuid4().hex)
+        copy_workspace(directory / 'agent_workspace', staged)
+        self._session_id = checkpoint['session_id']
+        session = staged / 'sessions' / self._session_id
+        session.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(directory / 'world.nmdb', session / 'world.nmdb')
+        shutil.copy2(directory / 'session.json', session / 'session.json')
+        previous = self.workspace_dir / ('previous-' + uuid.uuid4().hex)
+        if self.agent_workspace.exists():
+            os.replace(self.agent_workspace, previous)
         try:
-            if session_nmdb.exists():
-                shutil.copy2(session_nmdb, harness_nmdb)
+            os.replace(staged, self.agent_workspace)
         except Exception:
-            pass  # Non-critical
+            if previous.exists():
+                os.replace(previous, self.agent_workspace)
+            raise
+        if previous.exists():
+            shutil.rmtree(previous)
+        self._restored_snapshot_dir = directory
 
     def _load_checkpoint(self) -> Optional[Dict]:
         """Load checkpoint from disk."""
@@ -792,132 +782,12 @@ __pycache__/
         return None
 
     def _restore_from_checkpoint(self, checkpoint: Dict):
-        """Restore state from checkpoint.
-
-        Copies the harness nmdb back to the session directory (so the server
-        loads the correct state), truncates harness log files, and restores
-        agent state.
-        """
-        cp_day = checkpoint['day']
-
-        # Restore session ID
-        self._session_id = checkpoint.get('session_id', self._session_id)
-
-        # Copy harness nmdb back to session directory
-        harness_nmdb = self.workspace_dir / "world.nmdb"
-        session_nmdb = self.agent_workspace / "sessions" / self._session_id / "world.nmdb"
-        if harness_nmdb.exists() and session_nmdb.parent.exists():
-            shutil.copy2(harness_nmdb, session_nmdb)
-            print(f"  Restored DB from checkpoint (day {cp_day})")
-
-        # Update session metadata to reflect checkpoint day
-        session_meta = self.agent_workspace / "sessions" / self._session_id / "session.json"
-        if session_meta.exists():
-            meta = json.loads(session_meta.read_text())
-            meta["current_day"] = cp_day
-            meta["status"] = "created"  # Will be set to "running" when server starts
-            session_meta.write_text(json.dumps(meta, indent=2))
-
-        # Truncate JSONL logs to remove entries from days beyond checkpoint
-        for log_file in [
-            self.logs_dir / f"tool_results_{self.run_id}.jsonl",
-            self.logs_dir / f"raw_responses_{self.run_id}.jsonl",
-            self.logs_dir / f"timing_{self.run_id}.jsonl",
-        ]:
-            if log_file.exists():
-                kept_lines = []
-                with open(log_file, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            entry_day = entry.get('day', 0)
-                            if entry_day <= cp_day:
-                                kept_lines.append(line)
-                        except json.JSONDecodeError:
-                            kept_lines.append(line)
-                with open(log_file, 'w') as f:
-                    for line in kept_lines:
-                        f.write(line + "\n")
-                print(f"  Trimmed {log_file.name}: kept entries for days <= {cp_day}")
-
+        """Restore agent accounting after the server has loaded the saved world."""
         if self.agent:
-            self.agent.total_turns = checkpoint.get('agent_total_turns', 0)
-            self.agent.total_input_tokens = checkpoint.get('total_input_tokens', 0)
-            self.agent.total_output_tokens = checkpoint.get('total_output_tokens', 0)
-            self.agent.total_cached_tokens = checkpoint.get('total_cached_tokens', 0)
-            self.agent.total_reasoning_tokens = checkpoint.get('total_reasoning_tokens', 0)
-            self.agent.total_anthropic_fallbacks = checkpoint.get('total_anthropic_fallbacks', 0)
-
-        # If the crash happened mid-day (last logged tool wasn't a next-week
-        # invocation), suppress the outer loop's force step_day on the resume
-        # iteration so the agent can keep planning instead of being skipped
-        # forward. Cleared after one outer iteration.
-        last_tool = None
-        last_cmd = ""
-        last_result = ""
-        tool_results_file = self.logs_dir / f"tool_results_{self.run_id}.jsonl"
-        if tool_results_file.exists():
-            try:
-                with open(tool_results_file, "rb") as f:
-                    f.seek(0, 2)
-                    size = f.tell()
-                    chunk_size = min(size, 8192)
-                    f.seek(size - chunk_size)
-                    tail = f.read().decode("utf-8", errors="ignore").strip().splitlines()
-                    if tail:
-                        entry = json.loads(tail[-1])
-                        last_tool = entry.get("tool")
-                        last_cmd = (entry.get("arguments", {}) or {}).get("command", "") or ""
-                        last_result = entry.get("result", "") or ""
-            except Exception:
-                pass
-        last_was_next_week = (last_tool == "bash" and "next-week" in last_cmd)
-
-        # If the last logged tool was a ``next-week`` call, decide whether it
-        # actually completed. The server's success response begins with
-        # ``=== Week N Dashboard (Day X) ===`` — a reliable marker. An
-        # interrupted next-week (server timeout, harness crash mid-call) won't
-        # contain that header.
-        last_next_week_finished = (
-            last_was_next_week
-            and isinstance(last_result, str)
-            and "=== Week " in last_result
-        )
-
-        if last_was_next_week and not last_next_week_finished:
-            # next-week was the last action but it didn't complete — recover
-            # by forcing the harness to re-issue /next-week on the resume iter.
-            self._suppress_force_step_day_once = False
-        else:
-            # Either the last next-week finished cleanly (trust the agent to
-            # decide), or the last action wasn't next-week at all (mid-day
-            # crash — the conversation snapshot below will pick up where it
-            # left off).
-            self._suppress_force_step_day_once = True
-
-        print(
-            f"  Last logged tool: {last_tool!r} "
-            f"(next-week={last_was_next_week}, "
-            f"finished={last_next_week_finished if last_was_next_week else 'n/a'}) — "
-            f"force /next-week on resume iter: "
-            f"{'SKIP' if self._suppress_force_step_day_once else 'force'}"
-        )
-
-        # Mid-day resume: if the agent was in the middle of a day (last tool
-        # wasn't next-week), restore its accumulated conversation from the
-        # per-turn snapshot. Day-boundary resume (last_was_next_week=True)
-        # gets a fresh context as usual — _refresh_context() will fire on
-        # the next act() because the conversation is empty.
-        if self.agent and not last_was_next_week:
-            snap = self.agent._snapshot_path
-            if snap and snap.exists():
-                self.agent.load_conversation_snapshot(snap)
-            else:
-                print(f"  [resume] No conversation snapshot at {snap} — "
-                      f"agent will start day {cp_day} with fresh context.")
+            for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
+                          'total_cached_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
+                setattr(self.agent, field, checkpoint[field])
+        self._suppress_force_step_day_once = True
 
     # =========================================================================
     # Setup
@@ -999,7 +869,9 @@ __pycache__/
             # Resuming — session already exists, find it
             checkpoint = self._load_checkpoint()
             if checkpoint:
-                self._session_id = checkpoint.get('session_id')
+                self._restore_checkpoint_files(checkpoint)
+            else:
+                raise ValueError('Cannot resume without a complete checkpoint')
             if not self._session_id:
                 # Fallback: find session in workspace
                 sessions_dir = self.agent_workspace / "sessions"
@@ -1413,8 +1285,8 @@ __pycache__/
 
         # Stop server, then checkpoint so world.nmdb is copied after shutdown
         # has drained async saves and written the fresh session DB.
+        self._save_checkpoint(sim_day)
         self._stop_server()
-        self._save_checkpoint(sim_day, fetch_daily_scripts=False)
 
         if verbose:
             print(f"\n{'='*60}")

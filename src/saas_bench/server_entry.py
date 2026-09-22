@@ -398,6 +398,41 @@ def cmd_start_server(args, base: Path):
         script_workspace=base,
         require_sandbox=os.environ.get('CEOBENCH_RUN_KIND') == 'formal',
     )
+    from saas_bench.run_state import file_hash, write_json
+    checkpoint_root = os.environ.get('CEOBENCH_CHECKPOINT_ROOT')
+    if checkpoint_root:
+        checkpoint_root = Path(checkpoint_root).resolve()
+        if checkpoint_root.is_relative_to(base):
+            raise ValueError('Checkpoint directory must be outside the agent workspace')
+
+        def _checkpoint():
+            import uuid
+            snapshot_id = uuid.uuid4().hex
+            target = checkpoint_root / snapshot_id
+            target.mkdir(parents=True)
+            if not async_saver.drain(timeout=180):
+                raise TimeoutError('Background database save did not finish')
+            simulator.save_rng_states()
+            save_session_db(conn, target / 'world.nmdb')
+            saved_meta = dict(meta, current_day=simulator.current_day, status='created')
+            for field in ('port', 'pid'):
+                saved_meta.pop(field, None)
+            write_json(target / 'session.json', saved_meta)
+            write_json(target / 'server_state.json', {
+                'day': simulator.current_day, 'dashboard': api_server.last_dashboard,
+                'script_results': api_server.last_script_results})
+            return {'success': True, 'snapshot_id': snapshot_id, 'day': simulator.current_day,
+                    'files': {name: file_hash(target / name) for name in
+                              ('world.nmdb', 'session.json', 'server_state.json')}}
+
+        api_server.checkpoint_callback = _checkpoint
+    restored_state = os.environ.get('CEOBENCH_RESTORE_SERVER_STATE')
+    if restored_state:
+        state = json.loads(Path(restored_state).read_text())
+        if state['day'] != current_day:
+            raise ValueError('Restored dashboard day differs from world')
+        api_server._last_dashboard = state['dashboard']
+        api_server.last_script_results = state['script_results']
     api_server.start()
 
     # Set API port on tools so Python sandbox routes queries through HTTP

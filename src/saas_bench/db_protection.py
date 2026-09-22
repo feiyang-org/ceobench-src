@@ -298,6 +298,7 @@ class AsyncSaver:
         self._pending: Optional[str] = None
         self._busy: bool = False
         self._shutdown: bool = False
+        self._error = None
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="AsyncSaver"
         )
@@ -311,6 +312,8 @@ class AsyncSaver:
         """
         plain_path = str(plain_path)
         with self._cond:
+            if self._error is not None:
+                raise RuntimeError('Background database save failed') from self._error
             if self._shutdown:
                 # Caller submitted after shutdown — clean up their tmp file
                 # rather than leak it.
@@ -340,7 +343,9 @@ class AsyncSaver:
                 self._busy = True
             try:
                 encrypt_plain_atomic(p, self._nmdb_path, key=self._key)
-            except Exception:
+            except Exception as exc:
+                with self._cond:
+                    self._error = exc
                 traceback.print_exc(file=sys.stderr)
             finally:
                 try:
@@ -367,6 +372,8 @@ class AsyncSaver:
                     if remaining <= 0:
                         return False
                     self._cond.wait(timeout=remaining)
+            if self._error is not None:
+                raise RuntimeError('Background database save failed') from self._error
             return True
 
     def shutdown(
