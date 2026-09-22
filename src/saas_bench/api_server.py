@@ -933,13 +933,22 @@ class NovaMindAPIServer:
 
         # Persist predictions before stepping the world (so submit_day reflects
         # the day the prediction was made, not the post-step day).
+        if predictions and self.conn is None:
+            return {'success': False, 'error': 'prediction_save_failed', 'day': old_day}
         if predictions and self.conn is not None:
             from saas_bench.database import save_predictions as _save_predictions
             _pred_exc_tb = None
             try:
                 with self._lock:
-                    _save_predictions(self.conn, old_day, predictions, _time.time())
-                    self.conn.commit()
+                    self.conn.execute('SAVEPOINT week_predictions')
+                    try:
+                        _save_predictions(self.conn, old_day, predictions, _time.time())
+                        self.conn.execute('RELEASE week_predictions')
+                        self.conn.commit()
+                    except Exception:
+                        if self.conn.in_transaction:
+                            self.conn.rollback()
+                        raise
             except Exception:
                 import traceback
                 _pred_exc_tb = traceback.format_exc()
@@ -947,6 +956,7 @@ class NovaMindAPIServer:
                 # Log AFTER releasing the lock so a buffered stderr write can't
                 # back-pressure the lock holder. (run 27c000a5 d105 hang.)
                 print(_pred_exc_tb, file=sys.stderr, flush=True)
+                return {'success': False, 'error': 'prediction_save_failed', 'day': old_day}
 
         # Check for shocks BEFORE step_week (so shock effects apply this week)
         if self.shock_manager:
