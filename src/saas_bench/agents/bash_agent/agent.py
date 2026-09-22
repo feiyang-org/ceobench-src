@@ -29,7 +29,7 @@ class Message:
 
 
 # Regex to detect dashboard in bash output (day advancement)
-_DASHBOARD_RE = re.compile(r'=== Day (\d+) Dashboard ===')
+_DASHBOARD_RE = re.compile(r'=== (?:Day (\d+) Dashboard|Week \d+ Dashboard \(Day (\d+)\)) ===')
 
 
 class BashAgent(BaseAgent):
@@ -215,6 +215,7 @@ class BashAgent(BaseAgent):
         """
         self.conversation = []
         self._pending_tool_calls = []
+        self._observation_recorded = False
 
         if not self.use_anthropic:
             # OpenAI: system prompt goes in messages
@@ -231,11 +232,11 @@ class BashAgent(BaseAgent):
         """
         match = _DASHBOARD_RE.search(bash_output)
         if match:
-            new_day = int(match.group(1))
+            new_day = int(match.group(1) or match.group(2))
             if new_day > self.current_day:
                 self._day_advanced = True
                 # Extract dashboard from the output (everything from === Day N ===)
-                dashboard_start = bash_output.index(f"=== Day {new_day} Dashboard ===")
+                dashboard_start = match.start()
                 self._new_dashboard = bash_output[dashboard_start:]
                 return True
         return False
@@ -284,6 +285,25 @@ class BashAgent(BaseAgent):
             return Action(tool='bash', arguments={'command': './novamind-operation next-week'})
 
         # If we have pending tool call results to process, add them
+        if getattr(self, '_observation_recorded', False):
+            self._observation_recorded = False
+        else:
+            self.record_tool_result(observation)
+            self._observation_recorded = False
+
+        # Call LLM
+        action = self._call_llm()
+        self.turns_today += 1
+
+        # Persist conversation snapshot so a mid-day crash can be resumed
+        # with the exact accumulated context. Best-effort: failure here must
+        # not derail the run, just log.
+        self._save_conversation_snapshot()
+
+        return action
+
+    def record_tool_result(self, observation):
+        """Attach a completed result before making a resumable checkpoint."""
         if self._pending_tool_calls:
             if self.use_anthropic:
                 partial_results = self._pending_tool_calls[0].get('_partial_results', [])
@@ -313,16 +333,8 @@ class BashAgent(BaseAgent):
                 content=observation
             ))
 
-        # Call LLM
-        action = self._call_llm()
-        self.turns_today += 1
-
-        # Persist conversation snapshot so a mid-day crash can be resumed
-        # with the exact accumulated context. Best-effort: failure here must
-        # not derail the run, just log.
-        self._save_conversation_snapshot()
-
-        return action
+        self._last_observation = observation
+        self._observation_recorded = True
 
     def _serialize_content_item(self, item: Any) -> Any:
         """Convert a single content item to a JSON-safe form.
@@ -356,7 +368,7 @@ class BashAgent(BaseAgent):
             "name": m.name,
         }
 
-    def _save_conversation_snapshot(self) -> None:
+    def _save_conversation_snapshot(self, strict=False) -> None:
         """Atomically write self.conversation + minimal turn state to disk.
 
         Overwrites the same file each call (single snapshot, not append-only).
@@ -376,7 +388,8 @@ class BashAgent(BaseAgent):
                 "current_day": self.current_day,
                 "turns_today": self.turns_today,
                 "total_turns": self.total_turns,
-                "last_observation_preview": (self._last_observation or "")[:2000],
+                "last_observation": self._last_observation,
+                "observation_recorded": getattr(self, "_observation_recorded", False),
                 "saved_at": time.time(),
             }
             tmp_path = self._snapshot_path.with_suffix(self._snapshot_path.suffix + ".tmp")
@@ -385,7 +398,9 @@ class BashAgent(BaseAgent):
                 json.dump(payload, f)
             os.replace(tmp_path, self._snapshot_path)
         except Exception as e:
-            # Never let snapshot failure kill the run.
+            if strict:
+                raise
+            # Per-turn best effort files are not published checkpoints.
             print(f"[snapshot] WARN failed to save conversation snapshot: {e}")
 
     def load_conversation_snapshot(self, path: Path) -> bool:
@@ -414,41 +429,15 @@ class BashAgent(BaseAgent):
                     name=m.get("name"),
                 ))
 
-            def _has_in_flight_tool_call(msg: "Message") -> bool:
-                """Detect an assistant turn whose tool call was never executed.
-
-                Covers two shapes:
-                  - chat-completions style:  msg.tool_calls is set
-                  - Responses API style:    msg.content is a list containing
-                    `{'type': 'function_call', ...}` items
-                """
-                if msg.role != "assistant":
-                    return False
-                if msg.tool_calls:
-                    return True
-                if isinstance(msg.content, list):
-                    for item in msg.content:
-                        t = item.get("type") if isinstance(item, dict) else getattr(item, "type", "")
-                        if t == "function_call":
-                            return True
-                return False
-
-            # Drop trailing assistant w/ in-flight tool_call — that tool was
-            # never executed at crash time, so discarding leaves us at "right
-            # after the previous tool_result was delivered" — a clean re-entry
-            # point. The next LLM call regenerates from the prior context.
-            dropped = 0
-            while msgs and _has_in_flight_tool_call(msgs[-1]):
-                msgs.pop()
-                dropped += 1
+            if payload.get('pending_tool_calls'):
+                raise ValueError('Snapshot has a tool with an unknown outcome')
             self.conversation = msgs
             self._pending_tool_calls = []
             self.current_day = int(payload.get("current_day", 0) or 0)
             self.turns_today = int(payload.get("turns_today", 0) or 0)
-            self._skip_next_refresh = True
-            print(f"[snapshot] Restored conversation: {len(msgs)} messages "
-                  f"(dropped {dropped} in-flight assistant tool_call), "
-                  f"current_day={self.current_day}, turns_today={self.turns_today}")
+            self._skip_next_refresh = False
+            self._last_observation = payload['last_observation']
+            self._observation_recorded = payload['observation_recorded']
             return True
         except Exception as e:
             print(f"[snapshot] WARN failed to load conversation snapshot: {e}")

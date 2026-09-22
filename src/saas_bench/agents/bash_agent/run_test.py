@@ -730,6 +730,10 @@ __pycache__/
     def _save_checkpoint(self, day: int, fetch_daily_scripts: bool = True):
         """Publish only a complete, quiescent generation; keep the previous one on failure."""
         from saas_bench.run_state import copy_workspace, file_hash, tree_hash, write_json
+        if self.agent and self.agent._pending_tool_calls:
+            raise RuntimeError('Cannot checkpoint a tool with an unknown outcome')
+        if self.agent:
+            self.agent._save_conversation_snapshot(strict=True)
         receipt = self._http_post('/checkpoint', {'expected_day': day}, timeout=600)
         if not receipt.get('success') or receipt.get('day') != day:
             raise RuntimeError('Server did not acknowledge the requested checkpoint')
@@ -744,6 +748,7 @@ __pycache__/
         checkpoint = dict(version=2, day=day, run_id=self.run_id,
                           session_id=self._session_id, snapshot_id=snapshot_id,
                           files=receipt['files'], workspace_sha256=tree_hash(directory / 'agent_workspace'))
+        checkpoint['context_boundary'] = 'same_week' if self.agent and self.agent.current_day == day else 'new_week'
         for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
                       'total_cached_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
             checkpoint[field] = getattr(self.agent, field, 0)
@@ -787,6 +792,11 @@ __pycache__/
             for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
                           'total_cached_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
                 setattr(self.agent, field, checkpoint[field])
+            if checkpoint['context_boundary'] == 'same_week':
+                if not self.agent.load_conversation_snapshot(self.agent._snapshot_path):
+                    raise ValueError('Cannot restore the checkpoint conversation')
+            else:
+                self.agent.reset()
         self._suppress_force_step_day_once = True
 
     # =========================================================================
@@ -1031,7 +1041,9 @@ __pycache__/
             self._log_timing("dashboard", sim_day, elapsed_s=round(_dashboard_elapsed, 3))
 
             # Agent loop for this day
-            observation = dashboard
+            observation = (self.agent._last_observation
+                           if getattr(self.agent, '_observation_recorded', False) and self.agent.current_day == sim_day
+                           else dashboard)
             info = {'day': sim_day, 'cash': status.get('cash', self._get_cash())}
             turns_today = 0
             day_ended = False
@@ -1106,6 +1118,7 @@ __pycache__/
                 _tool_elapsed = _time.monotonic() - _t0
                 _day_tool_total += _tool_elapsed
                 observation = result if isinstance(result, str) else json.dumps(result)
+                self.agent.record_tool_result(observation)
 
                 self._log_timing("tool_exec", sim_day, turn=turns_today,
                                  elapsed_s=round(_tool_elapsed, 3),
