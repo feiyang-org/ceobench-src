@@ -14,6 +14,7 @@ Commands:
 
 import argparse
 import json
+import uuid
 import os
 import signal
 import sqlite3
@@ -134,7 +135,7 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
         config.social_post_llm_model = override_model
         config.enterprise_llm_model = override_model
 
-    valid_providers = {"bedrock", "anthropic", "openai", "deepseek"}
+    valid_providers = {"bedrock", "anthropic", "openai", "deepseek", "opencode"}
     for attr in ("social_post_llm_provider", "enterprise_llm_provider"):
         provider = getattr(config, attr)
         if provider not in valid_providers:
@@ -174,6 +175,9 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
         )
         sys.exit(1)
 
+    if 'opencode' in (config.social_post_llm_provider, config.enterprise_llm_provider) and not os.environ.get('OPENCODE_API_KEY'):
+        raise ValueError('Simulator OpenCode provider requires OPENCODE_API_KEY')
+
     return {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
 
 
@@ -206,11 +210,21 @@ def _session_config(seed, total_days, initial_cash, meta=None):
 
 def _create_simulator_openai_client(config: BenchmarkConfig):
     providers = {config.social_post_llm_provider, config.enterprise_llm_provider}
-    if not providers.intersection({"openai", "deepseek"}):
+    compatible = providers.intersection({"openai", "deepseek", "opencode"})
+    if not compatible:
         return None
+    if len(compatible) > 1:
+        raise ValueError('Simulator OpenAI-compatible providers must share one endpoint')
 
     from openai import OpenAI
 
+    if "opencode" in providers:
+        return OpenAI(
+            api_key=os.environ.get('OPENCODE_API_KEY'),
+            base_url='https://opencode.ai/zen/go/v1',
+            default_headers={'User-Agent': 'CEO-Bench/1.0',
+                             'x-opencode-session': os.environ.get('CEOBENCH_MODEL_SESSION') or uuid.uuid4().hex},
+        )
     if "deepseek" in providers:
         return OpenAI(
             api_key=os.environ.get("DEEPSEEK_API_KEY"),

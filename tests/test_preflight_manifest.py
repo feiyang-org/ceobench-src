@@ -65,3 +65,33 @@ def test_frozen_simulator_configuration_rejects_environment_drift(tmp_path, monk
     monkeypatch.setenv('CEOBENCH_SIMULATOR_LLM_MODEL', 'different-model')
     with pytest.raises(ValueError, match='frozen'):
         _session_config(42, 7, 100)
+
+
+def test_opencode_routes_both_roles_without_deepseek_credentials(tmp_path, monkeypatch):
+    from saas_bench.agents.bash_agent.run_test import BashAgentRunner
+    from saas_bench.config import BenchmarkConfig
+    from saas_bench.server_entry import _apply_simulator_llm_config, _create_simulator_openai_client
+    monkeypatch.setattr('saas_bench.agents.bash_agent.run_test.load_env_file', lambda _: {})
+    monkeypatch.setenv('OPENCODE_API_KEY', 'go-only-test-key')
+    monkeypatch.delenv('DEEPSEEK_API_KEY', raising=False)
+    for suffix in ('PROVIDER', 'MODEL'):
+        monkeypatch.delenv('CEOBENCH_SIMULATOR_LLM_' + suffix, raising=False)
+    runner = BashAgentRunner(provider='opencode', model='deepseek-v4.1-flash', workspace_base=tmp_path)
+    env = runner._server_environment()
+    assert env['CEOBENCH_SIMULATOR_LLM_PROVIDER'] == 'opencode'
+    assert env['CEOBENCH_SIMULATOR_LLM_MODEL'] == 'deepseek-v4.1-flash'
+    for name in ('CEOBENCH_SIMULATOR_LLM_PROVIDER', 'CEOBENCH_SIMULATOR_LLM_MODEL', 'CEOBENCH_MODEL_SESSION'):
+        monkeypatch.setenv(name, env[name])
+    config = BenchmarkConfig()
+    _apply_simulator_llm_config(config)
+    client = _create_simulator_openai_client(config)
+    assert str(client.base_url) == str(runner.client.base_url) == 'https://opencode.ai/zen/go/v1/'
+    assert client.api_key == 'go-only-test-key'
+    assert client.default_headers['User-Agent'] == runner.client.default_headers['User-Agent'] == 'CEO-Bench/1.0'
+    assert client.default_headers['x-opencode-session'] == runner.client.default_headers['x-opencode-session'] + ':simulator'
+    assert runner._server_environment()['CEOBENCH_MODEL_SESSION'] == env['CEOBENCH_MODEL_SESSION']
+    config.enterprise_llm_provider = 'deepseek'
+    with pytest.raises(ValueError, match='one endpoint'):
+        _create_simulator_openai_client(config)
+    runner.client.close()
+    client.close()

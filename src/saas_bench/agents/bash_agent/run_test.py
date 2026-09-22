@@ -304,6 +304,11 @@ class BashAgentRunner:
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
             client_kwargs["timeout"] = httpx.Timeout(600.0)  # 10min max per LLM call; retry on timeout
+            if self.provider == 'opencode':
+                client_kwargs['default_headers'] = {
+                    'User-Agent': 'CEO-Bench/1.0',
+                    'x-opencode-session': str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.workspace_dir))),
+                }
             self.client = OpenAI(**client_kwargs)
 
         self.base_url = str(self.client.base_url)
@@ -589,14 +594,13 @@ __pycache__/
         env['CEOBENCH_RUN_KIND'] = self.run_kind
         env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
         env['CEOBENCH_SIMULATOR_USAGE_LOG'] = str(self.logs_dir / 'simulator_requests.jsonl')
+        env['CEOBENCH_MODEL_SESSION'] = str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.workspace_dir))) + ':simulator'
         if getattr(self, '_restored_snapshot_dir', None):
             env['CEOBENCH_RESTORE_SERVER_STATE'] = str(self._restored_snapshot_dir / 'server_state.json')
-        # DeepSeek / OpenCode agent runs keep the simulator on official DeepSeek
-        # so social/enterprise LLM calls do not require Anthropic and do not
-        # burn the OpenCode Go subscription quota.
+        # Use the selected account for both roles unless explicitly overridden.
         if self.provider in ("deepseek", "opencode"):
-            env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", "deepseek")
-            env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", "deepseek-v4-flash")
+            env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", self.provider)
+            env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", self.model)
         return env
 
     def _prepare_manifest(self):

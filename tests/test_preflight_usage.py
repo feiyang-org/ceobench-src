@@ -33,7 +33,7 @@ def reply(api, usage=True):
     return result
 
 
-@pytest.mark.parametrize('provider,api', [('deepseek', 'chat'), ('openai', 'responses'),
+@pytest.mark.parametrize('provider,api', [('deepseek', 'chat'), ('opencode', 'chat'), ('openai', 'responses'),
                                          ('anthropic', 'messages'), ('bedrock', 'messages')])
 def test_real_sdk_requests_internal_retries_and_simulator_usage(tmp_path, monkeypatch, provider, api):
     monkeypatch.setenv('CEOBENCH_SIMULATOR_USAGE_LOG', str(tmp_path / 'simulator.jsonl'))
