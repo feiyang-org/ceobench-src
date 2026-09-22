@@ -1,6 +1,7 @@
 """Small, private run manifests and atomic JSON files."""
 
 import hashlib
+from importlib.metadata import version
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,12 @@ def artifact_hashes(public):
             'docs': tree_hash(public / 'docs')}
 
 
+def runtime_versions():
+    packages = ('openai', 'anthropic', 'httpx', 'numpy', 'pydantic', 'boto3', 'botocore', 'cryptography',
+                'sqlcipher3-binary' if platform.system() == 'Linux' else 'sqlcipher3')
+    return {name: version(name) for name in packages}
+
+
 def build_manifest(root, public):
     root = Path(root)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
@@ -50,15 +57,23 @@ def build_manifest(root, public):
     return {'version': 1, 'source_commit': commit,
             'patch_sha256': hashlib.sha256(patch).hexdigest(),
             'source_sha256': tree_hash(root / 'src'),
-            'python': platform.python_version(), 'artifacts': artifact_hashes(public)}
+            'builder_sha256': file_hash(root / 'scripts' / 'build_public.py'),
+            'python': platform.python_version(), 'runtime': runtime_versions(),
+            'artifacts': artifact_hashes(public)}
 
 
-def verify_build(public):
+def verify_build(public, root=None):
     manifest = json.loads((Path(public) / 'build.json').read_text())
     if manifest['artifacts'] != artifact_hashes(public):
         raise ValueError('Public artifacts differ from build.json; rebuild the public bundle')
-    if manifest['python'].split('.')[:2] != platform.python_version().split('.')[:2]:
+    if manifest['python'] != platform.python_version():
         raise ValueError('Public bundle Python version does not match this interpreter')
+    if manifest.get('runtime') != runtime_versions():
+        raise ValueError('Runtime SDK or dependency versions differ from build.json')
+    if root is not None:
+        root = Path(root)
+        if manifest.get('source_sha256') != tree_hash(root / 'src') or manifest.get('builder_sha256') != file_hash(root / 'scripts' / 'build_public.py'):
+            raise ValueError('Current source differs from the registered build; rebuild public artifacts')
     return manifest
 
 

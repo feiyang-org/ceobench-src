@@ -337,11 +337,8 @@ class BashAgentRunner:
         return json.loads(resp.read())
 
     def _get_cash(self) -> float:
-        """Get current cash balance via HTTP query."""
-        result = self._http_post('/query', {'sql': 'SELECT SUM(amount) FROM ledger'})
-        if not result.get('success') or not result.get('data', {}).get('rows'):
-            raise RuntimeError('Cash query failed')
-        return result['data']['rows'][0][0] or 0
+        """Use the same status receipt as the run loop."""
+        return float(self._get_game_status()['cash'])
 
     def _get_game_status(self) -> Dict:
         """Get game status (day, cash, subs, timeout) via HTTP."""
@@ -606,7 +603,7 @@ __pycache__/
         from dataclasses import asdict
         from saas_bench.config import SCENARIO_PACKS, ScenarioPack
         from saas_bench.run_state import verify_build, write_json
-        build = verify_build(self._public_dir())
+        build = verify_build(self._public_dir(), root=package_root.parent)
         configuration = {key: getattr(self, key) for key in (
             'model', 'provider', 'base_url', 'seed', 'scenario', 'total_days',
             'initial_cash', 'reasoning_effort', 'anthropic_fallback_model', 'run_kind')}
@@ -1040,7 +1037,7 @@ __pycache__/
             observation = (self.agent._last_observation
                            if getattr(self.agent, '_observation_recorded', False) and self.agent.current_day == sim_day
                            else dashboard)
-            info = {'day': sim_day, 'cash': status.get('cash', self._get_cash())}
+            info = {'day': sim_day, 'cash': status['cash']}
             turns_today = 0
             day_ended = False
             _day_llm_total = 0.0

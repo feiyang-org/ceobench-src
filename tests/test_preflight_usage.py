@@ -88,6 +88,7 @@ def test_missing_usage_cache_prices_and_restored_subtotals(tmp_path):
     assert recorder.summary['calls'] == 1
     assert usage_values({}, 'chat') == dict.fromkeys(FIELDS)
     assert cost_usd(usage_values(reply('chat'), 'chat'), 'chat', None) is None
+    assert usage_values({'usage': {'prompt_tokens': 8, 'prompt_cache_hit_tokens': 3}}, 'chat')['cached_tokens'] == 3
 
 
 def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch):

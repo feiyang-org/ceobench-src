@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -97,7 +98,8 @@ def clone(source, destination):
     return destination
 
 
-def test_packed_continuous_restore_and_independent_clones(offline_runner, tmp_path):
+@pytest.mark.parametrize('split_day', [21, 35])
+def test_packed_continuous_restore_and_independent_clones(offline_runner, tmp_path, split_day):
     first = offline_runner()
     workspace = first.agent_workspace
     (workspace / 'MEMORY.md').write_text('retain the weekly metric')
@@ -105,16 +107,16 @@ def test_packed_continuous_restore_and_independent_clones(offline_runner, tmp_pa
     metric.write_text("import novamind_api as nm\nprint('version A', nm.query('SELECT COUNT(*) AS n FROM ledger'))")
     assert first._http_post('/daily-scripts', {'name': 'metric', 'content': metric.read_text()})['success']
     metric.write_text("print('version B')")
-    for _ in range(3):
+    for _ in range(split_day // 7):
         receipt = advance(first)
         assert receipt['success'], receipt
         assert 'version A' in receipt['dashboard'] and '[stderr]' not in receipt['dashboard']
-    assert first._get_game_status()['day'] == 21
-    first.agent._refresh_context('day 21', 21)
-    first.agent.current_day = 21
+    assert first._get_game_status()['day'] == split_day
+    first.agent._refresh_context(f'day {split_day}', split_day)
+    first.agent.current_day = split_day
     first.agent.record_tool_result('completed metric registration')
     first._git_commit_workspace('offline checkpoint')
-    first._save_checkpoint(21)
+    first._save_checkpoint(split_day)
     source_snapshot = checkpoint_directory(first.workspace_dir, first._load_checkpoint())
     checkpoint_hash = tree_hash(source_snapshot)
     left = offline_runner(clone(first, tmp_path / 'left'))
@@ -128,7 +130,7 @@ def test_packed_continuous_restore_and_independent_clones(offline_runner, tmp_pa
         assert restored._git('rev-parse', 'HEAD').stdout == first._git('rev-parse', 'HEAD').stdout
         assert restored._http_get('/daily-scripts') == first._http_get('/daily-scripts')
         assert (restored.logs_dir / 'simulator_requests.jsonl').read_bytes() == (first.logs_dir / 'simulator_requests.jsonl').read_bytes()
-    for _ in range(3):
+    for _ in range((42 - split_day) // 7):
         expected = advance(first)
         for restored in (left, right):
             assert advance(restored) == expected
@@ -141,10 +143,15 @@ def test_packed_continuous_restore_and_independent_clones(offline_runner, tmp_pa
         assert summary['simulator'] == json.loads((first.workspace_dir / 'usage_summary.json').read_text())['simulator']
     assert expected['api_costs'] and expected['competitor_events']
     assert expected['_hidden_leads_per_1k_snapshot']
+    scoring = subprocess.run([sys.executable, str(ROOT / 'scripts/score_predictions.py'), str(first.workspace_dir)],
+                             capture_output=True, text=True, check=True)
+    assert json.loads(scoring.stdout)['four_week_count'] == 3
     before = business_state(right)
     (left.agent_workspace / 'MEMORY.md').write_text('left only')
     assert left._http_post('/daily-scripts', {'name': 'metric', 'content': "print('version B')"})['success']
-    left._save_checkpoint(42)
+    receipt = advance(left)
+    assert 'version B' in receipt['dashboard'] and 'version A' not in receipt['dashboard']
+    left._save_checkpoint(49)
     assert business_state(right) == before
     assert 'version A' in json.dumps(before['_registered_scripts'])
     assert (right.agent_workspace / 'MEMORY.md').read_text() == 'retain the weekly metric'
@@ -185,3 +192,53 @@ def test_checkpoint_http_does_not_accept_paths_and_predictions_reject_nonfinite(
                 h: {'point': bad, 'lower': 0, 'upper': 100} for h in ('cash_1wk', 'cash_4wk', 'cash_12wk', 'cash_26wk')}})
         assert error.value.code == 400
     assert runner._get_game_status()['day'] == 0
+
+
+def test_full_harness_uses_packed_cli_and_fake_agent_requests(offline_runner, monkeypatch):
+    import httpx
+    from openai import OpenAI
+    from test_preflight_usage import reply
+    runner = offline_runner()
+    requests = []
+    def handle(request):
+        requests.append(json.loads(request.content))
+        if len(requests) > 6:
+            raise KeyboardInterrupt('Harness failed to advance the week')
+        body = reply('chat')
+        command = "./novamind-operation next-week 'fixed offline action'" + ' 100000 -100000 1000000' * 4
+        body['choices'][0]['message']['tool_calls'] = [dict(id=f'week-{len(requests)}', type='function',
+            function=dict(name='bash', arguments=json.dumps({'command': command})))]
+        return httpx.Response(200, json=body)
+    runner.client.close()
+    runner.client = OpenAI(api_key='offline-only', base_url='https://api.deepseek.com', max_retries=0,
+                           http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    runner.agent.client = runner.agent.usage_recorder.attach(runner.client)
+    monkeypatch.setattr(runner, 'setup', lambda: None)
+    result = runner.run(verbose=False)
+    assert result['days_run'] == 42 and result['outcome'] == 'completed'
+    assert runner._server_proc is None
+    assert len(requests) == 6
+    assert all(not any(m['role'] == 'tool' for m in request['messages']) for request in requests)
+    checkpoint = runner._load_checkpoint()
+    assert checkpoint['total_turns'] == 6
+    summary = json.loads((runner.workspace_dir / 'usage_summary.json').read_text())
+    assert summary['agent']['calls'] == 6 and summary['agent']['known']['input_tokens'] == 60
+    assert summary['simulator']['calls'] > 0
+
+
+def test_harness_timeout_stops_branch_without_publishing_unknown_state(offline_runner, monkeypatch):
+    from saas_bench.environment import Action
+    runner = offline_runner()
+    runner._save_checkpoint(0)
+    previous = (runner.workspace_dir / 'checkpoint.json').read_bytes()
+    monkeypatch.setattr(runner, 'setup', lambda: None)
+    runner.tool_executor.bash_timeout = 0.2
+    monkeypatch.setattr(runner.agent, 'act', lambda *args: Action(tool='bash',
+        arguments={'command': 'python -c "import time; time.sleep(30)"'}))
+    with pytest.raises(RuntimeError, match='unknown'):
+        runner.run(verbose=False)
+    assert runner._server_proc is None
+    assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == previous
+    assert 'unknown' in json.loads((runner.workspace_dir / 'branch_stop.json').read_text())['reason']
+    with pytest.raises(ValueError, match='unknown'):
+        runner._load_checkpoint()

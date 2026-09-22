@@ -38,6 +38,8 @@ def usage_values(response, api):
     output_tokens = usage.get('completion_tokens' if chat else 'output_tokens')
     read = (usage.get('cache_read_input_tokens') if anthropic else
             (usage.get('prompt_tokens_details' if chat else 'input_tokens_details') or {}).get('cached_tokens'))
+    if chat and read is None:
+        read = usage.get('prompt_cache_hit_tokens')
     write = usage.get('cache_creation_input_tokens')
     # Anthropic reports uncached input separately; the common input count includes caches.
     if anthropic:
