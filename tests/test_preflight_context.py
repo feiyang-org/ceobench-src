@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from saas_bench.agents.bash_agent.agent import BashAgent, Message
+from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 
 
 def agent(tmp_path, anthropic=False):
@@ -89,7 +90,7 @@ def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api):
     client = (Anthropic if api == 'messages' else OpenAI)(api_key='offline-only', max_retries=0,
         http_client=httpx.Client(transport=httpx.MockTransport(handle)))
     def new_agent():
-        value = BashAgent([], client, system_prompt='Original instructions', workspace_path=tmp_path,
+        value = BashAgent(get_bash_agent_tool_descriptions(), client, system_prompt='Original instructions', workspace_path=tmp_path,
                           reasoning_effort='low' if api == 'responses' else None)
         value._snapshot_path = tmp_path / 'context.json'
         return value

@@ -10,6 +10,7 @@ from saas_bench.config import BenchmarkConfig
 from saas_bench.customer_llm import CustomerSimulator
 from saas_bench.database import init_database
 from saas_bench.model_usage import FIELDS, ModelUsage, cost_usd, usage_values
+from saas_bench.agents.bash_agent.tools import get_bash_agent_tool_descriptions
 
 
 def reply(api, usage=True):
@@ -162,7 +163,7 @@ def test_agent_outer_retry_records_full_request_and_missing_usage(tmp_path, monk
         return httpx.Response(200, json=body)
     client = OpenAI(api_key='test-secret', max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
     recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
-    agent = BashAgent([], client, system_prompt='original instructions', workspace_path=tmp_path, usage_recorder=recorder)
+    agent = BashAgent(get_bash_agent_tool_descriptions(), client, system_prompt='original instructions', workspace_path=tmp_path, usage_recorder=recorder)
     assert agent.act('dashboard', 0, False, {'day': 7}).tool == 'read_file'
     entries = [json.loads(s) for s in recorder.path.read_text().splitlines()]
     calls = [r for r in entries if r['event'] == 'request']
@@ -173,3 +174,9 @@ def test_agent_outer_retry_records_full_request_and_missing_usage(tmp_path, monk
     assert recorder.summary['known']['input_tokens'] is None
     assert recorder.summary['errors'] == 1
     client.close()
+
+
+def test_agent_rejects_empty_tools_before_any_request():
+    from saas_bench.agents.bash_agent.agent import BashAgent
+    with pytest.raises(ValueError, match='requires tools'):
+        BashAgent([], object())

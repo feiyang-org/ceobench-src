@@ -60,6 +60,8 @@ class BashAgent(BaseAgent):
         anthropic_fallback_model: Optional[str] = None,
         usage_recorder: Optional[ModelUsage] = None,
     ):
+        if not tool_descriptions:
+            raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
         super().__init__(tool_descriptions)
         self.client = client
         self.usage_recorder = usage_recorder or ModelUsage(None, 'agent')
