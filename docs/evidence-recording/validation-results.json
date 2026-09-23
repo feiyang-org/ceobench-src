@@ -1,0 +1,16 @@
+{
+  "status": "passed",
+  "events": 7,
+  "evidence_versions": 5,
+  "requests": 21,
+  "occurrences": 98,
+  "negative_controls": [
+    "tampered_blob",
+    "wrong_range",
+    "false_full",
+    "stale_context",
+    "missing_mapping",
+    "fork_cutoff"
+  ],
+  "provider_calls": 0
+}

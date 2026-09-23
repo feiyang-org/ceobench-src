@@ -109,6 +109,7 @@ dist/
 # user-facing markdown (e.g. docs/analyze_trajectory.md).
 docs/*
 !docs/*.md
+!docs/evidence-recording/
 modal_deploy/
 monitor/
 paper/
