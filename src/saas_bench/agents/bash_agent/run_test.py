@@ -770,7 +770,7 @@ __pycache__/
                 raise ValueError('Server snapshot checksum mismatch: ' + name)
         shutil.copy2(self.workspace_dir / 'manifest.json', directory / 'manifest.json')
         receipt['files']['manifest.json'] = file_hash(directory / 'manifest.json')
-        copy_workspace(self.agent_workspace, directory / 'agent_workspace')
+        copy_workspace(self.agent_workspace, directory / 'agent_workspace', omit_session_world=self._session_id)
         request_logs = {}
         for name in ('agent_requests.jsonl', 'simulator_requests.jsonl'):
             source = self.logs_dir / name

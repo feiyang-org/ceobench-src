@@ -13,6 +13,8 @@
 
 Linux 验收目录：`/tmp/ceobench-stage1-n4upJq`。依赖只安装到该目录的 venv。`tests.log`、`tests.xml`、`build.log` 和 `repo/public/build.json` 保留验收记录；原有运行和系统配置未修改。
 
+2026-09-23，跳过快照内重复数据库 C 后复验：macOS / Python 3.13.15 本地重建后 77 通过、1 跳过；sheep-rog / Linux / Python 3.14.7 在新目录 `/tmp/ceobench-omit-c-xc2aog` 原生重建，以 `formal` 模式运行 78 通过。远端 PyPI TLS 连接失败，新 venv 的依赖从旧验收 venv 只读复制；源码、构建和测试均留在新目录，旧验收目录没有写入。
+
 本地重复构建得到相同的运行包、SDK 和文档哈希。构建清单见 [public/build.json](../public/build.json)，其中保存源码基线、补丁及源码指纹、构建脚本指纹、Python 和实际 SDK 依赖版本。SDK 和文档重建后的内容与原版一致，原版任务说明、7/28/84/182 天四个预测期限保持原文。
 
 ## 具体检查
@@ -40,7 +42,7 @@ Linux 原生构建后，增加 `CEOBENCH_TEST_KIND=formal` 即可用相同测试
 
 ## 快照与用量文件
 
-`manifest.json` 冻结生效配置。`checkpoint.json` 只指向全部保存成功的 generation；数据库、配置、脚本、工作区、Git、MEMORY、对话、请求日志及累计数在 `checkpoints/<id>/`，位于 Agent 工作区之外。HTTP 保存请求只接受预期日期，导出目录由启动配置指定。
+`manifest.json` 冻结生效配置。`checkpoint.json` 只指向全部保存成功的 generation；每份快照的权威数据库是 `checkpoints/<id>/world.nmdb`（B），同一目录还保存配置、脚本、工作区、Git、MEMORY、对话、请求日志及累计数。复制工作区时跳过 `checkpoints/<id>/agent_workspace/sessions/<当前 session_id>/world.nmdb`（C），当前运行中的 `agent_workspace/sessions/<当前 session_id>/world.nmdb`（A）保留原样。恢复时先复制快照工作区，再将 B 复制到 A 的位置。HTTP 保存请求只接受预期日期，导出目录由启动配置指定。
 
 `operation.json` 标记尚未纳入完整快照的操作。发生超时或结果未知时，Harness 停止服务器并写 `branch_stop.json`，保留旧指针，拒绝直接恢复该分支。完整旧 generation 仍可离线分析。缺少必要状态的历史快照不会被补默认值后运行。
 

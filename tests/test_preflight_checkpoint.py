@@ -67,3 +67,24 @@ def test_legacy_and_nonportable_workspace_are_rejected(tmp_path):
     (workspace / 'escape').symlink_to(tmp_path)
     with pytest.raises(ValueError, match='symlink'):
         copy_workspace(workspace, tmp_path / 'copy')
+
+
+def test_checkpoint_copy_omits_only_current_session_world(tmp_path):
+    workspace = tmp_path / 'workspace'
+    current = workspace / 'sessions' / 'current'
+    other = workspace / 'sessions' / 'other'
+    current.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (current / 'world.nmdb').write_bytes(b'active')
+    (current / 'session.json').write_text('{}')
+    (other / 'world.nmdb').write_bytes(b'other')
+    (workspace / 'world.nmdb').write_bytes(b'workspace')
+
+    snapshot = tmp_path / 'snapshot'
+    copy_workspace(workspace, snapshot, omit_session_world='current')
+
+    assert (current / 'world.nmdb').read_bytes() == b'active'
+    assert not (snapshot / 'sessions' / 'current' / 'world.nmdb').exists()
+    assert (snapshot / 'sessions' / 'current' / 'session.json').read_text() == '{}'
+    assert (snapshot / 'sessions' / 'other' / 'world.nmdb').read_bytes() == b'other'
+    assert (snapshot / 'world.nmdb').read_bytes() == b'workspace'
