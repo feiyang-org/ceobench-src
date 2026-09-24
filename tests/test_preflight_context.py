@@ -29,7 +29,8 @@ def agent(tmp_path, anthropic=False):
 def test_completed_tool_roundtrip_and_week_refresh(tmp_path, shape):
     first = agent(tmp_path, shape == 'anthropic')
     call = {'type': 'function_call', 'call_id': 'call1', 'name': 'bash', 'arguments': '{}'}
-    first.conversation = [Message('assistant', [call] if shape != 'chat' else '',
+    first.conversation = [Message('system', 'Original prompt'),
+                         Message('assistant', [call] if shape != 'chat' else '',
                                   tool_calls=[{'id': 'call1'}] if shape == 'chat' else None)]
     first._pending_tool_calls = [{'id': 'call1', 'name': 'bash'}]
     first.record_tool_result('completed')
@@ -62,7 +63,8 @@ def test_memory_keeps_original_limit(tmp_path):
 
 @pytest.mark.parametrize('capture', [False, True])
 @pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
-def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api, capture):
+@pytest.mark.parametrize('initial_memory', ['memory A', '', None])
+def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api, capture, initial_memory):
     import httpx
     from openai import OpenAI
     from anthropic import Anthropic
@@ -108,20 +110,38 @@ def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api, captur
             value.usage_recorder.context_id = 'fixture-context'
         value._snapshot_path = tmp_path / 'context.json'
         return value
+    if initial_memory is not None:
+        (tmp_path / 'MEMORY.md').write_text(initial_memory)
+    def system(body):
+        if api == 'chat':
+            assert body['messages'][0]['role'] == 'system'
+            return body['messages'][0]['content']
+        if api == 'responses':
+            return body['instructions']
+        return body['system'][0]['text']
     first = new_agent()
-    assert first.act('dashboard', 0, False, {'day': 7}).tool == 'read_file'
+    assert first.current_day == -1
+    assert first.act('dashboard', 0, False, {'day': 0}).tool == 'read_file'
+    frozen = system(captured[0])
+    assert frozen.startswith('Original instructions')
+    assert ('memory A' in frozen) == bool(initial_memory)
     first.record_tool_result(observation)
     first._save_conversation_snapshot(strict=True)
+    (tmp_path / 'MEMORY.md').write_text('memory B')
     second = new_agent()
+    second.system_prompt = 'Changed base prompt must wait for the next week'
     assert second.load_conversation_snapshot(second._snapshot_path)
-    first.act('contents A', 0, False, {'day': 7})
-    second.act('contents A', 0, False, {'day': 7})
+    first.act('contents A', 0, False, {'day': 0})
+    second.act('contents A', 0, False, {'day': 0})
     assert captured[1] == captured[2]
+    assert system(captured[1]) == frozen
+    assert 'memory B' not in system(captured[2])
     assert 'call1' in json.dumps(captured[2]) and 'contents A' in json.dumps(captured[2])
     second.record_tool_result('contents A')
     (tmp_path / 'MEMORY.md').write_text('persistent note')
-    second.act('new week', 0, False, {'day': 14})
+    second.act('new week', 0, False, {'day': 7})
     assert 'persistent note' in json.dumps(captured[-1])
+    assert system(captured[-1]).startswith(second.system_prompt)
     assert 'call1' not in json.dumps(captured[-1])
     assert first.usage_recorder.summary['http_attempts'] == 2
     assert second.usage_recorder.summary['http_attempts'] == 2
@@ -134,4 +154,33 @@ def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api, captur
         assert all(item['version_id'] not in {x['version_id'] for x in maps[1]} for item in maps[-1])
         assert maps[-1]  # Actual new-week MEMORY read.
         assert 'version_id' not in first._snapshot_path.read_text()
+        memory_events = [event for event in event_ids(store) if store.read_event(event)['request']['kind'] == 'memory_read']
+        assert len(memory_events) == (2 if initial_memory is not None else 1)
+        memory_maps = [[item for item in mapping if item['role'] == 'system'] for mapping in maps]
+        assert bool(memory_maps[0]) == bool(initial_memory)
+        assert [item['version_id'] for item in memory_maps[0]] == [item['version_id'] for item in memory_maps[2]]
+    second.reset()
+    assert second.current_day == -1
+    second.act('reset day zero', 0, False, {'day': 0})
+    assert system(captured[-1]).startswith(second.system_prompt)
+    assert 'call1' not in json.dumps(captured[-1])
     client.close()
+
+
+@pytest.mark.parametrize('anthropic', [False, True])
+def test_legacy_snapshot_freezes_missing_system_once(tmp_path, anthropic):
+    first = agent(tmp_path, anthropic)
+    first.conversation = [Message('user', 'old dashboard')]
+    first._observation_recorded = True
+    first._save_conversation_snapshot(strict=True)
+    (tmp_path / 'MEMORY.md').write_text('note at migration')
+    second = agent(tmp_path, anthropic)
+    assert second.load_conversation_snapshot(first._snapshot_path)
+    assert second.conversation[0].role == 'system'
+    assert 'note at migration' in second.conversation[0].content
+    assert second.conversation[1].content == 'old dashboard'
+    second._save_conversation_snapshot(strict=True)
+    (tmp_path / 'MEMORY.md').write_text('later note')
+    third = agent(tmp_path, anthropic)
+    assert third.load_conversation_snapshot(first._snapshot_path)
+    assert third.conversation[0].content == second.conversation[0].content

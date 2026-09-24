@@ -99,7 +99,7 @@ class BashAgent(BaseAgent):
 
         # Agent state
         self.conversation: List[Message] = []
-        self.current_day: int = 0
+        self.current_day: int = -1
         self.turns_today: int = 0
         self._pending_tool_calls: List[Dict] = []
         self._last_observation: str = ""
@@ -181,11 +181,7 @@ class BashAgent(BaseAgent):
         return getattr(getattr(self, 'usage_recorder', None), 'evidence_store', None)
 
     def _get_system_prompt_with_memory(self) -> str:
-        """Return system prompt with MEMORY.md contents appended.
-
-        MEMORY.md is always injected into the system prompt so the agent
-        has its persistent notes available without needing to read the file.
-        """
+        """Read MEMORY.md once when building a new week's system prompt."""
         prompt = self.system_prompt
         memory_path = self.workspace_path / 'MEMORY.md'
         if memory_path.exists():
@@ -228,16 +224,27 @@ class BashAgent(BaseAgent):
                     self.evidence_store.fail(exc)
         return prompt
 
+    def _context_system_prompt(self) -> str:
+        """Reuse the frozen prompt, including its private source ranges."""
+        for message in self.conversation:
+            if message.role == 'system':
+                return message.content
+        # Legacy snapshots may have no system message. Freeze once on migration.
+        prompt = self._get_system_prompt_with_memory()
+        self.conversation.insert(0, Message(role='system', content=prompt))
+        return prompt
+
     def reset(self):
         """Reset agent state for a new episode."""
         self.conversation = []
-        self.current_day = 0
+        self.current_day = -1
         self.turns_today = 0
         self._pending_tool_calls = []
         self._last_observation = ""
         self._observation_recorded = False
         self._day_advanced = False
         self._new_dashboard = ""
+        self._skip_next_refresh = False
 
     def _refresh_context(self, dashboard: str, new_day: int):
         """Refresh conversation context for a new day.
@@ -252,12 +259,7 @@ class BashAgent(BaseAgent):
         self._pending_tool_calls = []
         self._observation_recorded = False
 
-        if not self.use_anthropic:
-            # OpenAI: system prompt goes in messages
-            self.conversation.append(Message(
-                role='system',
-                content=self._get_system_prompt_with_memory(),
-            ))
+        self._context_system_prompt()
 
     def check_day_advanced(self, bash_output: str) -> bool:
         """Check if bash output contains a dashboard (day advanced).
@@ -504,6 +506,9 @@ class BashAgent(BaseAgent):
             self._skip_next_refresh = False
             self._last_observation = payload['last_observation']
             self._observation_recorded = payload['observation_recorded']
+            if not any(message.role == 'system' for message in self.conversation):
+                print('[snapshot] Legacy context has no system prompt; freezing current system/MEMORY once.')
+                self._context_system_prompt()
             return True
         except Exception as e:
             print(f"[snapshot] WARN failed to load conversation snapshot: {e}")
@@ -524,6 +529,7 @@ class BashAgent(BaseAgent):
 
     def _call_openai(self) -> Optional[Action]:
         """Call OpenAI-compatible API and parse the response."""
+        self._context_system_prompt()
         import time as _time
         import traceback
         import signal
@@ -815,7 +821,7 @@ class BashAgent(BaseAgent):
                     'tools': tools,
                     'tool_choice': 'auto',
                     'max_output_tokens': 16384,
-                    'instructions': self._get_system_prompt_with_memory(),
+                    'instructions': self._context_system_prompt(),
                 }
                 if self.reasoning_effort:
                     api_kwargs['reasoning'] = {'effort': self.reasoning_effort, 'summary': 'auto'}
@@ -1111,7 +1117,7 @@ class BashAgent(BaseAgent):
                     if isinstance(last_block, dict):
                         last_block['cache_control'] = {"type": "ephemeral"}
 
-            system_text = self._get_system_prompt_with_memory()
+            system_text = self._context_system_prompt()
             system_content = [
                 {
                     "type": "text",

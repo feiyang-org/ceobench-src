@@ -1,0 +1,100 @@
+{
+  "source_sha256": "a45ce8815bc5998934aeba15d23ab7824a4c7563f6a8f46a80badf4697515b95",
+  "macos": {
+    "passed": 198,
+    "skipped": 4
+  },
+  "linux": {
+    "passed": 202,
+    "skipped": 0,
+    "python": "3.14.7",
+    "isolation": "bubblewrap",
+    "remote_directory": "/tmp/ceobench-context-HZMHQ2/repo",
+    "source_matches_macos": true
+  },
+  "offline": {
+    "status": "passed",
+    "events": 7,
+    "evidence_versions": 5,
+    "context_policy": "weekly_frozen",
+    "requests": 21,
+    "occurrences": 99,
+    "negative_controls": [
+      "tampered_blob",
+      "wrong_range",
+      "false_full",
+      "stale_context",
+      "missing_mapping",
+      "fork_cutoff"
+    ],
+    "provider_calls": 0
+  },
+  "live": {
+    "status": "passed",
+    "provider": "opencode",
+    "model": "deepseek-v4.1-flash",
+    "actual_http_requests": 4,
+    "source_sha256": "a45ce8815bc5998934aeba15d23ab7824a4c7563f6a8f46a80badf4697515b95",
+    "day0_full_system": true,
+    "same_week_frozen": true,
+    "continuous_restore_request_equal": true,
+    "new_week_memory_b": true,
+    "capture_healthy": true,
+    "usage": {
+      "calls": 4,
+      "errors": 0,
+      "known": {
+        "input_tokens": 27081,
+        "output_tokens": 136,
+        "cached_tokens": 26240,
+        "cache_creation_tokens": null,
+        "reasoning_tokens": 0
+      },
+      "missing": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "cache_creation_tokens": 4,
+        "reasoning_tokens": 0
+      },
+      "known_cost_usd": null,
+      "missing_cost": 4,
+      "http_attempts": 4,
+      "failed_http_attempts": 0,
+      "failed_attempts_without_usage": 0
+    },
+    "preliminary_probes": [
+      {
+        "directory": "opencode_runs/context-freeze-20260924",
+        "http_attempts": 3,
+        "stop_reason": "Tool outside probe allowlist; action was not executed",
+        "usage": {
+          "input_tokens": 22030,
+          "output_tokens": 195,
+          "cached_tokens": 14464
+        }
+      },
+      {
+        "directory": "opencode_runs/context-freeze-20260924/accepted",
+        "http_attempts": 3,
+        "stop_reason": "Tool outside probe allowlist; action was not executed",
+        "usage": {
+          "input_tokens": 20450,
+          "output_tokens": 147,
+          "cached_tokens": 13312
+        }
+      }
+    ],
+    "all_probe_http_attempts": 10
+  },
+  "files": {
+    "ceobench-context-macos-tests.xml": "a2b155e7cbaae52f24e9f5fa6456d9bbd7a6a6c89969694b274eb09893c38c8f",
+    "event-version-example.json": "f9403573f02ab7a902f33510da8e976ae16e54f1d02cd54883c69fe85630f94c",
+    "linux/build.json": "4a9ba39746902afb43a16fa4cdf0d97bfb8e30a21782ed2accd42e42c65952fe",
+    "linux/tests.xml": "a46dae0f2d6d8176419f55ad38468dc00ec61978bd6adf667ce11aeb4b78f4f0",
+    "live-summary.json": "af040f0defe4c2cfe59dc07578d08ad90f1cbfa9d62530abb6b8aeeba4c012c8",
+    "macos-build.json": "bf39dfd4bda497f177d7fbf8fe0b17960a156bf864b9cf4e8889832f28599870",
+    "model-request-source-map.json": "6f80479922e62e247058ca0b38f00537a95023b093471d69ed51aec18e7da4a2",
+    "validation-results.json": "c71fa2184619d35889eb46662606e44236b1756c71712c51720c881502a44f15"
+  }
+}

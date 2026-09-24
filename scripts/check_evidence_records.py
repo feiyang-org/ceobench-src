@@ -70,9 +70,10 @@ def event_example(work):
                   branches={'prefix': None, 'git': {'parent': 'prefix', 'fork_event': 'evidence-example/prefix/5'},
                             'pf': {'parent': 'prefix', 'fork_event': 'evidence-example/prefix/5'}},
                   events=[], versions={}, blobs={}, relations=[], git_mappings=[])
-    conn = sqlite3.connect(':memory:', check_same_thread=False)
+    init_database(work / 'events.db').close()
+    conn = sqlite3.connect(work / 'events.db', check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    server = NovaMindAPIServer(SimpleNamespace(workspace_path=work), conn=conn)
+    server = NovaMindAPIServer(SimpleNamespace(workspace_path=work, current_day=7), conn=conn)
     executor = BashAgentToolExecutor(work)
     sql = "SELECT 7 AS day, 'alpha' AS label, NULL AS note, 1.5 AS amount UNION ALL SELECT 7, 'alpha', NULL, 1.5"
     query = dict(data_source='evidence-example/public', sql=sql, bound_parameters=None)
@@ -316,7 +317,7 @@ def visibility_example(work):
             (case / 'evidence.txt').write_text(file_a)
             day0 = new_agent()
             request(day0, 'day0', 0, source_text(bundle, 'dashboard@0'),
-                    None if api == 'chat' else 'memory@a', 'dashboard@0', False)
+                    'memory@a', 'dashboard@0', False)
             a = new_agent()
             request(a, 'week_start', 7, source_text(bundle, 'dashboard@7'), 'memory@a', 'dashboard@7', False)
             a.record_tool_result(file_result)
@@ -325,7 +326,7 @@ def visibility_example(work):
                              len(file_a.splitlines()[0]) + 1 + len('FILE_A_证据🙂'), 'file_read')])
             (case / 'evidence.txt').write_text(source_text(bundle, 'file@b'))
             memory('memory@b')
-            current_memory = 'memory@a' if api == 'chat' else 'memory@b'
+            current_memory = 'memory@a'
             request(a, 'same_week_after_source_change', 7, file_result, current_memory, 'dashboard@7')
             a.record_tool_result(bash_result)
             history.extend([('bash@return', 0, len(bash_result), 'bash'),
@@ -352,7 +353,7 @@ def visibility_example(work):
         finally:
             client.close()
     bundle['checks'] = dict(apis=3, requests=len(bundle['requests']), provider_calls=0,
-        day0_chat_missing_system_memory=True, same_week_memory_policy=True, restore_bytes_equal=True,
+        day0_system_memory_present=True, same_week_memory_frozen=True, restore_bytes_equal=True,
         week_reset=True, unsent_result=True, file_range=True, bash_truncation=True,
         script_snapshot_and_dashboard_prefix=True, memory_strip_and_truncation=True)
     return bundle
@@ -404,6 +405,9 @@ def validate_events(bundle):
 
 
 def validate_visibility(bundle):
+    frozen = bundle['checks'].get('same_week_memory_frozen') is True
+    require(frozen or bundle['checks'].get('day0_chat_missing_system_memory') is True,
+            'unknown context policy')
     validate_blobs(bundle)
     require(bundle['provider_calls'] == 0, 'offline fixture mislabeled')
     attempts = set()
@@ -435,14 +439,17 @@ def validate_visibility(bundle):
         for name, request in cases.items():
             day = 0 if name == 'day0' else 14 if name == 'new_week' else 21 if name == 'memory_truncation' else 7
             expected = [f'dashboard@{day}', 'script@output']
-            memory = ('memory@long' if day == 21 else 'memory@c' if day == 14 else
-                      'memory@b' if api != 'chat' and name in ('same_week_after_source_change', 'continuous', 'same_week_restore')
-                      else 'memory@a')
-            if not (api == 'chat' and day == 0):
-                expected.append(memory)
+            memory = 'memory@long' if day == 21 else 'memory@c' if day == 14 else 'memory@a'
+            if not frozen and api != 'chat' and name in ('same_week_after_source_change', 'continuous', 'same_week_restore'):
+                memory = 'memory@b'  # Historical artifacts retain their original request policy.
+            body = json.loads(bundle['blobs'][request['wire_blob']]['text'])
+            prompt = [text for _, role, text in text_fields(body) if role == 'system']
+            if not frozen and api == 'chat' and day == 0:
+                require(not prompt, 'historical day0 Chat request changed')
             else:
-                body = json.loads(bundle['blobs'][request['wire_blob']]['text'])
-                require(all(m['role'] != 'system' for m in body['messages']), 'day0 Chat behavior changed')
+                expected.append(memory)
+                require(len(prompt) == 1 and prompt[0].startswith('Offline model-input visibility fixture.'),
+                        'missing system prompt')
             if name in ('same_week_after_source_change', 'continuous', 'same_week_restore'):
                 expected.extend(['file@return', 'file@a'])
             if name in ('continuous', 'same_week_restore'):
@@ -514,6 +521,7 @@ def main():
     validate_visibility(visibility)
     negatives = negative_checks(events, visibility)
     summary = dict(status='passed', events=len(events['events']), evidence_versions=len(events['versions']),
+                   context_policy='weekly_frozen' if visibility['checks'].get('same_week_memory_frozen') else 'historical_api_specific',
                    requests=len(visibility['requests']), occurrences=sum(len(r['occurrences']) for r in visibility['requests']),
                    negative_controls=negatives, provider_calls=0)
     if args.output:

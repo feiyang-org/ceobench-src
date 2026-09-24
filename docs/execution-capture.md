@@ -37,6 +37,8 @@
 | `agent.py`、`model_usage.py` | MEMORY 实际读取、strip、40,000 字符截断；私有会话来源状态绑定会话文件哈希；三个模型请求格式均在 SDK 最终序列化边界核验范围。保持 Chat 第 0 日原初始化行为。 |
 | `sql_evidence.py`、`server_entry.py`、`run_state.py` | checkpoint 关闭宿主新执行及 HTTP 新请求准入，允许已开始操作的子调用完成，随后备份证据与私有来源状态。冻结等待不持有子调用需要的世界锁或数据库事务。管理记录单独保存，当前 checkpoint 的回执不进入自身快照。 |
 
+> 已修复：表中保留的 Chat 第 0 日初始化缺陷已经修复。三个 API 均冻结每周 system/MEMORY；MEMORY 读取事件只在实际加载时产生，同周出现记录继续指向原版本，恢复保留私有来源范围。本页旧样例和 160／164 项验收数字保留，当前修复及回归结果见 [system 与 MEMORY 修复](context-freeze-validation.md)。
+
 文件工具的正整数校验、真实写入字节数、逐候选路径检查及上限提示，以及进程监督，均作为捕获开关共用的基线。证据与来源关系不会加入 Agent 提示词、工具文本或 Agent 可读会话 JSON。
 
 工作区扫描不跟随外部符号链接，特殊文件只记元数据。manifest 排除 `sessions/*/world.nmdb`、其 SQLite 辅助文件、`*.plain.tmp*` 和 `*.nmdb.tmp*` 模拟器临时数据库。扫描遇到其他并发变化会记录捕获故障并停止后续操作。

@@ -95,6 +95,8 @@ Git 对应关系只在 `git show <commit>:<path>` 的字节与已捕获版本完
 | Responses | `/instructions` | `/input/N/output`，`type=function_call_output` | 发送 B 版 |
 | Anthropic Messages | `/system/0/text` | `/messages/N/content/M/content`，`type=tool_result` | 发送 B 版 |
 
+> 已修复：上述表格与原始 JSON 保留当时验收事实。当前三条路径均冻结周初 system/MEMORY，第 0 天也带完整 system；同周修改文件只在新周自动加载。新的 21 条请求、99 条映射与验证结果另存于 `docs/evidence-recording/context-freeze/`，见 [修复与影响检查](context-freeze-validation.md)。
+
 具体下标保存在 `model-request-source-map.json` 每条记录中，不能用表中的 N／M 替代实际下标。Anthropic 的缓存字段保留在原始请求中。
 
 ### 对照结果
@@ -107,6 +109,8 @@ Git 对应关系只在 `git show <commit>:<path>` 的字节与已捕获版本完
 | 连续执行与同周恢复 | 2 | 两次请求的原始正文逐字节相同；旧文件片段和截断后的 Bash 返回均在其中 |
 | 第 14 日新周 | 1 | 旧工具结果清空，发送新 dashboard 与 MEMORY C；入会话后尚未发送的结果被清空 |
 | 第 21 日长 MEMORY | 1 | `strip()` 后只交付前 40,000 字符，隐藏尾部缺席，原文件边界空白不记为已交付 |
+
+> 已修复：当前第 0 天三条路径都有 system/MEMORY A；同周修改后和同周恢复都发送冻结的 A。原表中的缺项和 API 差异只属于旧样例。
 
 文件部分读取只映射 A 版第 2 行，添加的行号属于工具格式文本。Bash 输出超过 30,000 字符时，原 stdout 只映射 `[0,15000)` 与 `[len-15000,len)`，最终工具返回自身可完整出现。这里 stdout 的原文为固定脚本的已知预期输出；检查真实执行所得首尾及截断提示，没有接入通用双流捕获。
 
