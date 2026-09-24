@@ -176,6 +176,10 @@ class BashAgent(BaseAgent):
                 prompt = oracle_preamble + "\n\n" + prompt
         return prompt
 
+    @property
+    def evidence_store(self):
+        return getattr(getattr(self, 'usage_recorder', None), 'evidence_store', None)
+
     def _get_system_prompt_with_memory(self) -> str:
         """Return system prompt with MEMORY.md contents appended.
 
@@ -186,7 +190,20 @@ class BashAgent(BaseAgent):
         memory_path = self.workspace_path / 'MEMORY.md'
         if memory_path.exists():
             try:
-                memory_content = memory_path.read_text().strip()
+                original_memory = memory_path.read_bytes()
+                from saas_bench.execution_capture import ExecutionCapture, CapturedText, decoded, origin
+                memory_text = decoded(original_memory)
+                memory_content = memory_text.strip()
+                memory_origin = None
+                if self.evidence_store:
+                    capture = ExecutionCapture(self.evidence_store)
+                    capture.begin('memory_read', {'path': 'MEMORY.md'})
+                    memory_version = capture.file('MEMORY.md', original_memory, memory_text)
+                    if memory_version and memory_content:
+                        begin = len(memory_text) - len(memory_text.lstrip())
+                        memory_origin = origin(memory_version, memory_text, begin, begin + min(40000, len(memory_content)))
+                    if capture.event:
+                        capture.safe(capture.store.complete, capture.event)
                 if memory_content:
                     max_memory_chars = 40_000
                     if len(memory_content) > max_memory_chars:
@@ -201,8 +218,14 @@ class BashAgent(BaseAgent):
                         "This is automatically loaded into your context at the start of every day.\n\n"
                         f"{memory_content}"
                     )
-            except Exception:
-                pass
+                    if memory_origin:
+                        length = memory_origin['request_range'][1]
+                        offset = len(prompt) - len(memory_content)
+                        memory_origin['request_range'] = [offset, offset + length]
+                        prompt = CapturedText(prompt, [memory_origin])
+            except Exception as exc:
+                if self.evidence_store:
+                    self.evidence_store.fail(exc)
         return prompt
 
     def reset(self):
@@ -223,6 +246,9 @@ class BashAgent(BaseAgent):
         The agent reads its own files via tools when it needs context.
         """
         self.conversation = []
+        if self.evidence_store:
+            import uuid
+            self.usage_recorder.context_id = uuid.uuid4().hex
         self._pending_tool_calls = []
         self._observation_recorded = False
 
@@ -247,6 +273,10 @@ class BashAgent(BaseAgent):
                 # Extract dashboard from the output (everything from === Day N ===)
                 dashboard_start = match.start()
                 self._new_dashboard = bash_output[dashboard_start:]
+                if hasattr(bash_output, 'origins'):
+                    from saas_bench.execution_capture import CapturedText, slice_origins
+                    self._new_dashboard = CapturedText(self._new_dashboard,
+                        slice_origins(bash_output.origins, dashboard_start, len(bash_output)))
                 return True
         return False
 
@@ -419,7 +449,15 @@ class BashAgent(BaseAgent):
             with open(tmp_path, "w") as f:
                 json.dump(payload, f)
             os.replace(tmp_path, self._snapshot_path)
+            if self.evidence_store:
+                from saas_bench.execution_capture import text_sources
+                from saas_bench.sql_evidence import digest
+                self.evidence_store.save_state('agent_sources',
+                    dict(snapshot_sha256=digest(self._snapshot_path.read_bytes()),
+                         context_id=self.usage_recorder.context_id, sources=text_sources(payload)))
         except Exception as e:
+            if self.evidence_store:
+                self.evidence_store.fail(e)
             if strict:
                 raise
             # Per-turn best effort files are not published checkpoints.
@@ -438,6 +476,14 @@ class BashAgent(BaseAgent):
         try:
             with open(path, "r") as f:
                 payload = json.load(f)
+            if self.evidence_store:
+                from saas_bench.execution_capture import restore_sources
+                from saas_bench.sql_evidence import digest
+                state = self.evidence_store.load_state('agent_sources')
+                if not state or state['snapshot_sha256'] != digest(path.read_bytes()):
+                    raise ValueError('Missing or mismatched private source state')
+                restore_sources(payload, state['sources'])
+                self.usage_recorder.context_id = state['context_id']
             raw_msgs = payload.get("conversation", [])
             msgs: List[Message] = []
             for m in raw_msgs:
@@ -675,6 +721,8 @@ class BashAgent(BaseAgent):
                 return Action(tool=first_tc.function.name, arguments=args)
 
             except Exception as e:
+                if self.evidence_store:
+                    self.evidence_store.assert_healthy(quiescent=False)
                 status = getattr(e, 'status_code', 0) or 0
                 is_retryable = isinstance(e, openai.APIStatusError) and (status >= 500 or status == 429)
                 if not is_retryable:
@@ -877,6 +925,8 @@ class BashAgent(BaseAgent):
                 return Action(tool=first_fc.name, arguments=args)
 
             except Exception as e:
+                if self.evidence_store:
+                    self.evidence_store.assert_healthy(quiescent=False)
                 status = getattr(e, 'status_code', 0) or 0
                 is_retryable = isinstance(e, openai.APIStatusError) and (status >= 500 or status == 429)
                 if not is_retryable:
@@ -1181,6 +1231,8 @@ class BashAgent(BaseAgent):
                 return Action(tool=first_tool.name, arguments=first_tool.input or {})
 
             except Exception as e:
+                if self.evidence_store:
+                    self.evidence_store.assert_healthy(quiescent=False)
                 import traceback
                 if str(e).startswith("Anthropic response did not include a tool_use block"):
                     raise

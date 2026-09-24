@@ -174,12 +174,16 @@ def build_weekly_dashboard(
                 lines.append(f"  Post #{post['agent_post_id']}: {post['views']} views, {post['comment_count']} comments{comment_ids_str} — \"{post['content'][:80]}{'...' if len(post['content']) > 80 else ''}\"")
 
 
+    source_origins = []
     # Weekly calculation outputs
     if calc_outputs:
         lines.append("")
         lines.append("--- Weekly Calculations ---")
         for name, output in calc_outputs.items():
             lines.append(f"[{name}]")
+            from .execution_capture import slice_origins
+            target = sum(len(line) + 1 for line in lines)
+            source_origins.extend(slice_origins(getattr(output, 'origins', []), 0, min(500, len(output)), target))
             lines.append(output[:500])  # Truncate long outputs
 
     # Inbox
@@ -191,7 +195,8 @@ def build_weekly_dashboard(
     else:
         lines.append("  (No new messages)")
 
-    return '\n'.join(lines)
+    from .execution_capture import CapturedText
+    return CapturedText('\n'.join(lines), source_origins) if source_origins else '\n'.join(lines)
 
 
 def get_thread_inbox_items(conn: sqlite3.Connection, day: int, week_start_day: int = None) -> List[str]:

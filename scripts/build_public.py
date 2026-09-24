@@ -46,6 +46,8 @@ _ENGINE_MODULES = [
     "api_server",
     "public_sql",
     "sql_evidence",
+    "execution_capture",
+    "process_boundary",
     "config",
     "customer_llm",
     "database",
@@ -72,6 +74,7 @@ _ENGINE_MODULES = [
 _ENGINE_API_MODULES = [
     "__init__",
     "_client",
+    "_capture",
     "analytics",
     "enterprise",
     "infrastructure",
@@ -223,6 +226,8 @@ def _build_zipapp():
         # __main__.py (entry point, stays as source — it's tiny and must run
         # *before* any saas_bench import happens because of PYTHONHASHSEED).
         (staging / "__main__.py").write_text(_ZIPAPP_MAIN_SOURCE)
+
+        _compile_pyc(SRC_DIR / "novamind_api" / "_capture.py", staging / "_client_capture.pyc", "_client_capture.py")
 
         # Compile _public_cli.py → _public_cli.pyc at the archive root
         src_cli = SRC_DIR / "_public_cli.py"

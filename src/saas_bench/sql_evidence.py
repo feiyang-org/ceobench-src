@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+import uuid
 
 FORMAT = 'ceobench.evidence-records.v1'
 
@@ -95,6 +96,12 @@ class SQLEvidenceStore:
                     metadata BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS deliveries (
                     event_id TEXT PRIMARY KEY REFERENCES requests(event_id), record BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS capture_contexts (
+                    token TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES requests(event_id));
+                CREATE TABLE IF NOT EXISTS client_calls (
+                    token TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES requests(event_id),
+                    received BLOB);
+                CREATE TABLE IF NOT EXISTS private_state (name TEXT PRIMARY KEY, value BLOB NOT NULL);
             ''')
             source = encoded({k: identity[k] for k in ('run_id', 'data_source_id', 'format')})
             existing = conn.execute('SELECT value FROM identity').fetchone()
@@ -127,23 +134,150 @@ class SQLEvidenceStore:
 
     def fail(self, exc):
         from .run_state import write_json
-        self.fault = {'reason': str(exc), 'time': now(), 'capture_status': 'missing'}
+        previous = self.fault or {}
+        if self.fault_path.exists():
+            try:
+                previous = json.loads(self.fault_path.read_bytes())
+            except (OSError, ValueError):
+                pass
+        self.fault = dict(previous, reason=str(exc), time=now(), capture_status='missing')
         try:
             write_json(self.fault_path, self.fault)
         except OSError:
             pass  # The server's in-memory fault also blocks checkpoint publication.
 
-    def assert_healthy(self):
+    @property
+    def execution_capture(self):
+        return self.identity.get('capture_scope') == 'execution'
+
+    def assert_healthy(self, quiescent=True):
         if self.fault or self.fault_path.exists():
             raise RuntimeError('SQL evidence capture failed; collection stopped')
+        if not quiescent:
+            return
         with closing(self.connect()) as conn:
             pending = conn.execute('''SELECT event_id FROM requests
                 WHERE event_id NOT IN (SELECT event_id FROM results)
-                   OR event_id NOT IN (SELECT event_id FROM deliveries) LIMIT 1''').fetchone()
+                   OR (coalesce(json_extract(request, '$.requires_delivery'), 1) = 1
+                       AND event_id NOT IN (SELECT event_id FROM deliveries)) LIMIT 1''').fetchone()
+            missing = conn.execute('SELECT token FROM client_calls WHERE received IS NULL LIMIT 1').fetchone()
+            unknown = conn.execute("SELECT event_id FROM results WHERE json_extract(record, '$.status') = 'result_unknown' LIMIT 1").fetchone()
         if pending:
             raise RuntimeError('Unconfirmed SQL evidence outcome: ' + pending[0])
+        if missing:
+            raise RuntimeError('Unconfirmed client receive outcome: ' + missing[0])
+        if unknown:
+            raise RuntimeError('Unconfirmed execution outcome: ' + unknown[0])
 
-    def begin(self, raw_body, policy):
+    def begin_event(self, kind, request=None, parent=None, requires_delivery=False, admitted=False, **facts):
+        deadline = time.monotonic() + 180
+        while True:
+            self.assert_healthy(quiescent=False)
+            with closing(self.connect()) as conn, conn:
+                conn.execute('BEGIN IMMEDIATE')
+                paused = conn.execute("SELECT value FROM private_state WHERE name='admission_paused'").fetchone()
+                if parent or admitted or not paused or not json.loads(paused[0]):
+                    if parent:
+                        self._visible(conn, parent)
+                    seq = self.sequence(conn) + 1
+                    event = f"{self.identity['run_id']}/{self.identity['branch_id']}/{seq}"
+                    record = dict(event_id=event, seq=seq, author='ceo', kind=kind, request=request,
+                                  started_at=now(), parent_event_id=parent, requires_delivery=requires_delivery,
+                                  query_id=None, **facts)
+                    conn.execute('INSERT INTO requests VALUES (?,?,?,?,?)',
+                                 (event, self.identity['branch_id'], seq, None, encoded(record)))
+                    return event
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Checkpoint admission did not reopen')
+            time.sleep(.01)
+
+    def version(self, event, slot, payload, *, layer, object_id=None, **metadata):
+        if isinstance(payload, str):
+            payload = payload.encode('utf-8')
+        if not isinstance(payload, bytes):
+            raise TypeError('Evidence content must be bytes or text')
+        version = event + ':' + slot
+        sha = digest(payload)
+        with closing(self.connect()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            self._visible(conn, event)
+            previous = None
+            if object_id:
+                for row in conn.execute('SELECT version_id,event_id FROM versions WHERE json_extract(metadata, \'$.object_id\')=? ORDER BY rowid DESC', (object_id,)):
+                    try:
+                        self._visible(conn, row['event_id'])
+                        previous = row['version_id']
+                        break
+                    except KeyError:
+                        continue
+            record = dict(layer=layer, object_id=object_id, created_by_event=event, extent='full',
+                          source_truncated=False, acquired_at=now(),
+                          content_time={'status': 'unknown', 'reason': 'not_declared'})
+            record.update(metadata)
+            conn.execute('INSERT OR IGNORE INTO blobs VALUES (?,?,?)', (sha, len(payload), payload))
+            conn.execute('INSERT INTO versions VALUES (?,?,?,?,?)',
+                         (version, event, previous, sha, encoded(record)))
+        return version
+
+    def complete(self, event, status='succeeded', **facts):
+        record = dict(status=status, completed_at=None if status == 'result_unknown' else now(),
+                      capture_status='missing' if self.fault or self.fault_path.exists() else 'complete', capture_gaps=[])
+        record.update(facts)
+        with closing(self.connect()) as conn, conn:
+            conn.execute('INSERT INTO results VALUES (?,?)', (event, encoded(record)))
+
+    def context(self, event, token=None):
+        token = token or uuid.uuid4().hex
+        if not re.fullmatch('[a-f0-9]{32}', token):
+            raise ValueError('Invalid capture context')
+        with closing(self.connect()) as conn, conn:
+            self._visible(conn, event)
+            conn.execute('INSERT INTO capture_contexts VALUES (?,?)', (token, event))
+        return token
+
+    def parent(self, token, active=True):
+        if not token:
+            return None
+        with closing(self.connect()) as conn:
+            row = conn.execute('SELECT event_id FROM capture_contexts WHERE token=?', (token,)).fetchone()
+            if row is None:
+                raise ValueError('Unknown capture context')
+            self._visible(conn, row[0])
+            if active and conn.execute('SELECT 1 FROM results WHERE event_id=?', (row[0],)).fetchone():
+                raise ValueError('Capture context has ended')
+            return row[0]
+
+    def bind_client(self, event, token):
+        if not re.fullmatch('[a-f0-9]{32}', token or ''):
+            raise ValueError('Invalid client call key')
+        with closing(self.connect()) as conn, conn:
+            conn.execute('INSERT INTO client_calls VALUES (?,?,NULL)', (token, event))
+
+    def received(self, token, payload):
+        with closing(self.connect()) as conn, conn:
+            row = conn.execute('SELECT event_id,received FROM client_calls WHERE token=?', (token,)).fetchone()
+            if row is None or row['received'] is not None:
+                raise ValueError('Unknown or already recorded client call')
+            event = row['event_id']
+            self._visible(conn, event)
+        # All fields are client observations, never server-authored facts.
+        for slot, value in payload.items():
+            self.version(event, 'client_' + slot, bytes.fromhex(value) if slot == 'body' else encoded(value),
+                         layer='program_' + slot, origin='standard_client_observation')
+        with closing(self.connect()) as conn, conn:
+            conn.execute('UPDATE client_calls SET received=? WHERE token=? AND received IS NULL',
+                         (encoded(dict(receive_state=payload.get('state', 'received'), time=now())), token))
+
+    def save_state(self, name, value):
+        with closing(self.connect()) as conn, conn:
+            conn.execute('INSERT OR REPLACE INTO private_state VALUES (?,?)', (name, encoded(value)))
+
+    def load_state(self, name):
+        with closing(self.connect()) as conn:
+            row = conn.execute('SELECT value FROM private_state WHERE name=?', (name,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def begin(self, raw_body, policy, parent=None):
         if self.fault or self.fault_path.exists():
             raise RuntimeError('SQL evidence capture failed; collection stopped')
         try:
@@ -162,8 +296,8 @@ class SQLEvidenceStore:
                 conn.execute('INSERT OR IGNORE INTO queries VALUES (?,?)', (query, encoded(definition)))
             request = dict(event_id=event, seq=seq, author='ceo', kind='sql_query',
                            started_at=now(), candidate_sql=sql, bound_parameters=None,
-                           raw_request_hex=raw_body.hex(), parent_event_id=None,
-                           parent_reason='unpropagated_context', query_id=query)
+                           raw_request_hex=raw_body.hex(), parent_event_id=parent,
+                           parent_reason=None if parent else 'unpropagated_context', query_id=query)
             conn.execute('INSERT INTO requests VALUES (?,?,?,?,?)',
                          (event, self.identity['branch_id'], seq, query, encoded(request)))
         return event
@@ -227,7 +361,11 @@ class SQLEvidenceStore:
             result = conn.execute('SELECT record FROM results WHERE event_id=?', (event,)).fetchone()
             delivery = conn.execute('SELECT record FROM deliveries WHERE event_id=?', (event,)).fetchone()
             definition = conn.execute('SELECT definition FROM queries WHERE id=?', (request['query_id'],)).fetchone()
-            return dict(request=request, result=json.loads(result[0]) if result else
+            client = conn.execute('SELECT received FROM client_calls WHERE event_id=?', (event,)).fetchone()
+            versions = conn.execute('SELECT version_id,metadata FROM versions WHERE event_id=? ORDER BY rowid', (event,)).fetchall()
+            inputs = sorted({meta['derived_from'] for row in versions if (meta := json.loads(row['metadata'])).get('derived_from')})
+            return dict(request=request, inputs=inputs, outputs=[row['version_id'] for row in versions],
+                        client_receipt=json.loads(client[0]) if client and client[0] else {'receive_state': 'unknown'}, result=json.loads(result[0]) if result else
                         dict(status='result_unknown', completed_at=None, capture_status='missing'),
                         query_definition=json.loads(definition[0]) if definition else None,
                         delivery=json.loads(delivery[0]) if delivery else
@@ -249,4 +387,8 @@ class SQLEvidenceStore:
         self.assert_healthy()
         with closing(self.connect()) as conn, closing(sqlite3.connect(target)) as backup:
             conn.backup(backup)
-            return dict(identity=self.identity, cutoff=self.sequence(conn), sha256=digest(Path(target).read_bytes()))
+            # Admission is live coordination, never restored as a permanent pause.
+            backup.execute("DELETE FROM private_state WHERE name='admission_paused'")
+            backup.commit()
+            cutoff = self.sequence(conn)
+        return dict(identity=self.identity, cutoff=cutoff, sha256=digest(Path(target).read_bytes()))

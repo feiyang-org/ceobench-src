@@ -197,11 +197,12 @@ def test_checkpoint_http_does_not_accept_paths_and_predictions_reject_nonfinite(
     assert runner._get_game_status()['day'] == 0
 
 
-def test_full_harness_uses_packed_cli_and_fake_agent_requests(offline_runner, monkeypatch):
+@pytest.mark.parametrize('execution', [False, True])
+def test_full_harness_uses_packed_cli_and_fake_agent_requests(offline_runner, monkeypatch, execution):
     import httpx
     from openai import OpenAI
     from test_preflight_usage import reply
-    runner = offline_runner()
+    runner = offline_runner(execution_capture=execution)
     requests = []
     def handle(request):
         requests.append(json.loads(request.content))
@@ -306,6 +307,9 @@ def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
     assert not list((directory / 'agent_workspace').rglob('sql-evidence*'))
     runner._stop_server()
     restored = offline_runner(runner.workspace_dir)
+    assert not restored.execution_capture and restored.evidence_store is None
+    with pytest.raises(ValueError, match='configuration mismatch'):
+        offline_runner(runner.workspace_dir, execution_capture=True)
     restored._http_post('/query', {'sql': sql})
     restored._save_checkpoint(7)
     assert restored._load_checkpoint()['sql_evidence']['cutoff'] == 5
@@ -328,3 +332,81 @@ def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
     assert again._load_checkpoint()['sql_evidence']['cutoff'] == 2
     with closing(store.connect()) as conn:
         assert store.sequence(conn) == 5
+
+
+def test_packed_execution_capture_scripts_cache_restore_and_fork(offline_runner, tmp_path):
+    import shlex
+    from contextlib import closing
+    from saas_bench.run_state import clone_sql_run
+    from test_sql_evidence import event_ids
+    runner = offline_runner(execution_capture=True)
+    store = runner.evidence_store
+    code = "import novamind_api as nm; print(nm.query('SELECT 17 AS n')); print('中' * 600)"
+    result = runner.tool_executor.execute('bash', {'command': './novamind-operation python-c ' + shlex.quote(code)})
+    assert '17' in result and '中' * 600 in result, result
+    events = [store.read_event(e) for e in event_ids(store)]
+    python_event = next(r['request']['event_id'] for r in events if r['request']['kind'] == 'cli_python')
+    assert store.get_content(python_event + ':code')[1].decode() == code
+    query = next(r for r in events if r['request']['kind'] == 'sql_query')
+    assert query['request']['parent_event_id'] == python_event
+    assert query['client_receipt']['receive_state'] == 'received'
+    script = runner.agent_workspace / 'registered.py'
+    script.write_text("print('version A' + '中' * 600)")
+    runner._http_post('/daily-scripts', {'name': 'metric', 'content': script.read_text()})
+    registered = store.load_state('script_versions')['metric']
+    script.write_text("print('version B')")
+    assert 'version A' in advance(runner)['dashboard']
+    dashboard = runner._get_dashboard()
+    assert 'version B' not in dashboard and '中' * 600 not in dashboard
+    generated = store.load_state('dashboard')['version']
+    assert runner._get_dashboard() == dashboard
+    assert store.load_state('dashboard')['version'] == generated
+    meta, body = store.get_content(generated)
+    assert any(o['source_range'][1] - o['source_range'][0] == 500 for o in meta['segments'])
+    assert b'version A' in store.get_content(registered)[1]
+    assert any(r['request']['kind'] == 'registered_script_execution' for r in
+               (store.read_event(e) for e in event_ids(store)))
+    runner._save_checkpoint(7)
+    snapshot = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
+    assert not list((snapshot / 'agent_workspace').rglob('*evidence.sqlite'))
+    runner._stop_server()
+    restored = offline_runner(runner.workspace_dir)
+    assert restored._get_dashboard() == dashboard
+    assert restored.evidence_store.load_state('dashboard')['version'] == generated
+    restored._save_checkpoint(7)
+    left = offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / 'execution-left', 'left'))
+    right = offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / 'execution-right', 'right'))
+    for child in (left, right):
+        assert child.evidence_store.get_content(registered)[1] == store.get_content(registered)[1]
+        text = child.tool_executor.execute('write_file', {'path': 'branch.txt', 'content': child.sql_evidence_config['branch_id']})
+        version = text.origins[0]['version_id']
+        other = right if child is left else left
+        with pytest.raises(KeyError):
+            other.evidence_store.get_content(version)
+        child._save_checkpoint(7)
+        child.evidence_store.assert_healthy()
+
+
+def test_harness_preserves_unfinished_descendants_and_server(offline_runner, monkeypatch):
+    import signal
+    from saas_bench.environment import Action
+    runner = offline_runner(execution_capture=True)
+    runner._save_checkpoint(0)
+    pointer = (runner.workspace_dir / 'checkpoint.json').read_bytes()
+    monkeypatch.setattr(runner, 'setup', lambda: None)
+    monkeypatch.setattr(runner.agent, 'act', lambda *args: Action(tool='bash',
+        arguments={'command': 'sleep 60 >/dev/null 2>&1 & echo parent-returned'}))
+    try:
+        with pytest.raises(RuntimeError, match='unknown'):
+            runner.run(verbose=False)
+        assert runner._server_proc.poll() is None
+        assert runner.tool_executor.preserved_process.poll() is None
+        assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == pointer
+        assert json.loads((runner.workspace_dir / 'sql-evidence.fault.json').read_text())['preserve_scene']
+        with pytest.raises(ValueError, match='unknown'):
+            runner._load_checkpoint()
+    finally:
+        proc = runner.tool_executor.preserved_process
+        if proc:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate(timeout=5)

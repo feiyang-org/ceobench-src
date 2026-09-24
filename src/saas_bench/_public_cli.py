@@ -13,6 +13,11 @@ Python's zipimport. The agent only interacts through the ``./novamind-operation`
 CLI and the ``novamind_api`` SDK source at ``docs/novamind_api/``.
 """
 
+try:
+    from .novamind_api._capture import observed, urlopen, print, script_start, script_end, decode_output
+except ImportError:  # zipapp client lives at the archive root
+    from _client_capture import observed, urlopen, print, script_start, script_end, decode_output
+
 import json
 import os
 import signal
@@ -168,6 +173,7 @@ def _ensure_server_running(session_id: str) -> int:
     sys.exit(1)
 
 
+@observed
 def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
     url = f"http://127.0.0.1:{port}{path}"
     data = json.dumps(body or {}).encode() if method == "POST" else None
@@ -178,7 +184,7 @@ def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
         method=method,
     )
     try:
-        with urllib.request.urlopen(req, timeout=1800) as resp:
+        with urlopen(req, timeout=1800) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body_bytes = e.read()
@@ -207,6 +213,7 @@ def _log_history(session_id: str, entry: dict):
 # Commands
 # =========================================================================
 
+@observed
 def cmd_new_session(args):
     result = _run_server_cmd([
         "new-session",
@@ -220,6 +227,7 @@ def cmd_new_session(args):
     print(result.stdout.strip())
 
 
+@observed
 def cmd_next_week(args):
     session_id = _resolve_session(args.session)
     port = _ensure_server_running(session_id)
@@ -255,6 +263,7 @@ def cmd_next_week(args):
         sys.exit(1)
 
 
+@observed
 def cmd_python(args):
     session_id = _resolve_session(args.session)
     port = _ensure_server_running(session_id)
@@ -266,6 +275,7 @@ def cmd_python(args):
     _execute_python(session_id, port, code, source=str(script_path))
 
 
+@observed
 def cmd_python_c(args):
     session_id = _resolve_session(args.session)
     port = _ensure_server_running(session_id)
@@ -299,14 +309,20 @@ def _execute_python(session_id: str, port: int, code: str, source: str = "unknow
     # processes (if any) don't accidentally invoke the engine.
     env.pop("NOVAMIND_SERVER_MODE", None)
 
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(_base_dir()),
-        timeout=300,
-    )
+    captured = script_start(code, source, env)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, env=env,
+            cwd=str(_base_dir()), timeout=300,
+        )
+    except subprocess.TimeoutExpired as exc:
+        script_end(captured, exc.stdout or b'', exc.stderr or b'', None, 'timeout')
+        raise
+    except BaseException as exc:
+        script_end(captured, b'', b'', None, type(exc).__name__)
+        raise
+    script_end(captured, result.stdout, result.stderr, result.returncode)
+    result.stdout, result.stderr = decode_output(result.stdout), decode_output(result.stderr)
 
     if result.stdout:
         print(result.stdout, end="")
@@ -324,6 +340,7 @@ def _execute_python(session_id: str, port: int, code: str, source: str = "unknow
     sys.exit(result.returncode)
 
 
+@observed
 def cmd_query(args):
     session_id = _resolve_session(args.session)
     port = _ensure_server_running(session_id)
@@ -347,6 +364,7 @@ def cmd_query(args):
         sys.exit(1)
 
 
+@observed
 def cmd_status(args):
     session_id = _resolve_session(args.session)
     if session_id == "__env__":
@@ -375,6 +393,7 @@ def cmd_status(args):
     print(json.dumps(meta, indent=2))
 
 
+@observed
 def cmd_history(args):
     session_id = _resolve_session(args.session)
     history_path = _sessions_dir() / session_id / "history.jsonl"
@@ -394,6 +413,7 @@ def cmd_history(args):
     print(json.dumps({"history": entries, "count": len(entries)}, indent=2, default=str))
 
 
+@observed
 def cmd_list_sessions(args):
     sessions_dir = _sessions_dir()
     sessions = []
@@ -415,6 +435,7 @@ def cmd_list_sessions(args):
     print(json.dumps({"sessions": sessions, "count": len(sessions)}, indent=2, default=str))
 
 
+@observed
 def cmd_stop(args):
     session_id = _resolve_session(args.session)
     sdir = _sessions_dir() / session_id

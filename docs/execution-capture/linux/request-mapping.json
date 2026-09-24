@@ -1,0 +1,40 @@
+[
+  {
+    "attempt_id": "52dbdf9cc5fa42489d90539b9b0688c9",
+    "call_id": "9723dfcaa48f453a9d7210027fe02001",
+    "context_id": "0f27792940a54e5faa8472cede7f885e",
+    "full_source": true,
+    "json_pointer": "/messages/0/content",
+    "reader": "ceo",
+    "request_range": [
+      0,
+      5
+    ],
+    "role": "tool",
+    "send_state_event_id": "test-run/prefix/4",
+    "source_range": [
+      0,
+      5
+    ],
+    "version_id": "test-run/prefix/1:tool_return"
+  },
+  {
+    "attempt_id": "52dbdf9cc5fa42489d90539b9b0688c9",
+    "call_id": "9723dfcaa48f453a9d7210027fe02001",
+    "context_id": "0f27792940a54e5faa8472cede7f885e",
+    "full_source": true,
+    "json_pointer": "/messages/0/content",
+    "reader": "ceo",
+    "request_range": [
+      0,
+      5
+    ],
+    "role": "tool",
+    "send_state_event_id": "test-run/prefix/4",
+    "source_range": [
+      0,
+      5
+    ],
+    "version_id": "test-run/prefix/1:stdout"
+  }
+]

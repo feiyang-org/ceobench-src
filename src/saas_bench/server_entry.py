@@ -453,6 +453,11 @@ def cmd_start_server(args, base: Path):
                               ('world.nmdb', 'session.json', 'server_state.json')}}
             if sql_evidence:
                 receipt['sql_evidence'] = sql_evidence.snapshot(target / 'sql-evidence.sqlite')
+                control = sql_evidence.path.with_suffix('.controls.jsonl')
+                if control.exists():
+                    import shutil
+                    shutil.copy2(control, target / control.name)
+                    receipt['files'][control.name] = file_hash(target / control.name)
             return receipt
 
         api_server.checkpoint_callback = _checkpoint
@@ -462,6 +467,13 @@ def cmd_start_server(args, base: Path):
         if state['day'] != current_day:
             raise ValueError('Restored dashboard day differs from world')
         api_server._last_dashboard = state['dashboard']
+        if sql_evidence and sql_evidence.execution_capture and state['dashboard']:
+            from saas_bench.execution_capture import CapturedText
+            from saas_bench.sql_evidence import digest
+            saved = sql_evidence.load_state('dashboard')
+            if saved is None or saved['sha256'] != digest(state['dashboard'].encode()):
+                raise ValueError('Restored dashboard source state mismatch')
+            api_server._last_dashboard = CapturedText(state['dashboard'], saved['origins'])
         api_server.last_script_results = state['script_results']
         customer_sim.usage_recorder.summary = state['usage']
         for name, value in state['event_logger'].items():

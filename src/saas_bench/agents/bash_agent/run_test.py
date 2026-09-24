@@ -91,6 +91,7 @@ class BashAgentRunner:
         run_kind: Optional[str] = None,
         pricing_file: Optional[Path] = None,
         sql_capture: Optional[bool] = None,
+        execution_capture: Optional[bool] = None,
     ):
         from saas_bench.model_usage import load_pricing
         self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
@@ -99,6 +100,10 @@ class BashAgentRunner:
             saved_manifest = json.loads((Path(continue_from) / 'manifest.json').read_text())
             saved = saved_manifest['configuration']
             saved_capture = bool(saved_manifest.get('sql_evidence'))
+            saved_execution = (saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution'
+            if execution_capture is not None and execution_capture != saved_execution:
+                raise ValueError('Resume execution capture configuration mismatch')
+            execution_capture = saved_execution
             if sql_capture is not None and sql_capture != saved_capture:
                 raise ValueError('Resume SQL capture configuration mismatch')
             sql_capture = saved_capture
@@ -122,6 +127,12 @@ class BashAgentRunner:
             seed, scenario, total_days, initial_cash, reasoning_effort = (
                 saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
             run_kind = saved['run_kind']
+        if execution_capture:
+            if sql_capture is False:
+                raise ValueError('Execution capture requires SQL capture')
+            sql_capture = True
+        self.execution_capture = bool(execution_capture)
+        self.evidence_store = None
         self.run_kind = run_kind or 'engineering'
         if self.run_kind not in ('engineering', 'pilot', 'formal'):
             raise ValueError('Invalid run kind')
@@ -174,6 +185,10 @@ class BashAgentRunner:
         self.sql_evidence_config = (saved_manifest.get('sql_evidence') if continue_from else
             dict(format=FORMAT, run_id=self.run_id, branch_id='prefix',
                  data_source_id=uuid.uuid4().hex) if sql_capture else None)
+
+        if self.sql_evidence_config and self.execution_capture and not continue_from:
+            from saas_bench.execution_capture import EXCLUSIONS
+            self.sql_evidence_config.update(capture_scope='execution', file_exclusions=EXCLUSIONS)
 
         # Logs directory
         self.logs_dir = self.workspace_dir / "logs"
@@ -345,6 +360,30 @@ class BashAgentRunner:
 
     def _http_get(self, path: str, timeout: float = 30) -> Dict:
         req = urllib.request.Request(self._server_url(path))
+        if path == '/dashboard' and self.evidence_store:
+            from saas_bench.execution_capture import ExecutionCapture, CapturedText, origin
+            capture = ExecutionCapture(self.evidence_store)
+            capture.begin('dashboard_acquisition', {'path': path})
+            if capture.event:
+                req.add_header('X-Capture-Context', capture.store.context(capture.event))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read()
+                capture.blob('received', raw, 'program_body')
+                result = json.loads(raw)
+                text = result.get('dashboard', '')
+                source = capture.store.load_state('dashboard') or {}
+                from saas_bench.sql_evidence import digest
+                if source.get('sha256') != digest(text.encode()):
+                    raise ValueError('Dashboard receipt differs from captured generation')
+                version = capture.blob('dashboard', text, 'dashboard', derived_from=source.get('version'))
+                if version:
+                    result['dashboard'] = CapturedText(text, [origin(version, text)] + source.get('origins', []))
+                capture.safe(capture.store.complete, capture.event)
+                return result
+            except Exception as exc:
+                capture.store.fail(exc)
+                raise
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read())
 
@@ -833,6 +872,9 @@ __pycache__/
             raise ValueError('Checkpoint configuration differs from run manifest')
         if self.sql_evidence_config:
             restore_sql_evidence(self.workspace_dir, directory, checkpoint, self.sql_evidence_config)
+            controls = directory / 'sql-evidence.controls.jsonl'
+            if controls.exists() and not (self.workspace_dir / controls.name).exists():
+                shutil.copy2(controls, self.workspace_dir / controls.name)
         staged = self.workspace_dir / ('restore-' + uuid.uuid4().hex)
         copy_workspace(directory / 'agent_workspace', staged)
         self._session_id = checkpoint['session_id']
@@ -873,6 +915,8 @@ __pycache__/
         write_json(self.workspace_dir / 'operation.json', {'id': uuid.uuid4().hex, 'kind': kind, 'day': day})
 
     def _check_capture_health(self):
+        if self.evidence_store:
+            self.evidence_store.assert_healthy()
         if self.sql_evidence_config:
             if ((self.workspace_dir / 'sql-evidence.fault.json').exists() or
                     self._http_get('/health').get('status') != 'ok'):
@@ -932,6 +976,10 @@ __pycache__/
         # ── Step 2: Launch server subprocess ──
         self._launch_server()
 
+        if self.execution_capture:
+            from saas_bench.sql_evidence import SQLEvidenceStore
+            self.evidence_store = SQLEvidenceStore(self.workspace_dir / 'sql-evidence.sqlite', self.sql_evidence_config)
+
         # ── Step 3: Create tool executor + agent ──
         # Pass NOVAMIND_API_PORT so the CLI (./novamind-operation) connects to
         # the already-running server instead of trying to start a new one.
@@ -939,6 +987,7 @@ __pycache__/
             workspace_path=self.agent_workspace,
             env={"NOVAMIND_API_PORT": str(self._server_port)},
             require_sandbox=self.run_kind == 'formal', stop_on_timeout=True,
+            evidence_store=self.evidence_store,
         )
 
         tool_descriptions = get_bash_agent_tool_descriptions()
@@ -955,7 +1004,7 @@ __pycache__/
             workspace_path=self.agent_workspace,
             total_days=self.total_days,
             anthropic_fallback_model=self.anthropic_fallback_model,
-            usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing),
+            usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing, self.evidence_store),
         )
 
         # Wire the per-session conversation snapshot path. The agent writes
@@ -1012,7 +1061,12 @@ __pycache__/
             write_json(self.workspace_dir / 'branch_stop.json', {'error': type(exc).__name__, 'reason': str(exc)})
             raise
         finally:
-            self._stop_server()
+            fault_path = self.workspace_dir / 'sql-evidence.fault.json'
+            preserve = bool(getattr(self.tool_executor, 'preserved_process', None))
+            if fault_path.exists():
+                preserve = preserve or json.loads(fault_path.read_text()).get('preserve_scene', False)
+            if not preserve:
+                self._stop_server()
 
     def _run(self, verbose=True):
         self.setup()
@@ -1400,6 +1454,7 @@ def main():
                              "distinguished without forking the run_id scheme.")
     parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
     parser.add_argument('--pricing-file', type=Path, help='JSON with source, basis, and exact-model USD/1k token rates')
+    parser.add_argument('--execution-capture', action=argparse.BooleanOptionalAction, default=None, help='Capture public receipts, files, Bash and model source occurrences')
     parser.add_argument('--sql-capture', action=argparse.BooleanOptionalAction, default=None,
                         help='Privately capture SQL responses; defaults off for new runs')
     args = parser.parse_args()
@@ -1418,7 +1473,7 @@ def main():
         label=args.label,
         run_kind=args.run_kind,
         pricing_file=args.pricing_file,
-        sql_capture=args.sql_capture,
+        sql_capture=args.sql_capture, execution_capture=args.execution_capture,
     )
 
     result = runner.run(verbose=not args.quiet)

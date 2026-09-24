@@ -122,7 +122,10 @@ class _Stream(httpx.SyncByteStream):
 
 
 class ModelUsage:
-    def __init__(self, path, role, pricing=None):
+    def __init__(self, path, role, pricing=None, evidence_store=None):
+        self.evidence_store = evidence_store
+        self.source_records = []
+        self.context_id = uuid.uuid4().hex if evidence_store else None
         self.path = Path(path) if path else None
         self.role = role
         self.pricing = pricing or {}
@@ -157,7 +160,19 @@ class ModelUsage:
             failure_recorded = False
             with recorder.lock:
                 recorder.summary['http_attempts'] += 1
-            body = request.read().decode('utf-8')
+            raw_body = request.read()
+            capture_event = None
+            capture_done = False
+            if recorder.evidence_store:
+                from .execution_capture import model_request
+                # Required evidence is durable before sending a model request.
+                try:
+                    capture_event = model_request(recorder.evidence_store, raw_body, recorder.source_records,
+                                                  call_id, attempt_id, recorder.context_id)
+                except Exception as exc:
+                    recorder.evidence_store.fail(exc)
+                    raise
+            body = raw_body.decode('utf-8')
             try:
                 body = json.loads(body)
             except ValueError:
@@ -171,7 +186,14 @@ class ModelUsage:
                 streaming = kwargs.get('stream', False)
                 response = send(request, *args, **dict(kwargs, stream=True))
                 def finish(content, error):
-                    nonlocal failure_recorded
+                    nonlocal failure_recorded, capture_done
+                    if capture_event and not capture_done:
+                        capture_done = True
+                        try:
+                            recorder.evidence_store.complete(capture_event, 'failed' if error or response.status_code >= 400 else 'succeeded',
+                                send_state='response_received', http_status=response.status_code, response_error=error)
+                        except Exception as exc:
+                            recorder.evidence_store.fail(exc)
                     try:
                         body = content.decode('utf-8')
                     except UnicodeDecodeError:
@@ -196,6 +218,11 @@ class ModelUsage:
                         response.read()
                 return response
             except BaseException as exc:
+                if capture_event and not capture_done:
+                    try:
+                        recorder.evidence_store.complete(capture_event, 'failed', send_state='unknown', error=type(exc).__name__)
+                    except Exception as capture_error:
+                        recorder.evidence_store.fail(capture_error)
                 if not failure_recorded:
                     with recorder.lock:
                         recorder.summary['failed_http_attempts'] += 1
@@ -208,6 +235,9 @@ class ModelUsage:
         return client
 
     def call(self, api, request, invoke, **context):
+        if self.evidence_store:
+            from .execution_capture import text_sources
+            self.source_records = text_sources(request)
         call_id = uuid.uuid4().hex
         started = datetime.now(timezone.utc)
         token = _CALL.set((self, call_id))

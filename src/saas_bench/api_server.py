@@ -164,6 +164,9 @@ def _get_helpful_query_error(error: Exception, sql: str) -> str:
     return str(error)
 
 
+from .execution_capture import public_handler
+
+
 class _APIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the NovaMind API server."""
 
@@ -171,6 +174,7 @@ class _APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    @public_handler
     def do_POST(self):
         try:
             if self.path == '/call':
@@ -194,6 +198,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_internal_error(exc, op=f"POST {self.path}")
 
+    @public_handler
     def do_GET(self):
         try:
             if self.path == '/vars':
@@ -213,6 +218,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_internal_error(exc, op=f"GET {self.path}")
 
+    @public_handler
     def do_DELETE(self):
         try:
             if self.path == '/daily-scripts':
@@ -262,9 +268,14 @@ class _APIHandler(BaseHTTPRequestHandler):
     def _read_body(self) -> Dict:
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length)
+        if getattr(self, '_control_capture', False):
+            self._control_request = body.hex()
         return json.loads(body) if body else {}
 
     def _send_json(self, data: Dict, status: int = 200):
+        if getattr(self, '_generic_capture', False):
+            from .execution_capture import text_sources
+            self._sql_execution['public_fields'] = text_sources(data)
         response = json.dumps(data, default=str).encode()
         self._capture_response(status, response)
         try:
@@ -286,16 +297,23 @@ class _APIHandler(BaseHTTPRequestHandler):
         if store is None or getattr(self, '_sql_capture_failed', False):
             return
         try:
+            if method == 'finish' and getattr(self, '_generic_capture', False):
+                from .execution_capture import finish_http
+                return finish_http(store, *args)
             return getattr(store, method)(*args)
         except Exception as exc:
             self._sql_capture_failed = True
             store.fail(exc)
 
     def _capture_response(self, status, response):
+        if getattr(self, '_control_capture', False):
+            self._control_record = dict(path=self.path, method=self.command, status=status, body_hex=response.hex(), request_hex=getattr(self, '_control_request', ''))
         if getattr(self, '_sql_event', None):
             self._sql_response = status, response
 
     def end_headers(self):
+        if hasattr(self, '_control_record'):
+            self._control_record['headers'] = (b''.join(self._headers_buffer) + b'\r\n').decode('latin-1')
         if getattr(self, '_sql_event', None) and getattr(self, '_sql_response', None):
             status, body = self._sql_response
             self._sql_response = None
@@ -305,6 +323,8 @@ class _APIHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def _capture_delivery(self, state):
+        if hasattr(self, '_control_record'):
+            self._control_record['send_state'] = state
         if getattr(self, '_sql_event', None):
             self._capture_sql('delivered', self._sql_event, state)
 
@@ -431,6 +451,9 @@ class _APIHandler(BaseHTTPRequestHandler):
 
     def _handle_query(self):
         api = self.server._api_server
+        if api.sql_evidence and api.sql_evidence.execution_capture:
+            self._query_response_started = False
+            return self._handle_query_request()
         with api._sql_lock:
             while api._sql_paused:
                 api._sql_lock.wait()
@@ -454,7 +477,8 @@ class _APIHandler(BaseHTTPRequestHandler):
         try:
             raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
             from .public_sql import PUBLIC_POLICY_VERSION
-            self._sql_event = self._capture_sql('begin', raw, PUBLIC_POLICY_VERSION)
+            if not (self.server._api_server.sql_evidence and self.server._api_server.sql_evidence.execution_capture):
+                self._sql_event = self._capture_sql('begin', raw, PUBLIC_POLICY_VERSION)
             body = json.loads(raw) if raw else {}
             if not isinstance(body, dict) or not isinstance(body.get('sql'), str) or not body['sql'].strip():
                 self._send_json({'success': False, 'error': 'sql must be a non-empty string'}, 400)
@@ -537,7 +561,7 @@ class _APIHandler(BaseHTTPRequestHandler):
             with server._lock:
                 scripts = server.get_daily_scripts()
                 scripts[name] = content
-                server.set_daily_scripts(scripts)
+                server.set_daily_scripts(scripts, registration=name)
             self._send_json({"success": True, "data": {"name": name, "registered": True}})
         except Exception as e:
             self._send_internal_error(e, op="daily-scripts:post")
@@ -584,6 +608,8 @@ class _APIHandler(BaseHTTPRequestHandler):
         if not dashboard and server.conn:
             day = server.tools.current_day
             dashboard = build_weekly_dashboard(server.conn, day)
+            from .execution_capture import dashboard_version
+            dashboard = dashboard_version(server, dashboard, day)
         self._send_json({
             "dashboard": dashboard or f"=== Day {server.tools.current_day} ===\n(No data)",
             "day": server.tools.current_day,
@@ -759,8 +785,25 @@ class NovaMindAPIServer:
             with self._sql_lock:
                 self._sql_paused = True
                 try:
+                    if self.sql_evidence and self.sql_evidence.execution_capture:
+                        self.sql_evidence.save_state('admission_paused', True)
                     if not self._sql_lock.wait_for(lambda: self._sql_active == 0, timeout=180):
                         raise TimeoutError('SQL capture did not finish before checkpoint')
+                    if self.sql_evidence is not None and self.sql_evidence.execution_capture:
+                        import time
+                        deadline = time.monotonic() + 180
+                        while True:
+                            self.sql_evidence.assert_healthy(quiescent=False)
+                            try:
+                                self.sql_evidence.assert_healthy()
+                                if self._sql_active == 0:
+                                    break
+                            except RuntimeError as exc:
+                                if not str(exc).startswith('Unconfirmed'):
+                                    raise
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError('Execution capture did not finish before checkpoint')
+                            self._sql_lock.wait(timeout=0.05)
                     # No query can hold the world lock while this checkpoint owns it.
                     with self._lock:
                         if self.sql_evidence is not None:
@@ -773,8 +816,12 @@ class NovaMindAPIServer:
                             raise RuntimeError('Harness checkpoint directory is not configured')
                         return self.checkpoint_callback()
                 finally:
-                    self._sql_paused = False
-                    self._sql_lock.notify_all()
+                    try:
+                        if self.sql_evidence and self.sql_evidence.execution_capture:
+                            self.sql_evidence.save_state('admission_paused', False)
+                    finally:
+                        self._sql_paused = False
+                        self._sql_lock.notify_all()
         finally:
             self._advance_lock.release()
 
@@ -922,6 +969,8 @@ class NovaMindAPIServer:
             week = (new_day + 6) // 7
             dashboard = f"=== Week {week} Dashboard (Day {new_day}) ===\n(No dashboard data available)"
 
+        from .execution_capture import dashboard_version
+        dashboard = dashboard_version(self, dashboard, new_day)
         with self._lock:
             self._last_dashboard = dashboard
 
@@ -950,19 +999,42 @@ class NovaMindAPIServer:
         from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
         workspace = Path(self.script_workspace)
         executor = BashAgentToolExecutor(workspace, bash_timeout=300,
+            evidence_store=self.sql_evidence if self.sql_evidence and self.sql_evidence.execution_capture else None,
             require_sandbox=self.require_sandbox,
             env={'NOVAMIND_API_PORT': str(self.port), 'PYTHONHASHSEED': '0',
                  'PYTHONPATH': os.pathsep.join((str(workspace / 'docs'), str(workspace)))})
         results = {}
         self.last_script_results = []
         for name, code in self.get_daily_scripts().items():
-            output = executor.execute('bash', {'command': shlex.quote(sys.executable) + ' -c ' + shlex.quote(code)})
+            from .execution_capture import ExecutionCapture, CURRENT_EVENT
+            capture = ExecutionCapture(executor.evidence_store) if executor.evidence_store else None
+            token = None
+            if capture:
+                versions = capture.store.load_state('script_versions') or {}
+                capture.begin('registered_script_execution', {'name': name, 'registered_version': versions.get(name)})
+                capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
+                token = CURRENT_EVENT.set(capture.event)
+            try:
+                output = executor.execute('bash', {'command': shlex.quote(sys.executable) + ' -c ' + shlex.quote(code)})
+            except BaseException as exc:
+                if capture and capture.event:
+                    capture.safe(capture.store.complete, capture.event, 'result_unknown', error=type(exc).__name__)
+                raise
+            else:
+                if capture and capture.event:
+                    child = output.origins[0]['version_id'].rsplit(':', 1)[0] if getattr(output, 'origins', []) else None
+                    child_record = capture.safe(capture.store.read_event, child) if child else None
+                    status = child_record['result']['status'] if child_record else 'result_unknown'
+                    capture.safe(capture.store.complete, capture.event, status, child_event_id=child)
+            finally:
+                if token is not None:
+                    CURRENT_EVENT.reset(token)
             results[name] = output
             self.last_script_results.append(dict(name=name,
                 sha256=hashlib.sha256(code.encode()).hexdigest(), output=output))
         return results
 
-    def set_daily_scripts(self, scripts: Dict[str, str]):
+    def set_daily_scripts(self, scripts: Dict[str, str], registration=None):
         """Restore daily scripts from checkpoint."""
         with self._lock:
             import hashlib
@@ -981,4 +1053,10 @@ class NovaMindAPIServer:
                     self.conn.execute('ROLLBACK TO registered_scripts')
                     self.conn.execute('RELEASE registered_scripts')
                     raise
+            before = self._daily_scripts
             self._daily_scripts = dict(scripts)
+            from .execution_capture import registered_scripts
+            try:
+                registered_scripts(self, scripts, before, registration)
+            except Exception as exc:
+                self.sql_evidence.fail(exc)

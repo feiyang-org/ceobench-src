@@ -115,7 +115,8 @@ def test_go_cache_fields_and_sourced_time_bounded_prices(tmp_path):
             load_pricing(path)
 
 
-def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch):
+@pytest.mark.parametrize('capture', [False, True])
+def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch, capture):
     monkeypatch.setattr('time.sleep', lambda _: None)
     attempts = []
     class Interrupted(httpx.SyncByteStream):
@@ -129,7 +130,10 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
         if len(attempts) == 1:
             raise httpx.ConnectError('offline connection error')
         return httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=Interrupted())
-    recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent')
+    from saas_bench.sql_evidence import SQLEvidenceStore
+    from test_sql_evidence import identity, event_ids
+    store = SQLEvidenceStore(tmp_path / 'private.sqlite', identity(capture_scope='execution')) if capture else None
+    recorder = ModelUsage(tmp_path / 'agent.jsonl', 'agent', evidence_store=store)
     client = recorder.attach(Anthropic(api_key='test-secret', max_retries=1,
                                       http_client=httpx.Client(transport=httpx.MockTransport(handle))))
     request = dict(model='test-model', messages=[{'role': 'user', 'content': 'hello'}], max_tokens=30)
@@ -146,6 +150,12 @@ def test_connection_retry_and_interrupted_anthropic_stream(tmp_path, monkeypatch
     assert recorder.summary['errors'] == 1
     assert recorder.summary['known'] == dict.fromkeys(FIELDS)
     assert recorder.summary['missing'] == dict.fromkeys(FIELDS, 1)
+    if store:
+        store.assert_healthy()
+        events = [store.read_event(event) for event in event_ids(store)]
+        assert len(events) == 2
+        assert events[0]['result']['send_state'] == 'unknown'
+        assert events[1]['result']['response_error'] == 'ReadError'
     client.close()
 
 

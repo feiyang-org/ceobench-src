@@ -1,0 +1,315 @@
+{
+  "evidence_kind": "actually_executed_local_fixture",
+  "model_transport": "real SDK with MockTransport",
+  "external_provider_calls": 0,
+  "python": "3.14.7 (main, Aug 10 2026, 07:46:56) [GCC 16.1.1 20260728]",
+  "platform": "linux",
+  "timings_seconds": {
+    "sha256": 0.00043001642916351557,
+    "version_write_inclusive": 0.01317824685247615,
+    "boundary_scan_inclusive": 0.010600801964756101,
+    "client_callback_storage": 0.005806325003504753,
+    "captured_bash_total": 0.11986817099386826,
+    "client_callback_roundtrip": 0.00873600400518626,
+    "uncaptured_bash_total": 0.08071379002649337,
+    "model_request_mapping": 0.0016553500317968428
+  },
+  "timing_note": "inclusive phases overlap; no timeout values changed",
+  "events": [
+    {
+      "request": {
+        "author": "ceo",
+        "event_id": "test-run/prefix/1",
+        "kind": "bash",
+        "parent_event_id": null,
+        "query_id": null,
+        "request": {
+          "command": "python - <<'CODE'\nimport novamind_api\nimport json\nfrom pathlib import Path\nimport time\nfrom novamind_api import _capture\ncallback_times = []\nsubmit = _capture.submit\ndef measured(record):\n    started = time.perf_counter()\n    try:\n        return submit(record)\n    finally:\n        callback_times.append(time.perf_counter() - started)\n_capture.submit = measured\nfirst = novamind_api.query('SELECT amount FROM ledger')\nsecond = novamind_api.query('SELECT 99 AS hidden_print')\nPath('forecast.json').write_text(json.dumps(first))\nprint(first['rows'][0]['amount'])\nPath('callback-times.json').write_text(json.dumps(callback_times))\nCODE"
+        },
+        "requires_delivery": false,
+        "seq": 1,
+        "started_at": "2026-09-24T08:55:09.049905+00:00"
+      },
+      "inputs": [
+        "test-run/prefix/1:stderr_bytes",
+        "test-run/prefix/1:stdout_bytes"
+      ],
+      "outputs": [
+        "test-run/prefix/1:file_1_before",
+        "test-run/prefix/1:file_2_before",
+        "test-run/prefix/1:file_3_before",
+        "test-run/prefix/1:file_4_before",
+        "test-run/prefix/1:file_5_before",
+        "test-run/prefix/1:file_6_before",
+        "test-run/prefix/1:file_7_before",
+        "test-run/prefix/1:file_8_before",
+        "test-run/prefix/1:file_9_before",
+        "test-run/prefix/1:file_10_before",
+        "test-run/prefix/1:workspace_before",
+        "test-run/prefix/1:stdout_bytes",
+        "test-run/prefix/1:stderr_bytes",
+        "test-run/prefix/1:stdout",
+        "test-run/prefix/1:stderr",
+        "test-run/prefix/1:file_11_after",
+        "test-run/prefix/1:file_12_after",
+        "test-run/prefix/1:file_13_after",
+        "test-run/prefix/1:file_14_after",
+        "test-run/prefix/1:file_15_after",
+        "test-run/prefix/1:file_16_after",
+        "test-run/prefix/1:file_17_after",
+        "test-run/prefix/1:file_18_after",
+        "test-run/prefix/1:file_19_after",
+        "test-run/prefix/1:file_20_after",
+        "test-run/prefix/1:file_21_after",
+        "test-run/prefix/1:file_22_after",
+        "test-run/prefix/1:file_23_after",
+        "test-run/prefix/1:file_24_after",
+        "test-run/prefix/1:file_25_after",
+        "test-run/prefix/1:file_26_after",
+        "test-run/prefix/1:file_27_after",
+        "test-run/prefix/1:file_28_after",
+        "test-run/prefix/1:file_29_after",
+        "test-run/prefix/1:file_30_after",
+        "test-run/prefix/1:file_31_after",
+        "test-run/prefix/1:file_32_after",
+        "test-run/prefix/1:workspace_after",
+        "test-run/prefix/1:tool_return"
+      ],
+      "client_receipt": {
+        "receive_state": "unknown"
+      },
+      "result": {
+        "after_scan_seconds": 0.007392561004962772,
+        "before_scan_seconds": 0.003199295955710113,
+        "capture_gaps": [
+          "unobserved_internal_file_reads",
+          "unobserved_intermediate_file_versions",
+          "unobserved_pipe_streams",
+          "unobserved_program_data_dependencies"
+        ],
+        "capture_status": "complete",
+        "changed_paths": [
+          "callback-times.json",
+          "docs/novamind_api",
+          "docs/novamind_api/__pycache__",
+          "docs/novamind_api/__pycache__/__init__.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/_capture.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/_client.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/analytics.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/enterprise.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/infrastructure.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/market.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/marketing.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/pricing.cpython-314.pyc",
+          "docs/novamind_api/__pycache__/research.cpython-314.pyc",
+          "forecast.json"
+        ],
+        "completed_at": "2026-09-24T08:55:09.169442+00:00",
+        "exit_code": 0,
+        "pid": 1029910,
+        "process_boundary": {
+          "children": [],
+          "coverage": "subreaper",
+          "exit_code": 0,
+          "unknown": null
+        },
+        "process_started": true,
+        "status": "succeeded"
+      },
+      "query_definition": null,
+      "delivery": {
+        "send_state": "unknown",
+        "receive_state": "unknown"
+      }
+    },
+    {
+      "request": {
+        "author": "ceo",
+        "bound_parameters": null,
+        "candidate_sql": "SELECT amount FROM ledger",
+        "event_id": "test-run/prefix/2",
+        "kind": "sql_query",
+        "parent_event_id": "test-run/prefix/1",
+        "parent_reason": null,
+        "query_id": "cefe8e567e5058cf1b1c48dc6c536a079f84abf38b9915ef425db6bbeb630202",
+        "raw_request_hex": "7b2273716c223a202253454c45435420616d6f756e742046524f4d206c6564676572227d",
+        "seq": 2,
+        "started_at": "2026-09-24T08:55:09.128453+00:00"
+      },
+      "inputs": [
+        "test-run/prefix/2:public_response"
+      ],
+      "outputs": [
+        "test-run/prefix/2:public_response",
+        "test-run/prefix/2:comparison",
+        "test-run/prefix/2:client_state",
+        "test-run/prefix/2:client_body",
+        "test-run/prefix/2:client_parsed",
+        "test-run/prefix/2:client_transformations",
+        "test-run/prefix/2:client_returned",
+        "test-run/prefix/2:client_error",
+        "test-run/prefix/2:client_projection"
+      ],
+      "client_receipt": {
+        "receive_state": "received",
+        "time": "2026-09-24T08:55:09.135341+00:00"
+      },
+      "result": {
+        "attempted_sql": "SELECT amount FROM ledger",
+        "capture_gaps": [],
+        "capture_seconds": 0.0002334049786441028,
+        "capture_status": "complete",
+        "comparison": {
+          "scope": "complete_for_query",
+          "status": "available"
+        },
+        "completed_at": "2026-09-24T08:55:09.130706+00:00",
+        "day": 0,
+        "executed_sql": "SELECT amount FROM ledger",
+        "headers": "HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.14.7\r\nDate: Thu, 24 Sep 2026 08:55:09 GMT\r\nContent-Type: application/json\r\nContent-Length: 84\r\n\r\n",
+        "http_status": 200,
+        "lock_seconds": 0.00012652098666876554,
+        "losses": [],
+        "oracle": false,
+        "public_policy_version": "public-sql-v1",
+        "receive_state": "unknown",
+        "result_coverage": "complete_for_query",
+        "snapshot_bytes": 454656,
+        "snapshot_ref": "825b34116b134dd185a53ecc736c8496",
+        "snapshot_seconds": 0.000494822976179421,
+        "snapshot_status": "success",
+        "sql_seconds": 3.0381022952497005e-05,
+        "status": "succeeded",
+        "total_seconds": 0.0017949449829757214
+      },
+      "query_definition": [
+        "query-v1",
+        "test-run",
+        "prefix",
+        "world-1",
+        "public-sql-v1",
+        "SELECT amount FROM ledger",
+        null
+      ],
+      "delivery": {
+        "receive_state": "unknown",
+        "send_state": "sent",
+        "time": "2026-09-24T08:55:09.131171+00:00"
+      }
+    },
+    {
+      "request": {
+        "author": "ceo",
+        "bound_parameters": null,
+        "candidate_sql": "SELECT 99 AS hidden_print",
+        "event_id": "test-run/prefix/3",
+        "kind": "sql_query",
+        "parent_event_id": "test-run/prefix/1",
+        "parent_reason": null,
+        "query_id": "d31ad976fbea8a7bfb953a0046650afbf7d2d708997c8a3b1b1a37d705d0c144",
+        "raw_request_hex": "7b2273716c223a202253454c4543542039392041532068696464656e5f7072696e74227d",
+        "seq": 3,
+        "started_at": "2026-09-24T08:55:09.137016+00:00"
+      },
+      "inputs": [
+        "test-run/prefix/3:public_response"
+      ],
+      "outputs": [
+        "test-run/prefix/3:public_response",
+        "test-run/prefix/3:comparison",
+        "test-run/prefix/3:client_state",
+        "test-run/prefix/3:client_body",
+        "test-run/prefix/3:client_parsed",
+        "test-run/prefix/3:client_transformations",
+        "test-run/prefix/3:client_returned",
+        "test-run/prefix/3:client_error",
+        "test-run/prefix/3:client_projection"
+      ],
+      "client_receipt": {
+        "receive_state": "received",
+        "time": "2026-09-24T08:55:09.144780+00:00"
+      },
+      "result": {
+        "attempted_sql": "SELECT 99 AS hidden_print",
+        "capture_gaps": [],
+        "capture_seconds": 0.00022418104344978929,
+        "capture_status": "complete",
+        "comparison": {
+          "scope": "complete_for_query",
+          "status": "available"
+        },
+        "completed_at": "2026-09-24T08:55:09.140411+00:00",
+        "day": 0,
+        "executed_sql": "SELECT 99 AS hidden_print",
+        "headers": "HTTP/1.0 200 OK\r\nServer: BaseHTTP/0.6 Python/3.14.7\r\nDate: Thu, 24 Sep 2026 08:55:09 GMT\r\nContent-Type: application/json\r\nContent-Length: 94\r\n\r\n",
+        "http_status": 200,
+        "lock_seconds": 0.00018152903066948056,
+        "losses": [],
+        "oracle": false,
+        "public_policy_version": "public-sql-v1",
+        "receive_state": "unknown",
+        "result_coverage": "complete_for_query",
+        "snapshot_bytes": 454656,
+        "snapshot_ref": "692804afddb34095bca79f911fc1e434",
+        "snapshot_seconds": 0.00030439801048487425,
+        "snapshot_status": "success",
+        "sql_seconds": 2.4757988285273314e-05,
+        "status": "succeeded",
+        "total_seconds": 0.0027961499872617424
+      },
+      "query_definition": [
+        "query-v1",
+        "test-run",
+        "prefix",
+        "world-1",
+        "public-sql-v1",
+        "SELECT 99 AS hidden_print",
+        null
+      ],
+      "delivery": {
+        "receive_state": "unknown",
+        "send_state": "sent",
+        "time": "2026-09-24T08:55:09.140810+00:00"
+      }
+    },
+    {
+      "request": {
+        "author": "ceo",
+        "event_id": "test-run/prefix/4",
+        "kind": "model_request",
+        "parent_event_id": null,
+        "query_id": null,
+        "request": {
+          "attempt_id": "52dbdf9cc5fa42489d90539b9b0688c9",
+          "call_id": "9723dfcaa48f453a9d7210027fe02001",
+          "context_id": "0f27792940a54e5faa8472cede7f885e"
+        },
+        "requires_delivery": false,
+        "seq": 4,
+        "started_at": "2026-09-24T08:55:09.351823+00:00"
+      },
+      "inputs": [],
+      "outputs": [
+        "test-run/prefix/4:wire",
+        "test-run/prefix/4:occurrences"
+      ],
+      "client_receipt": {
+        "receive_state": "unknown"
+      },
+      "result": {
+        "capture_gaps": [],
+        "capture_status": "complete",
+        "completed_at": "2026-09-24T08:55:09.353307+00:00",
+        "http_status": 200,
+        "response_error": null,
+        "send_state": "response_received",
+        "status": "succeeded"
+      },
+      "query_definition": null,
+      "delivery": {
+        "send_state": "unknown",
+        "receive_state": "unknown"
+      }
+    }
+  ]
+}

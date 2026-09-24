@@ -60,13 +60,24 @@ def test_memory_keeps_original_limit(tmp_path):
     assert 'a' * 40000 in prompt and 'not included' not in prompt
 
 
+@pytest.mark.parametrize('capture', [False, True])
 @pytest.mark.parametrize('api', ['chat', 'responses', 'messages'])
-def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api):
+def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api, capture):
     import httpx
     from openai import OpenAI
     from anthropic import Anthropic
     from test_preflight_usage import reply
     captured = []
+    store = None
+    observation = 'contents A'
+    if capture:
+        from saas_bench.sql_evidence import SQLEvidenceStore
+        from saas_bench.model_usage import ModelUsage
+        from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+        from test_sql_evidence import identity, event_ids
+        store = SQLEvidenceStore(tmp_path.parent / (tmp_path.name + '.sqlite'), identity(capture_scope='execution'))
+        (tmp_path / 'contents.txt').write_text('contents A')
+        observation = BashAgentToolExecutor(tmp_path, evidence_store=store).execute('read_file', {'path': 'contents.txt'})
     def handle(request):
         captured.append(json.loads(request.content))
         body = reply(api)
@@ -92,11 +103,14 @@ def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api):
     def new_agent():
         value = BashAgent(get_bash_agent_tool_descriptions(), client, system_prompt='Original instructions', workspace_path=tmp_path,
                           reasoning_effort='low' if api == 'responses' else None)
+        if capture:
+            value.usage_recorder.evidence_store = store
+            value.usage_recorder.context_id = 'fixture-context'
         value._snapshot_path = tmp_path / 'context.json'
         return value
     first = new_agent()
     assert first.act('dashboard', 0, False, {'day': 7}).tool == 'read_file'
-    first.record_tool_result('contents A')
+    first.record_tool_result(observation)
     first._save_conversation_snapshot(strict=True)
     second = new_agent()
     assert second.load_conversation_snapshot(second._snapshot_path)
@@ -111,4 +125,13 @@ def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api):
     assert 'call1' not in json.dumps(captured[-1])
     assert first.usage_recorder.summary['http_attempts'] == 2
     assert second.usage_recorder.summary['http_attempts'] == 2
+    if capture:
+        store.assert_healthy()
+        model_events = [event for event in event_ids(store) if store.read_event(event)['request']['kind'] == 'model_request']
+        assert len(model_events) == len(captured) == 4
+        maps = [json.loads(store.get_content(event + ':occurrences')[1]) for event in model_events]
+        assert maps[1] and maps[1] == [dict(item, call_id=maps[1][0]['call_id'], attempt_id=maps[1][0]['attempt_id'], send_state_event_id=maps[1][0]['send_state_event_id']) for item in maps[2]]
+        assert all(item['version_id'] not in {x['version_id'] for x in maps[1]} for item in maps[-1])
+        assert maps[-1]  # Actual new-week MEMORY read.
+        assert 'version_id' not in first._snapshot_path.read_text()
     client.close()

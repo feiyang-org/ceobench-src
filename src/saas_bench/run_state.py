@@ -102,8 +102,9 @@ def checkpoint_directory(run, checkpoint):
     required = {'world.nmdb', 'session.json', 'server_state.json', 'manifest.json'}
     if not required.issubset(checkpoint['files']):
         raise ValueError('Incomplete checkpoint file list')
+    allowed = required | {'sql-evidence.controls.jsonl'}
     for name, checksum in checkpoint['files'].items():
-        if name not in required or file_hash(directory / name) != checksum:
+        if name not in allowed or file_hash(directory / name) != checksum:
             raise ValueError('Checkpoint checksum mismatch: ' + name)
     for name, checksum in checkpoint['request_logs'].items():
         if name not in ('agent_requests.jsonl', 'simulator_requests.jsonl') or file_hash(directory / 'request_logs' / name) != checksum:

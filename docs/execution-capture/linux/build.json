@@ -1,10 +1,10 @@
 {
   "version": 1,
-  "source_commit": "34c4f2be9cad18e8fb4a0af1f4a8570ff1c50f7a",
-  "patch_sha256": "7b18687bda6eece9e3794857e3b9f39d19358a78bf6b1679c298ce5073d2b236",
+  "source_commit": "3c1452b1a166e70881c9384b4a3302a905cf91f8",
+  "patch_sha256": "099437269ecc0412d9aec579de44df1ecebdde8c3097da73ab9486d224fc59cb",
   "source_sha256": "3c7004b66ca2e5bcb688bb8f4c2cdc4425529c76ba38582215420764996eb23e",
   "builder_sha256": "8f072eb11c2af12721376447859af4075db13107f0245519e555797346b07655",
-  "python": "3.13.15",
+  "python": "3.14.7",
   "runtime": {
     "openai": "2.15.0",
     "anthropic": "0.109.1",
@@ -12,13 +12,13 @@
     "numpy": "2.4.1",
     "pydantic": "2.12.5",
     "boto3": "1.42.41",
-    "botocore": "1.42.41",
+    "botocore": "1.42.97",
     "cryptography": "46.0.3",
-    "sqlcipher3": "0.6.2"
+    "sqlcipher3-binary": "0.6.0"
   },
   "artifacts": {
-    "bundle": "231627f15b0f40bd327d04a41449722008c0a66680cde284467663e69f6387e2",
+    "bundle": "8ae66d7408e0e34ba0d4d160078ae56382336a65b5047af774f143e6bd8e2c8d",
     "sdk": "20d1a1836833185704499818a82af99cf14fdbaa77cbeadf30826cfb8dd9f3aa",
-    "docs": "73255e79b8aaeed32866f32ae01c88447215c37bf805ba7a0018f8ea4ba62433"
+    "docs": "1128843ffbda0108366749e432c287ec9e9f3ec89082d2a1d223d95fa1e77222"
   }
 }
