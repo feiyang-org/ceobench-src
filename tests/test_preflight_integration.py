@@ -51,10 +51,10 @@ def offline_runner(tmp_path, monkeypatch, packed_public):
         return popen(args, *other, **kwargs)
     monkeypatch.setattr(subprocess, 'Popen', launch)
     runners = []
-    def create(restore=None):
+    def create(restore=None, **options):
         runner = BashAgentRunner(model='test-model', provider='deepseek', api_key='offline-only',
                                 total_days=42, workspace_base=tmp_path, continue_from=restore,
-                                run_kind=os.environ.get('CEOBENCH_TEST_KIND', 'engineering'))
+                                run_kind=os.environ.get('CEOBENCH_TEST_KIND', 'engineering'), **options)
         runners.append(runner)
         runner.setup()
         if restore:
@@ -279,3 +279,52 @@ def test_packed_public_sql_policy(offline_runner):
     result = advance(runner)
     assert result['success']
     assert 'row_count' in result['dashboard']
+
+
+def test_packed_sql_evidence_restore_and_fork(offline_runner, tmp_path):
+    from contextlib import closing
+    from saas_bench.sql_evidence import SQLEvidenceStore
+    from saas_bench.run_state import clone_sql_run
+    runner = offline_runner(sql_capture=True)
+    workspace = runner.agent_workspace
+    sql = 'SELECT count(*) AS n FROM ledger'
+    original = runner._http_post('/query', {'sql': sql})
+    env = dict(os.environ, NOVAMIND_API_PORT=str(runner._server_port), PYTHONPATH=str(workspace / 'docs'))
+    for command in ([sys.executable, str(workspace / 'novamind-operation'), 'query', sql],
+                    [sys.executable, '-c', 'import novamind_api as nm; print(nm.query(' + repr(sql) + '))']):
+        assert subprocess.run(command, cwd=workspace, env=env, capture_output=True, timeout=10).returncode == 0
+    runner._http_post('/daily-scripts', {'name': 'capture', 'content':
+        "import novamind_api as nm\nprint(nm.query('SELECT count(*) AS n FROM ledger'))"})
+    assert advance(runner)['success']
+    runner._save_checkpoint(7)
+    checkpoint = runner._load_checkpoint()
+    assert checkpoint['sql_evidence']['cutoff'] == 4
+    store = SQLEvidenceStore(runner.workspace_dir / 'sql-evidence.sqlite', runner.sql_evidence_config)
+    version = runner.run_id + '/prefix/1:public_response'
+    assert json.loads(store.get_content(version)[1]) == original
+    directory = checkpoint_directory(runner.workspace_dir, checkpoint)
+    assert not list((directory / 'agent_workspace').rglob('sql-evidence*'))
+    runner._stop_server()
+    restored = offline_runner(runner.workspace_dir)
+    restored._http_post('/query', {'sql': sql})
+    restored._save_checkpoint(7)
+    assert restored._load_checkpoint()['sql_evidence']['cutoff'] == 5
+    left = offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / 'capture-left', 'left'))
+    right = offline_runner(clone_sql_run(restored.workspace_dir, tmp_path / 'capture-right', 'right'))
+    for child in (left, right):
+        child._http_post('/query', {'sql': 'SELECT 42 AS x'})
+        child._save_checkpoint(7)
+        child_store = SQLEvidenceStore(child.workspace_dir / 'sql-evidence.sqlite', child.sql_evidence_config)
+        assert child_store.get_content(version)[1] == store.get_content(version)[1]
+        branch = child.sql_evidence_config['branch_id']
+        assert child_store.get_content(child.run_id + '/' + branch + '/1:public_response')[1]
+        other = 'right' if branch == 'left' else 'left'
+        with pytest.raises(KeyError):
+            child_store.get_content(child.run_id + '/' + other + '/1:public_response')
+    left._stop_server()
+    again = offline_runner(left.workspace_dir)
+    again._http_post('/query', {'sql': 'SELECT 43 AS x'})
+    again._save_checkpoint(7)
+    assert again._load_checkpoint()['sql_evidence']['cutoff'] == 2
+    with closing(store.connect()) as conn:
+        assert store.sequence(conn) == 5

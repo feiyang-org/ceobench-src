@@ -402,6 +402,14 @@ def cmd_start_server(args, base: Path):
         _log_history({"type": "next_week", "day": day, "timestamp": time.time()})
 
     # Create and start API server
+    sql_evidence = None
+    evidence_path = os.environ.get('CEOBENCH_SQL_EVIDENCE')
+    if evidence_path:
+        from saas_bench.sql_evidence import SQLEvidenceStore
+        identity = json.loads(Path(os.environ['CEOBENCH_RUN_MANIFEST']).read_text())['sql_evidence']
+        if Path(evidence_path).resolve().is_relative_to(base.resolve()):
+            raise ValueError('SQL evidence must be outside the agent workspace')
+        sql_evidence = SQLEvidenceStore(evidence_path, identity)
     api_server = NovaMindAPIServer(
         tools=tools,
         simulator=simulator,
@@ -411,6 +419,7 @@ def cmd_start_server(args, base: Path):
         event_logger=event_logger,
         script_workspace=base,
         require_sandbox=os.environ.get('CEOBENCH_RUN_KIND') == 'formal',
+        sql_evidence=sql_evidence,
     )
     from saas_bench.run_state import file_hash, write_json
     checkpoint_root = os.environ.get('CEOBENCH_CHECKPOINT_ROOT')
@@ -439,9 +448,12 @@ def cmd_start_server(args, base: Path):
                 'usage': customer_sim.usage_recorder.summary,
                 'event_logger': {name: getattr(event_logger, name) for name in
                                  ('current_day', '_event_count', '_total_llm_cost', '_missing_llm_cost')}})
-            return {'success': True, 'snapshot_id': snapshot_id, 'day': simulator.current_day,
+            receipt = {'success': True, 'snapshot_id': snapshot_id, 'day': simulator.current_day,
                     'files': {name: file_hash(target / name) for name in
                               ('world.nmdb', 'session.json', 'server_state.json')}}
+            if sql_evidence:
+                receipt['sql_evidence'] = sql_evidence.snapshot(target / 'sql-evidence.sqlite')
+            return receipt
 
         api_server.checkpoint_callback = _checkpoint
     restored_state = os.environ.get('CEOBENCH_RESTORE_SERVER_STATE')

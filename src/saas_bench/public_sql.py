@@ -69,11 +69,12 @@ def install_authorizer(conn, *, oracle=False):
 
 
 @contextmanager
-def query_snapshot(server, deadline):
+def query_snapshot(server, deadline, metadata=None):
     """Copy the live world under its lock; never query the asynchronous disk save."""
     started = time.monotonic()
-    metadata = {'snapshot_ref': uuid.uuid4().hex, 'public_policy_version': PUBLIC_POLICY_VERSION,
-                'oracle': server.oracle_mode, 'status': 'failed'}
+    metadata = metadata if metadata is not None else {}
+    metadata.update(snapshot_ref=uuid.uuid4().hex, public_policy_version=PUBLIC_POLICY_VERSION,
+                    oracle=server.oracle_mode, snapshot_status='failed')
     # ponytail: one full backup per query; add revision-based reuse only if measured cost warrants it.
     with tempfile.TemporaryDirectory(prefix='novamind-query-') as directory:
         path = Path(directory).resolve() / 'snapshot.db'
@@ -124,7 +125,7 @@ def query_snapshot(server, deadline):
                 before = time.monotonic()
                 try:
                     yield conn, metadata
-                    metadata['status'] = 'success'
+                    metadata['snapshot_status'] = 'success'
                 except sqlite3.Error as exc:
                     if denied:
                         raise QueryDenied('Query is not allowed by the read-only SQL policy. Read docs/tables/ for public columns.') from exc
@@ -142,13 +143,19 @@ def query_snapshot(server, deadline):
                 pass  # A closed diagnostic stream must not override the query result.
 
 
-def execute_query(server, sql):
+def execute_query(server, sql, *, metadata=None):
+    metadata = metadata if metadata is not None else {}
+    metadata['executed_sql'] = None
     deadline = time.monotonic() + server.QUERY_TIMEOUT_SECONDS
     try:
-        with query_snapshot(server, deadline) as (conn, _):
+        with query_snapshot(server, deadline, metadata) as (conn, _):
+            metadata['attempted_sql'] = sql
             cursor = conn.execute(sql)
+            metadata['executed_sql'] = sql
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
             raw = cursor.fetchmany(ROW_LIMIT + 1)
+            metadata['losses'] = ['blob_coercion'] if any(
+                isinstance(value, bytes) for row in raw[:ROW_LIMIT] for value in row) else []
             check_deadline(deadline)
             result = {'success': True, 'columns': columns,
                       'rows': [dict(row) for row in raw[:ROW_LIMIT]],

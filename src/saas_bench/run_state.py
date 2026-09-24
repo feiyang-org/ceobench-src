@@ -110,4 +110,65 @@ def checkpoint_directory(run, checkpoint):
             raise ValueError('Checkpoint request log checksum mismatch: ' + name)
     if tree_hash(directory / 'agent_workspace') != checkpoint['workspace_sha256']:
         raise ValueError('Checkpoint workspace checksum mismatch')
+    evidence = checkpoint.get('sql_evidence')
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    if bool(evidence) != bool(manifest.get('sql_evidence')):
+        raise ValueError('Checkpoint SQL evidence is missing or unexpected')
+    if evidence and (evidence['identity'] != manifest['sql_evidence'] or
+                     file_hash(directory / 'sql-evidence.sqlite') != evidence['sha256']):
+        raise ValueError('Checkpoint SQL evidence checksum or identity mismatch')
     return directory
+
+
+def restore_sql_evidence(run, directory, checkpoint, identity):
+    from contextlib import closing
+    from .sql_evidence import SQLEvidenceStore
+    evidence = checkpoint.get('sql_evidence')
+    if not evidence:
+        raise ValueError('Capture cannot resume from a checkpoint without evidence')
+    path = Path(run) / 'sql-evidence.sqlite'
+    if path.exists():
+        store = SQLEvidenceStore(path, identity)
+        store.assert_healthy()
+        with closing(store.connect()) as conn:
+            # Never roll back a live ledger and reuse an already allocated sequence.
+            if identity != evidence['identity'] or store.sequence(conn) != evidence['cutoff']:
+                raise ValueError('SQL evidence has uncheckpointed events; preserve it for reconciliation')
+    else:
+        if identity != evidence['identity']:
+            if (identity.get('parent_branch') != evidence['identity']['branch_id'] or
+                    identity.get('fork_seq') != evidence['cutoff'] or
+                    identity['run_id'] != evidence['identity']['run_id'] or
+                    identity['data_source_id'] != evidence['identity']['data_source_id']):
+                raise ValueError('Invalid SQL evidence fork identity')
+        shutil.copy2(Path(directory) / 'sql-evidence.sqlite', path)
+        store = SQLEvidenceStore(path, identity)
+        store.assert_healthy()
+
+
+def clone_sql_run(source, destination, branch_id):
+    """Clone a frozen SQL-capture checkpoint, assigning an explicit new branch."""
+    import re
+    source, destination = Path(source), Path(destination)
+    checkpoint = json.loads((source / 'checkpoint.json').read_text())
+    directory = checkpoint_directory(source, checkpoint)
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', branch_id):
+        raise ValueError('Invalid evidence branch ID')
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    parent = manifest['sql_evidence']
+    from contextlib import closing
+    import sqlite3
+    with closing(sqlite3.connect(f'file:{directory / "sql-evidence.sqlite"}?mode=ro', uri=True)) as conn:
+        if conn.execute('SELECT 1 FROM branches WHERE id=?', (branch_id,)).fetchone():
+            raise ValueError('Clone branch ID already exists')
+    destination.mkdir(parents=True, exist_ok=False)
+    target = destination / 'checkpoints' / checkpoint['snapshot_id']
+    target.parent.mkdir()
+    shutil.copytree(directory, target)
+    shutil.copy2(source / 'config.json', destination / 'config.json')
+    manifest['sql_evidence'] = dict(parent, branch_id=branch_id, parent_branch=parent['branch_id'],
+                                    fork_seq=checkpoint['sql_evidence']['cutoff'],
+                                    source_manifest_sha256=file_hash(directory / 'manifest.json'))
+    write_json(destination / 'manifest.json', manifest)
+    write_json(destination / 'checkpoint.json', checkpoint)
+    return destination

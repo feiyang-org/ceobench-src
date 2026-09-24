@@ -90,6 +90,7 @@ class BashAgentRunner:
         label: Optional[str] = None,
         run_kind: Optional[str] = None,
         pricing_file: Optional[Path] = None,
+        sql_capture: Optional[bool] = None,
     ):
         from saas_bench.model_usage import load_pricing
         self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
@@ -97,6 +98,10 @@ class BashAgentRunner:
         if continue_from:
             saved_manifest = json.loads((Path(continue_from) / 'manifest.json').read_text())
             saved = saved_manifest['configuration']
+            saved_capture = bool(saved_manifest.get('sql_evidence'))
+            if sql_capture is not None and sql_capture != saved_capture:
+                raise ValueError('Resume SQL capture configuration mismatch')
+            sql_capture = saved_capture
             if pricing_file and self.pricing_registration != saved_manifest.get('pricing'):
                 raise ValueError('Resume pricing configuration mismatch')
             self.pricing_registration = saved_manifest.get('pricing')
@@ -165,6 +170,10 @@ class BashAgentRunner:
 
         # Agent working directory (inside the run directory)
         self.agent_workspace = self.workspace_dir / "agent_workspace"
+        from saas_bench.sql_evidence import FORMAT
+        self.sql_evidence_config = (saved_manifest.get('sql_evidence') if continue_from else
+            dict(format=FORMAT, run_id=self.run_id, branch_id='prefix',
+                 data_source_id=uuid.uuid4().hex) if sql_capture else None)
 
         # Logs directory
         self.logs_dir = self.workspace_dir / "logs"
@@ -602,6 +611,10 @@ __pycache__/
         env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
         env['CEOBENCH_SIMULATOR_USAGE_LOG'] = str(self.logs_dir / 'simulator_requests.jsonl')
         env['CEOBENCH_MODEL_SESSION'] = str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.workspace_dir))) + ':simulator'
+        if self.sql_evidence_config:
+            env['CEOBENCH_SQL_EVIDENCE'] = str(self.workspace_dir / 'sql-evidence.sqlite')
+        else:
+            env.pop('CEOBENCH_SQL_EVIDENCE', None)
         if getattr(self, '_restored_snapshot_dir', None):
             env['CEOBENCH_RESTORE_SERVER_STATE'] = str(self._restored_snapshot_dir / 'server_state.json')
         # Use the selected account for both roles unless explicitly overridden.
@@ -633,6 +646,8 @@ __pycache__/
         manifest = dict(version=1, build=build, configuration=configuration,
                         benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
+        if self.sql_evidence_config:
+            manifest['sql_evidence'] = self.sql_evidence_config
         if self.pricing_registration:
             manifest['pricing'] = self.pricing_registration
         manifest = json.loads(json.dumps(manifest))
@@ -782,6 +797,13 @@ __pycache__/
                           session_id=self._session_id, snapshot_id=snapshot_id,
                           files=receipt['files'], request_logs=request_logs,
                           workspace_sha256=tree_hash(directory / 'agent_workspace'))
+        if self.sql_evidence_config:
+            evidence = receipt.get('sql_evidence')
+            if not evidence or evidence['identity'] != self.sql_evidence_config:
+                raise ValueError('Missing or mismatched SQL evidence checkpoint')
+            if file_hash(directory / 'sql-evidence.sqlite') != evidence['sha256']:
+                raise ValueError('SQL evidence checkpoint checksum mismatch')
+            checkpoint['sql_evidence'] = evidence
         checkpoint['context_boundary'] = 'same_week' if self.agent and self.agent.current_day == day else 'new_week'
         progress = self.workspace_dir / 'operation.json'
         checkpoint['operation_id'] = json.loads(progress.read_text())['id'] if progress.exists() else None
@@ -796,10 +818,21 @@ __pycache__/
             'simulator': json.loads((directory / 'server_state.json').read_text())['usage']})
 
     def _restore_checkpoint_files(self, checkpoint):
-        from saas_bench.run_state import checkpoint_directory, copy_workspace
+        from saas_bench.run_state import checkpoint_directory, copy_workspace, restore_sql_evidence
         directory = checkpoint_directory(self.workspace_dir, checkpoint)
-        if json.loads((directory / 'manifest.json').read_text()) != json.loads((self.workspace_dir / 'manifest.json').read_text()):
+        saved_manifest = json.loads((directory / 'manifest.json').read_text())
+        current_manifest = json.loads((self.workspace_dir / 'manifest.json').read_text())
+        expected_manifest = dict(current_manifest)
+        if (self.sql_evidence_config != saved_manifest.get('sql_evidence') and
+                self.sql_evidence_config and self.sql_evidence_config.get('source_manifest_sha256')):
+            from saas_bench.run_state import file_hash
+            if file_hash(directory / 'manifest.json') != self.sql_evidence_config['source_manifest_sha256']:
+                raise ValueError('Clone source manifest mismatch')
+            expected_manifest['sql_evidence'] = saved_manifest['sql_evidence']
+        if saved_manifest != expected_manifest:
             raise ValueError('Checkpoint configuration differs from run manifest')
+        if self.sql_evidence_config:
+            restore_sql_evidence(self.workspace_dir, directory, checkpoint, self.sql_evidence_config)
         staged = self.workspace_dir / ('restore-' + uuid.uuid4().hex)
         copy_workspace(directory / 'agent_workspace', staged)
         self._session_id = checkpoint['session_id']
@@ -836,7 +869,14 @@ __pycache__/
 
     def _begin_operation(self, kind, day):
         from saas_bench.run_state import write_json
+        self._check_capture_health()
         write_json(self.workspace_dir / 'operation.json', {'id': uuid.uuid4().hex, 'kind': kind, 'day': day})
+
+    def _check_capture_health(self):
+        if self.sql_evidence_config:
+            if ((self.workspace_dir / 'sql-evidence.fault.json').exists() or
+                    self._http_get('/health').get('status') != 'ok'):
+                raise RuntimeError('SQL evidence capture failed; collection stopped')
 
     def _restore_from_checkpoint(self, checkpoint: Dict):
         """Restore agent accounting after the server has loaded the saved world."""
@@ -1135,6 +1175,7 @@ __pycache__/
                     action.tool, action.arguments or {},
                     observation  # Full result in JSONL (tool already caps at 50K)
                 )
+                self._check_capture_health()
 
                 if verbose:
                     print(f"      → {observation[:200]}")
@@ -1359,6 +1400,8 @@ def main():
                              "distinguished without forking the run_id scheme.")
     parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
     parser.add_argument('--pricing-file', type=Path, help='JSON with source, basis, and exact-model USD/1k token rates')
+    parser.add_argument('--sql-capture', action=argparse.BooleanOptionalAction, default=None,
+                        help='Privately capture SQL responses; defaults off for new runs')
     args = parser.parse_args()
 
     runner = BashAgentRunner(
@@ -1375,6 +1418,7 @@ def main():
         label=args.label,
         run_kind=args.run_kind,
         pricing_file=args.pricing_file,
+        sql_capture=args.sql_capture,
     )
 
     result = runner.run(verbose=not args.quiet)

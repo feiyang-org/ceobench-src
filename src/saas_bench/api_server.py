@@ -199,7 +199,9 @@ class _APIHandler(BaseHTTPRequestHandler):
             if self.path == '/vars':
                 self._handle_vars()
             elif self.path == '/health':
-                self._send_json({"status": "ok"})
+                evidence = self.server._api_server.sql_evidence
+                self._send_json({"status": "capture_failed" if evidence and
+                                 (evidence.fault or evidence.fault_path.exists()) else "ok"})
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_get()
             elif self.path == '/dashboard':
@@ -264,11 +266,47 @@ class _APIHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, data: Dict, status: int = 200):
         response = json.dumps(data, default=str).encode()
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
+        self._capture_response(status, response)
+        try:
+            if self.path == '/query':
+                self._query_response_started = True
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+        except OSError:
+            self._capture_delivery('failed')
+            raise
+        else:
+            self._capture_delivery('sent')
+
+    def _capture_sql(self, method, *args):
+        store = self.server._api_server.sql_evidence
+        if store is None or getattr(self, '_sql_capture_failed', False):
+            return
+        try:
+            return getattr(store, method)(*args)
+        except Exception as exc:
+            self._sql_capture_failed = True
+            store.fail(exc)
+
+    def _capture_response(self, status, response):
+        if getattr(self, '_sql_event', None):
+            self._sql_response = status, response
+
+    def end_headers(self):
+        if getattr(self, '_sql_event', None) and getattr(self, '_sql_response', None):
+            status, body = self._sql_response
+            self._sql_response = None
+            # Includes BaseHTTPRequestHandler's actual Server/Date/status line too.
+            headers = (b''.join(self._headers_buffer) + b'\r\n').decode('latin-1')
+            self._capture_sql('finish', self._sql_event, status, headers, body, self._sql_execution)
+        super().end_headers()
+
+    def _capture_delivery(self, state):
+        if getattr(self, '_sql_event', None):
+            self._capture_sql('delivered', self._sql_event, state)
 
     def _handle_call(self):
         """Handle a tool call: POST /call {"tool": "...", "args": {...}}."""
@@ -392,15 +430,37 @@ class _APIHandler(BaseHTTPRequestHandler):
             self._send_internal_error(e, op="next-week")
 
     def _handle_query(self):
+        api = self.server._api_server
+        with api._sql_lock:
+            while api._sql_paused:
+                api._sql_lock.wait()
+            api._sql_active += 1
+        try:
+            self._query_response_started = False
+            self._sql_event = None
+            self._sql_response = None
+            self._sql_capture_failed = False
+            self._sql_execution = {}
+            self._handle_query_request()
+        finally:
+            self._sql_event = None
+            with api._sql_lock:
+                api._sql_active -= 1
+                api._sql_lock.notify_all()
+
+    def _handle_query_request(self):
         """Execute SQL on a separately authorized, read-only world snapshot."""
         sql = ''
         try:
-            body = self._read_body()
+            raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            from .public_sql import PUBLIC_POLICY_VERSION
+            self._sql_event = self._capture_sql('begin', raw, PUBLIC_POLICY_VERSION)
+            body = json.loads(raw) if raw else {}
             if not isinstance(body, dict) or not isinstance(body.get('sql'), str) or not body['sql'].strip():
                 self._send_json({'success': False, 'error': 'sql must be a non-empty string'}, 400)
                 return
             sql = body['sql']
-            response = execute_query(self.server._api_server, sql)
+            response = execute_query(self.server._api_server, sql, metadata=self._sql_execution)
             enum_hint = _get_enum_hint_for_query(sql, response['rows'])
             if enum_hint:
                 response['hint'] = enum_hint
@@ -412,13 +472,15 @@ class _APIHandler(BaseHTTPRequestHandler):
         except SnapshotUnavailable as exc:
             self._send_json({'success': False, 'error': str(exc)}, 503)
         except TimeoutError:
-            self._send_json({'success': False, 'error': 'Query exceeded its time limit. Narrow the query or try again when the world is idle.'}, 504)
+            if not self._query_response_started:
+                self._send_json({'success': False, 'error': 'Query exceeded its time limit. Narrow the query or try again when the world is idle.'}, 504)
         except sqlite3.Error as exc:
             self._send_json({'success': False, 'error': _get_helpful_query_error(exc, sql)}, 500)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
-            self._send_internal_error(exc, op='query')
+            if not self._query_response_started:
+                self._send_internal_error(exc, op='query')
 
     def _send_query_json(self, data):
         """Bound serialization and socket writes separately from SQL execution."""
@@ -432,17 +494,27 @@ class _APIHandler(BaseHTTPRequestHandler):
             chunks.append(chunk.encode())
         response = b''.join(chunks)
         check_deadline(deadline)
+        capture_started = time.monotonic()
+        self._capture_response(200, response)
+        # Capture has its own accounting, never spend SQL/response execution budgets on it.
+        deadline += time.monotonic() - capture_started
         serialized = time.monotonic()
         self.connection.settimeout(max(0.001, deadline - serialized))
         try:
+            self._query_response_started = True
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(response)))
             self.end_headers()
             self.wfile.write(response)
+            self._capture_delivery('sent')
         except TimeoutError:
             # Headers have already been sent; never append a second HTTP response.
             self.close_connection = True
+            self._capture_delivery('failed')
+        except OSError:
+            self._capture_delivery('failed')
+            raise
         finally:
             try:
                 print('[public_sql_response] ' + json.dumps({
@@ -594,7 +666,7 @@ class NovaMindAPIServer:
     def __init__(self, tools: AgentTools, simulator=None, conn=None,
                  day_callback=None, dashboard_callback=None,
                  shock_manager=None, event_logger=None, script_workspace=None,
-                 require_sandbox=False):
+                 require_sandbox=False, sql_evidence=None):
         """Initialize the API server.
 
         Args:
@@ -607,6 +679,14 @@ class NovaMindAPIServer:
             event_logger: Optional EventLogger for logging events
         """
         self.oracle_mode = _ORACLE_MODE
+        self.sql_evidence = sql_evidence
+        if sql_evidence is not None:
+            if self.oracle_mode:
+                raise ValueError('Oracle cannot write public SQL evidence')
+            from pathlib import Path
+            if sql_evidence.path.is_relative_to(Path(script_workspace or tools.workspace_path).resolve()):
+                raise ValueError('SQL evidence must be outside the agent workspace')
+            sql_evidence.assert_healthy()
         if self.oracle_mode and (require_sandbox or os.environ.get('CEOBENCH_RUN_KIND') == 'formal'):
             raise ValueError('Formal runs cannot enable oracle mode')
         self.tools = tools
@@ -620,6 +700,9 @@ class NovaMindAPIServer:
         self._thread: Optional[threading.Thread] = None
         self.port: int = 0
         self._lock = threading.RLock()
+        self._sql_lock = threading.Condition()
+        self._sql_active = 0
+        self._sql_paused = False
         self._advance_lock = threading.Lock()
         self._operation_failed = False
         self.checkpoint_callback = None
@@ -673,14 +756,25 @@ class NovaMindAPIServer:
         if not self._advance_lock.acquire(blocking=False):
             raise RuntimeError('Cannot checkpoint an in-flight week')
         try:
-            with self._lock:
-                if self._operation_failed or self._step_day_timed_out:
-                    raise RuntimeError('Operation outcome unknown; checkpoint refused')
-                if expected_day != self.tools.current_day:
-                    raise ValueError('Checkpoint day mismatch')
-                if self.checkpoint_callback is None:
-                    raise RuntimeError('Harness checkpoint directory is not configured')
-                return self.checkpoint_callback()
+            with self._sql_lock:
+                self._sql_paused = True
+                try:
+                    if not self._sql_lock.wait_for(lambda: self._sql_active == 0, timeout=180):
+                        raise TimeoutError('SQL capture did not finish before checkpoint')
+                    # No query can hold the world lock while this checkpoint owns it.
+                    with self._lock:
+                        if self.sql_evidence is not None:
+                            self.sql_evidence.assert_healthy()
+                        if self._operation_failed or self._step_day_timed_out:
+                            raise RuntimeError('Operation outcome unknown; checkpoint refused')
+                        if expected_day != self.tools.current_day:
+                            raise ValueError('Checkpoint day mismatch')
+                        if self.checkpoint_callback is None:
+                            raise RuntimeError('Harness checkpoint directory is not configured')
+                        return self.checkpoint_callback()
+                finally:
+                    self._sql_paused = False
+                    self._sql_lock.notify_all()
         finally:
             self._advance_lock.release()
 

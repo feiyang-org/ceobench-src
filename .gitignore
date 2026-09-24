@@ -128,6 +128,7 @@ tests/*
 !tests/test_ceobench_rnd_projects.py
 !tests/test_ceobench_segment_discovery.py
 !tests/test_public_sql.py
+!tests/test_sql_evidence.py
 !tests/test_preflight_*.py
 !tests/preflight_*.py
 tools/

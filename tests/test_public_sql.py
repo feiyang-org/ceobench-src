@@ -298,7 +298,8 @@ def test_send_timeout_does_not_send_a_second_response(monkeypatch):
         server=SimpleNamespace(_api_server=SimpleNamespace(QUERY_RESPONSE_TIMEOUT_SECONDS=30)),
         connection=SimpleNamespace(settimeout=lambda _: None),
         send_response=statuses.append, send_header=lambda *_: None,
-        end_headers=lambda: None, wfile=SimpleNamespace(write=timeout), close_connection=False)
+        end_headers=lambda: None, wfile=SimpleNamespace(write=timeout), close_connection=False,
+        _capture_response=lambda *_: None, _capture_delivery=lambda *_: None)
     _APIHandler._send_query_json(handler, {'success':True})
     assert statuses == [200] and handler.close_connection
     # A closed log pipe must not turn a completed response into a second HTTP error.

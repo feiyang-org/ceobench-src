@@ -45,6 +45,7 @@ _ENGINE_MODULES = [
     "_sql_chunk",
     "api_server",
     "public_sql",
+    "sql_evidence",
     "config",
     "customer_llm",
     "database",
