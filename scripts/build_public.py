@@ -44,6 +44,7 @@ _ENGINE_MODULES = [
     "_embedded_key",
     "_sql_chunk",
     "api_server",
+    "public_sql",
     "config",
     "customer_llm",
     "database",

@@ -245,3 +245,37 @@ def test_harness_timeout_stops_branch_without_publishing_unknown_state(offline_r
     assert 'unknown' in json.loads((runner.workspace_dir / 'branch_stop.json').read_text())['reason']
     with pytest.raises(ValueError, match='unknown'):
         runner._load_checkpoint()
+
+
+def test_packed_public_sql_policy(offline_runner):
+    """Exercise the rebuilt engine through HTTP, shipped SDK, CLI and weekly scripts."""
+    runner = offline_runner()
+    workspace = runner.agent_workspace
+    positive = runner._http_post('/query', {'sql': 'SELECT * FROM subscriptions LIMIT 1'})
+    assert positive['success'] and 'first_billing_done' not in positive['columns']
+    import urllib.error
+    attacks = [
+        'WITH c AS (SELECT 1) UPDATE ledger SET amount=99',
+        'SELECT * FROM group_insight_snapshots',
+        'SELECT actual_completion_day AS done_on FROM research_projects',
+    ]
+    env = dict(os.environ, NOVAMIND_API_PORT=str(runner._server_port), PYTHONPATH=str(workspace / 'docs'))
+    for sql in ['SELECT count(*) AS n FROM ledger', *attacks]:
+        good = sql not in attacks
+        try:
+            response = runner._http_post('/query', {'sql': sql})
+            assert good and response['success']
+        except urllib.error.HTTPError:
+            assert not good
+        cli = subprocess.run([sys.executable, str(workspace / 'novamind-operation'),
+                              'query', sql],
+                             cwd=workspace, env=env, text=True, capture_output=True, timeout=10)
+        assert (cli.returncode == 0) == good, cli.stdout + cli.stderr
+        sdk = subprocess.run([sys.executable, '-c', 'import novamind_api as nm; print(nm.query(' + repr(sql) + '))'],
+                             cwd=workspace, env=env, text=True, capture_output=True, timeout=10)
+        assert (sdk.returncode == 0) == good, sdk.stdout + sdk.stderr
+    assert runner._http_post('/daily-scripts', {'name': 'sql-policy', 'content':
+        "import novamind_api as nm\nprint(nm.query('SELECT count(*) AS n FROM ledger'))"})['success']
+    result = advance(runner)
+    assert result['success']
+    assert 'row_count' in result['dashboard']

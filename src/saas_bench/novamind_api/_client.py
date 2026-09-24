@@ -157,7 +157,7 @@ def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict
 def query(sql: str) -> Dict[str, Any]:
     """Execute a read-only SQL query against the simulator database.
 
-    Hidden columns and internal tables are automatically filtered.
+    SELECT * expands only public columns. Internal tables and columns are denied.
     Write queries are blocked — use the novamind_api functions instead.
 
     Args:
