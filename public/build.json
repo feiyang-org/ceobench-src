@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "source_commit": "9c9b2517689fb05c7ed306baa6689dc913337c9a",
-  "patch_sha256": "370471927860d7c664912be38e6d3dbf2c6c97506482bc824b190373b37a6c63",
-  "source_sha256": "0ebab9306441e31eb80e97e2cf2bb4ae996b6dd5d35f56f115e5d3bffda79fa9",
+  "source_commit": "0f172c6391fd0bb7376c64cfbca42acd7e4d1f94",
+  "patch_sha256": "ab6c46f55dbc26552fa836382a9b826049d31bab107d2312a77725b2af80da28",
+  "source_sha256": "55aaebcf419937504db0b1257cb06f4a3d51da1f709336b10449f6a1d7011f50",
   "builder_sha256": "8f072eb11c2af12721376447859af4075db13107f0245519e555797346b07655",
   "python": "3.13.15",
   "runtime": {
@@ -17,7 +17,7 @@
     "sqlcipher3-binary": "0.6.0"
   },
   "artifacts": {
-    "bundle": "9e06bc06ca720dee34166f8a6c2738733b416237e9286f3a957c50aedd4d6e3a",
+    "bundle": "1569618ba341f3424f20cfd4e0c86c96edfd57fe858c0e7de85961463cccac31",
     "sdk": "a3d2ddfa5e4ae965f9e22097c036450a6029ce2862ffa31886a328e9493e1e43",
     "docs": "7c023f89611900e309fd8eac6601ff7134ebf052a4070f44cffd231fe175bcb2"
   }
