@@ -141,7 +141,7 @@ class BashAgent(BaseAgent):
         """Build the default system prompt.
 
         Loads the bash_agent system_prompt.md and fills in
-        {simulator_instructions} and {total_days}.
+        simulator instructions and configured days, weeks and years.
 
         ORACLE MODE: when env var ORACLE_MODE=1, prepend system_prompt_oracle.md
         as a preamble. The oracle preamble explicitly overrides the "hidden
@@ -166,10 +166,11 @@ class BashAgent(BaseAgent):
 
         prompt = template.replace('{simulator_instructions}', sim_text)
 
-        # Replace {total_days} placeholder with actual value
+        # Fill duration consistently for all experiment groups.
         total_years = self.total_days / 365
         years_str = f"{total_years:.0f}" if total_years == int(total_years) else f"{total_years:.1f}"
         prompt = prompt.replace('{total_days}', str(self.total_days))
+        prompt = prompt.replace('{total_weeks}', str((self.total_days + 6) // 7))
         prompt = prompt.replace('{total_years}', years_str)
 
         if os.environ.get("ORACLE_MODE") == "1":

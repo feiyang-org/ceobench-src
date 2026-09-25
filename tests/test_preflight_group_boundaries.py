@@ -24,6 +24,8 @@ def original_prompt(days):
     years = days / 365
     return (ORIGINAL['system_template'].replace('{simulator_instructions}', sim)
             .replace('{total_days}', str(days))
+            # User-approved common repair: resolve the original week placeholder.
+            .replace('{total_weeks}', str((days + 6) // 7))
             .replace('{total_years}', f'{years:.0f}' if years == int(years) else f'{years:.1f}'))
 
 
@@ -34,11 +36,13 @@ def save_artifact(name, value):
         target.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
 
 
-@pytest.mark.parametrize('days', [7, 42, 497, 730, 3650])
-def test_original_prompt_and_tools_match_frozen_baseline(days, monkeypatch):
+@pytest.mark.parametrize('days,weeks', [(7, 1), (14, 2), (42, 6), (497, 71), (730, 105), (3650, 522)])
+def test_original_prompt_and_tools_match_frozen_baseline(days, weeks, monkeypatch):
     monkeypatch.delenv('ORACLE_MODE', raising=False)
     agent = BashAgent.__new__(BashAgent)
     agent.total_days = days
+    assert f'{days} simulated days ({weeks} weeks /' in agent._default_system_prompt()
+    assert f'Maximize cash over {weeks} weeks.' in agent._default_system_prompt()
     assert agent._default_system_prompt().encode() == original_prompt(days).encode()
     assert get_bash_agent_tool_descriptions() == [dict(type='function', **t) for t in ORIGINAL['tools']]
 
