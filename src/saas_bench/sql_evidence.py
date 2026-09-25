@@ -150,18 +150,27 @@ class SQLEvidenceStore:
     def execution_capture(self):
         return self.identity.get('capture_scope') == 'execution'
 
-    def assert_healthy(self, quiescent=True):
-        if self.fault or self.fault_path.exists():
-            raise RuntimeError('SQL evidence capture failed; collection stopped')
-        if not quiescent:
-            return
-        with closing(self.connect()) as conn:
-            pending = conn.execute('''SELECT event_id FROM requests
-                WHERE event_id NOT IN (SELECT event_id FROM results)
-                   OR (coalesce(json_extract(request, '$.requires_delivery'), 1) = 1
-                       AND event_id NOT IN (SELECT event_id FROM deliveries)) LIMIT 1''').fetchone()
-            missing = conn.execute('SELECT token FROM client_calls WHERE received IS NULL LIMIT 1').fetchone()
-            unknown = conn.execute("SELECT event_id FROM results WHERE json_extract(record, '$.status') = 'result_unknown' LIMIT 1").fetchone()
+    def assert_healthy(self, quiescent=True, settle=0):
+        """With settle, wait that long for server threads to record sends already observed by the client."""
+        deadline = time.monotonic() + settle
+        while True:
+            if self.fault or self.fault_path.exists():
+                raise RuntimeError('SQL evidence capture failed; collection stopped')
+            if not quiescent:
+                return
+            with closing(self.connect()) as conn:
+                pending = conn.execute('''SELECT event_id, event_id IN (SELECT event_id FROM results) FROM requests
+                    WHERE event_id NOT IN (SELECT event_id FROM results)
+                       OR (coalesce(json_extract(request, '$.requires_delivery'), 1) = 1
+                           AND event_id NOT IN (SELECT event_id FROM deliveries))
+                    ORDER BY 2 LIMIT 1''').fetchone()
+                missing = conn.execute('SELECT token FROM client_calls WHERE received IS NULL LIMIT 1').fetchone()
+                unknown = conn.execute("SELECT event_id FROM results WHERE json_extract(record, '$.status') = 'result_unknown' LIMIT 1").fetchone()
+            # The response bytes reach the client before its handler records the send.
+            if pending and pending[1] and time.monotonic() < deadline:
+                time.sleep(.01)
+                continue
+            break
         if pending:
             raise RuntimeError('Unconfirmed SQL evidence outcome: ' + pending[0])
         if missing:

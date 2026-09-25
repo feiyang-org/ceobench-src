@@ -916,7 +916,7 @@ __pycache__/
 
     def _check_capture_health(self):
         if self.evidence_store:
-            self.evidence_store.assert_healthy()
+            self.evidence_store.assert_healthy(settle=5)
         if self.sql_evidence_config:
             if ((self.workspace_dir / 'sql-evidence.fault.json').exists() or
                     self._http_get('/health').get('status') != 'ok'):

@@ -255,6 +255,30 @@ os._exit(0)
             store.assert_healthy()
 
 
+def test_settle_waits_only_for_late_send_records(tmp_path):
+    store = SQLEvidenceStore(tmp_path / 'e.sqlite', identity())
+    event = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
+    store.complete(event)
+    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome'):
+        store.assert_healthy()
+    late = threading.Timer(.2, store.delivered, (event, 'sent'))
+    late.start()
+    store.assert_healthy(settle=5)
+    late.join()
+    lost = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
+    store.complete(lost)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome: ' + lost):
+        store.assert_healthy(settle=.3)
+    assert time.monotonic() - started >= .3
+    store.delivered(lost, 'sent')
+    running = store.begin_event('public_http', {'path': '/dashboard'}, requires_delivery=True)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match='Unconfirmed SQL evidence outcome: ' + running):
+        store.assert_healthy(settle=5)
+    assert time.monotonic() - started < 1
+
+
 def test_snapshot_branch_visibility_and_tampering(captured, tmp_path):
     api, store = captured
     request(api, 'SELECT 1')
