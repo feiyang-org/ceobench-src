@@ -420,6 +420,7 @@ def cmd_start_server(args, base: Path):
         script_workspace=base,
         require_sandbox=os.environ.get('CEOBENCH_RUN_KIND') == 'formal',
         sql_evidence=sql_evidence,
+        checkpoint_token=os.environ.get('CEOBENCH_CHECKPOINT_TOKEN'),
     )
     from saas_bench.run_state import file_hash, write_json
     checkpoint_root = os.environ.get('CEOBENCH_CHECKPOINT_ROOT')

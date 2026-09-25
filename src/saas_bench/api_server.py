@@ -186,6 +186,12 @@ class _APIHandler(BaseHTTPRequestHandler):
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_post()
             elif self.path == '/checkpoint':
+                import secrets
+                expected_token = self.server._api_server.checkpoint_token
+                supplied_token = self.headers.get('X-Harness-Token', '')
+                if not expected_token or not secrets.compare_digest(supplied_token, expected_token):
+                    self._send_json({'error': 'Harness access required'}, 403)
+                    return
                 body = self._read_body()
                 if set(body) != {'expected_day'} or not isinstance(body['expected_day'], int):
                     self._send_json({'success': False, 'error': 'expected_day is required; no other fields allowed'}, 400)
@@ -694,7 +700,7 @@ class NovaMindAPIServer:
     def __init__(self, tools: AgentTools, simulator=None, conn=None,
                  day_callback=None, dashboard_callback=None,
                  shock_manager=None, event_logger=None, script_workspace=None,
-                 require_sandbox=False, sql_evidence=None):
+                 require_sandbox=False, sql_evidence=None, checkpoint_token=None):
         """Initialize the API server.
 
         Args:
@@ -734,6 +740,7 @@ class NovaMindAPIServer:
         self._advance_lock = threading.Lock()
         self._operation_failed = False
         self.checkpoint_callback = None
+        self.checkpoint_token = checkpoint_token
         self._last_dashboard: str = ""
         self._last_day_result = None
         self._daily_scripts: Dict[str, str] = {}  # name -> content snapshot

@@ -188,6 +188,8 @@ class BashAgent(BaseAgent):
         """Read MEMORY.md once when building a new week's system prompt."""
         prompt = self.system_prompt
         memory_path = self.workspace_path / 'MEMORY.md'
+        if not memory_path.resolve().is_relative_to(self.workspace_path.resolve()):
+            raise ValueError('MEMORY.md must stay within the agent workspace')
         if memory_path.exists():
             try:
                 original_memory = memory_path.read_bytes()

@@ -334,6 +334,7 @@ class BashAgentToolExecutor:
     # encryption is meaningless.
     _FORBIDDEN_SANDBOX_ENV = frozenset({
         'NMDB_KEY',
+        'CEOBENCH_CHECKPOINT_TOKEN',
     })
 
     @classmethod

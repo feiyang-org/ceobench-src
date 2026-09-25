@@ -401,9 +401,12 @@ class BashAgentRunner:
 
     def _http_post(self, path: str, data: Optional[Dict] = None, timeout: float = 1800) -> Dict:
         body = json.dumps(data or {}).encode()
+        headers = {'Content-Type': 'application/json'}
+        if path == '/checkpoint':
+            headers['X-Harness-Token'] = self._checkpoint_token
         req = urllib.request.Request(
             self._server_url(path), data=body,
-            headers={'Content-Type': 'application/json'},
+            headers=headers,
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read())
@@ -655,11 +658,15 @@ __pycache__/
 
     def _server_environment(self) -> Dict[str, str]:
         """Environment for host-side simulator processes."""
+        import secrets
+        if not getattr(self, '_checkpoint_token', None):
+            self._checkpoint_token = secrets.token_urlsafe(32)
         env = os.environ.copy()
         env["NOVAMIND_SERVER_MODE"] = "1"
         env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
         env['CEOBENCH_RUN_KIND'] = self.run_kind
         env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
+        env['CEOBENCH_CHECKPOINT_TOKEN'] = self._checkpoint_token
         env['CEOBENCH_SIMULATOR_USAGE_LOG'] = str(self.logs_dir / 'simulator_requests.jsonl')
         env['CEOBENCH_MODEL_SESSION'] = str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.workspace_dir))) + ':simulator'
         if self.sql_evidence_config:
