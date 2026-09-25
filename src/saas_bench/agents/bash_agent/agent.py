@@ -59,6 +59,7 @@ class BashAgent(BaseAgent):
         total_days: int = 3650,
         anthropic_fallback_model: Optional[str] = None,
         usage_recorder: Optional[ModelUsage] = None,
+        text_registration: bool = False,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
@@ -96,6 +97,9 @@ class BashAgent(BaseAgent):
 
         # Build system prompt
         self.system_prompt = system_prompt or self._default_system_prompt()
+        if text_registration:
+            from saas_bench.registration_schema import REGISTRATION_PROMPT
+            self.system_prompt += REGISTRATION_PROMPT
 
         # Agent state
         self.conversation: List[Message] = []
@@ -1126,8 +1130,8 @@ class BashAgent(BaseAgent):
                 }
             ]
 
-            from .tools import get_bash_agent_anthropic_tools
-            tools = get_bash_agent_anthropic_tools()
+            tools = [dict(name=t['name'], description=t['description'], input_schema=t['parameters'])
+                     for t in self.tool_descriptions]
             if tools:
                 tools[-1]['cache_control'] = {"type": "ephemeral"}
 

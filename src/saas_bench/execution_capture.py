@@ -326,6 +326,47 @@ def slice_origins(origins, start, end, target=0):
     return result
 
 
+def query_projection(capture, stdout):
+    """Attribute an unchanged, complete standard CLI projection to its SQL result.
+
+    Arbitrary Python prints, pipes, and concatenated output remain unassigned.
+    Both the observed CLI print and its enclosing stdout must match exactly and
+    use the same OS pipe. Redirecting the query and echoing equal text cannot
+    establish this relation.
+    """
+    store = capture.store
+    with closing(store.connect()) as conn:
+        rows = conn.execute('''SELECT v.version_id, r.event_id FROM versions v
+            JOIN requests r USING(event_id)
+            WHERE json_extract(v.metadata, '$.layer') = 'program_projection'
+            AND json_extract(r.request, '$.parent_event_id') = ? AND r.query_id IS NOT NULL''',
+            (capture.event,)).fetchall()
+    matches = []
+    for row in rows:
+        projection = json.loads(store.get_content(row['version_id'])[1])
+        prints = [part['text'] for part in projection if part['stream'] == 'stdout'
+                  and part.get('sink') is not None and part['sink'] == capture.facts.get('stdout_sink')]
+        if not prints or ''.join(prints) != stdout:
+            continue
+        public = row['event_id'] + ':public_response'
+        meta, raw = store.get_content(public)
+        body = json.loads(raw)
+        try:
+            projected = json.loads(stdout)
+        except ValueError:
+            continue
+        expected = {k: body.get(k) for k in ('columns', 'rows', 'row_count')}
+        if body.get('success') and projected == expected:
+            matches.append((public, meta))
+    if len(matches) != 1:
+        return []
+    public, meta = matches[0]
+    version = capture.blob('query_projection', stdout, 'query_model_projection',
+                           object_id=meta['object_id'], derived_from=public,
+                           source_truncated=meta['source_truncated'], transformation='standard_cli_query_projection')
+    return [origin(version, stdout)] if version else []
+
+
 def text_sources(value, pointer=''):
     """Walk known string identities; never search for matching text."""
     result = []

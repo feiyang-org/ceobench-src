@@ -103,7 +103,13 @@ def print(*args, **kwargs):
     if state is not None and target in (sys.stdout, sys.stderr):
         text = io.StringIO()
         builtins.print(*args, **dict(kwargs, file=text))
-        state['projection'].append({'stream': 'stderr' if target is sys.stderr else 'stdout', 'text': text.getvalue()})
+        try:
+            sink = os.fstat(target.fileno())
+            sink = [sink.st_dev, sink.st_ino]
+        except (OSError, AttributeError, io.UnsupportedOperation):
+            sink = None
+        state['projection'].append({'stream': 'stderr' if target is sys.stderr else 'stdout',
+                                    'text': text.getvalue(), 'sink': sink})
     return builtins.print(*args, **kwargs)
 
 

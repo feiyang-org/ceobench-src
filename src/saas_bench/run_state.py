@@ -147,7 +147,7 @@ def restore_sql_evidence(run, directory, checkpoint, identity):
         store.assert_healthy()
 
 
-def clone_sql_run(source, destination, branch_id):
+def clone_sql_run(source, destination, branch_id, *, text_registration=None):
     """Clone a frozen SQL-capture checkpoint, assigning an explicit new branch."""
     import re
     source, destination = Path(source), Path(destination)
@@ -157,6 +157,10 @@ def clone_sql_run(source, destination, branch_id):
         raise ValueError('Invalid evidence branch ID')
     manifest = json.loads((directory / 'manifest.json').read_text())
     parent = manifest['sql_evidence']
+    if text_registration is not None:
+        if manifest.get('text_registration') != 'prefix' or text_registration not in ('git', 'pf'):
+            raise ValueError('Registration forks must change prefix to git or pf')
+        manifest['text_registration'] = text_registration
     from contextlib import closing
     import sqlite3
     with closing(sqlite3.connect(f'file:{directory / "sql-evidence.sqlite"}?mode=ro', uri=True)) as conn:
