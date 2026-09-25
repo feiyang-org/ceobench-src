@@ -276,6 +276,8 @@ class _APIHandler(BaseHTTPRequestHandler):
         if getattr(self, '_generic_capture', False):
             from .execution_capture import text_sources
             self._sql_execution['public_fields'] = text_sources(data)
+            if self.path == '/next-week' and self.server._api_server._step_day_timed_out:
+                self._sql_execution['world_outcome_unknown'] = True
         response = json.dumps(data, default=str).encode()
         self._capture_response(status, response)
         try:
@@ -799,7 +801,8 @@ class NovaMindAPIServer:
                                 if self._sql_active == 0:
                                     break
                             except RuntimeError as exc:
-                                if not str(exc).startswith('Unconfirmed'):
+                                if (not str(exc).startswith('Unconfirmed') or
+                                        str(exc).startswith('Unconfirmed execution outcome')):
                                     raise
                             if time.monotonic() >= deadline:
                                 raise TimeoutError('Execution capture did not finish before checkpoint')

@@ -265,6 +265,8 @@ class BashAgentToolExecutor:
             result = handler(args)
             if tool_name != 'bash' and result.startswith('Error:'):
                 status = 'failed'
+            elif capture and capture.facts.get('timed_out'):
+                status = 'timed_out'
             elif capture and capture.facts.get('exit_code', 0):
                 status = 'failed'
         except NextDayTimeoutError:

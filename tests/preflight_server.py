@@ -5,6 +5,8 @@ import os
 import runpy
 import socket
 import sys
+import time
+from pathlib import Path
 import httpx
 
 
@@ -36,5 +38,22 @@ if __name__ == '__main__':
         return original_connect(sock, address)
     socket.socket.connect = local_only
     httpx.HTTPTransport.handle_request = fake_request
+    pause_path = os.environ.get('CEOBENCH_TEST_PAUSE_RESPONSE_PATH')
+    if pause_path:
+        sys.path.insert(0, sys.argv[1])  # Import the native zipapp module that runpy will use.
+        from saas_bench.api_server import _APIHandler
+        original_send = _APIHandler._send_json
+        def paused_send(self, data, status=200):
+            if self.path == pause_path and data.get('success') is True:
+                marker = Path(os.environ['CEOBENCH_TEST_RESPONSE_MARKER'])
+                release = Path(os.environ['CEOBENCH_TEST_RESPONSE_RELEASE'])
+                marker.write_text('world action finished; public response not sent')
+                deadline = time.monotonic() + 20
+                while not release.exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('Test did not release the response')
+                    time.sleep(.01)
+            return original_send(self, data, status)
+        _APIHandler._send_json = paused_send
     sys.argv = sys.argv[1:]
     runpy.run_path(sys.argv[0], run_name='__main__')

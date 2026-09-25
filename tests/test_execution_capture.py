@@ -185,6 +185,56 @@ def test_streams_truncation_failure_and_capture_equivalence(captured):
         assert text[slice(*source['source_range'])] == actual[slice(*source['request_range'])]
 
 
+def test_finished_bash_timeout_is_distinct_from_unknown_outcome(captured):
+    _, store, executor = captured
+    executor.bash_timeout = .1
+    result = executor.execute('bash', {'command': 'echo before-timeout; sleep 30'})
+    row = records(store)[0]
+    assert 'before-timeout' in result and 'timed out' in result
+    assert row['result']['status'] == 'timed_out'
+    assert row['result']['timed_out'] is True
+    assert row['result']['exit_code'] is not None
+    store.assert_healthy()
+
+
+def test_running_week_after_timeout_remains_unknown(captured):
+    import threading
+    from types import SimpleNamespace
+    api, store, _ = captured
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    def step_week():
+        started.set()
+        try:
+            release.wait(5)
+            return SimpleNamespace(day=7)
+        finally:
+            finished.set()
+    api.simulator = SimpleNamespace(step_week=step_week)
+    api.STEP_WEEK_TIMEOUT = .1
+    body = dict(rationale='offline timeout check', predictions={
+        name: dict(point=10, lower=0, upper=20) for name in
+        ('cash_1wk', 'cash_4wk', 'cash_12wk', 'cash_26wk')})
+    try:
+        request = urllib.request.Request(f'http://127.0.0.1:{api.port}/next-week',
+                                         data=json.dumps(body).encode())
+        with urllib.request.urlopen(request, timeout=3) as response:
+            assert json.load(response)['error'] == 'step_week_timeout'
+        assert started.is_set() and not finished.is_set()
+        settled(api)
+        row = records(store)[0]
+        event = row['request']['event_id']
+        assert row['result']['status'] == 'result_unknown'
+        assert row['result']['completed_at'] is None
+        assert json.loads(store.get_content(event + ':public_response')[1])['error'] == 'step_week_timeout'
+        with pytest.raises(RuntimeError, match='Unconfirmed'):
+            store.assert_healthy()
+        with pytest.raises(RuntimeError, match='Unconfirmed'):
+            api.checkpoint(0)
+    finally:
+        release.set()
+        assert finished.wait(3)
+
+
 @pytest.mark.parametrize('detached', [False, pytest.param(True, marks=pytest.mark.skipif(sys.platform != 'linux', reason='Linux subreaper acceptance'))])
 def test_background_descendant_pauses_and_preserves_scene(captured, detached):
     import os

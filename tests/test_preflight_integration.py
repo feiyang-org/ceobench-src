@@ -387,6 +387,307 @@ def test_packed_execution_capture_scripts_cache_restore_and_fork(offline_runner,
         child.evidence_store.assert_healthy()
 
 
+def test_six_week_execution_capture_matches_uncaptured_run(offline_runner, tmp_path):
+    """Pair the public and tool bytes across two restore boundaries."""
+    import urllib.request
+    from saas_bench.run_state import clone_sql_run
+    from test_sql_evidence import event_ids
+
+    runners = [offline_runner(), offline_runner(execution_capture=True)]
+    traces = [[], []]
+    script_a = "print('registered version A')"
+    script_b = "print('registered version B')"
+    for week in range(6):
+        for index, runner in enumerate(runners):
+            execute = runner.tool_executor.execute
+            if week == 0:
+                traces[index].append(execute('write_file', {'path': 'comparison.txt', 'content': 'week 0'}))
+                traces[index].append(execute('read_file', {'path': 'comparison.txt'}))
+                traces[index].append(execute('search_files', {'pattern': 'week', 'path': 'comparison.txt'}))
+                traces[index].append(execute('glob_files', {'pattern': 'comparison.txt'}))
+                traces[index].append(runner._http_post('/daily-scripts', {'name': 'metric', 'content': script_a}))
+            else:
+                traces[index].append(execute('edit_file', {'path': 'comparison.txt',
+                    'old_string': f'week {week - 1}', 'new_string': f'week {week}'}))
+            if week == 3:
+                traces[index].append(runner._http_post('/daily-scripts', {'name': 'metric', 'content': script_b}))
+            if week == 5:
+                request = urllib.request.Request(runner._server_url('/daily-scripts'),
+                    data=b'{"name":"metric"}', headers={'Content-Type': 'application/json'}, method='DELETE')
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    traces[index].append(json.loads(response.read()))
+            traces[index].append(runner._http_post('/query', {'sql': 'SELECT 7 AS n'}))
+            traces[index].append(runner._http_post('/query', {'sql': 'SELECT 7 AS n WHERE 0'}))
+            traces[index].append(execute('bash', {'command': './novamind-operation query "SELECT 7 AS n"'}))
+            traces[index].append(execute('bash', {'command':
+                "python -c \"import sys; print('stdout'); print('stderr', file=sys.stderr); sys.exit(3)\""}))
+            traces[index].append(advance(runner))
+            traces[index].append(runner._get_dashboard())
+            traces[index].append(runner._get_dashboard())
+        assert traces[0] == traces[1]
+        assert runners[0]._get_game_status() == runners[1]._get_game_status()
+        if week in (2, 4):
+            day = (week + 1) * 7
+            for index, runner in enumerate(runners):
+                if day == 21:
+                    runner.agent._refresh_context(f'day {day}', day)
+                    runner.agent.current_day = day
+                runner._save_checkpoint(day)
+                runner._stop_server()
+                runners[index] = offline_runner(runner.workspace_dir)
+            assert runners[0]._load_checkpoint()['context_boundary'] == runners[1]._load_checkpoint()['context_boundary']
+            assert runners[0]._load_checkpoint()['context_boundary'] == ('same_week' if day == 21 else 'new_week')
+            assert runners[0]._get_dashboard() == runners[1]._get_dashboard()
+    for runner in runners:
+        runner._save_checkpoint(42)
+    assert business_state(runners[0]) == business_state(runners[1])
+    assert runners[0]._http_get('/daily-scripts') == runners[1]._http_get('/daily-scripts')
+    assert runners[0].agent_workspace.joinpath('comparison.txt').read_bytes() == runners[1].agent_workspace.joinpath('comparison.txt').read_bytes()
+    assert runners[0].agent_workspace.joinpath('comparison.txt').read_bytes() == b'week 5'
+    assert (checkpoint_directory(runners[0].workspace_dir, runners[0]._load_checkpoint()) /
+        'server_state.json').read_bytes() == (checkpoint_directory(runners[1].workspace_dir,
+        runners[1]._load_checkpoint()) / 'server_state.json').read_bytes()
+    store = runners[1].evidence_store
+    store.assert_healthy()
+    kinds = {store.read_event(event)['request']['kind'] for event in event_ids(store)}
+    assert {'bash', 'sql_query', 'registered_script_execution', 'public_http'} <= kinds
+    destination = os.environ.get('CEOBENCH_STAGE2_ARTIFACTS')
+    if destination:
+        output = Path(destination)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / 'six-week-pair.json').write_text(json.dumps({
+            'evidence_kind': 'actually_executed_local_offline', 'weeks': 6,
+            'split_days': [21, 35], 'compared_actions': len(traces[0]),
+            'exact_tool_and_public_values': True, 'business_state_equal': True,
+            'event_kinds': sorted(kinds), 'captured_run_id': runners[1].run_id,
+        }, indent=2))
+        (output / 'comparison-values.json').write_text(json.dumps([
+            {'index': number, 'uncaptured': left, 'captured': right, 'equal': left == right}
+            for number, (left, right) in enumerate(zip(*traces))
+        ], indent=2, ensure_ascii=False))
+        metadata = []
+        for runner in runners:
+            checkpoint = runner._load_checkpoint()
+            conn = load_session_db(checkpoint_directory(runner.workspace_dir, checkpoint) / 'world.nmdb')
+            try:
+                submitted = [row[0] for row in conn.execute('SELECT submitted_at FROM predictions ORDER BY rowid')]
+            finally:
+                conn.close()
+            metadata.append({'run_id': runner.run_id, 'snapshot_id': checkpoint['snapshot_id'],
+                             'prediction_submitted_at': submitted})
+        (output / 'comparison-metadata.json').write_text(json.dumps(metadata, indent=2))
+        store.snapshot(output / 'six-week-evidence.sqlite')
+
+
+def test_stage2_workspace_overhead(offline_runner, monkeypatch):
+    """Opt-in native 1x/10x workload with paired, alternating measurements."""
+    import hashlib
+    import httpx
+    import platform
+    import shlex
+    import statistics
+    import time
+    from collections import defaultdict
+    from openai import OpenAI
+    from saas_bench import execution_capture
+    from saas_bench.model_usage import ModelUsage
+    from test_preflight_usage import reply
+    from test_sql_evidence import event_ids
+
+    destination = os.environ.get('CEOBENCH_STAGE2_ARTIFACTS')
+    if not destination:
+        pytest.skip('Set CEOBENCH_STAGE2_ARTIFACTS for the stage 2 native workload')
+    output = Path(destination)
+    output.mkdir(parents=True, exist_ok=True)
+    report = {'evidence_kind': 'actually_executed_local_synthetic_workload',
+              'external_provider_calls': 0, 'platform': platform.platform(),
+              'python': sys.version, 'historical_basis': {'files': 124, 'bytes': 2480041},
+              'scales': {}}
+    code = '''import json, time
+import novamind_api as n
+from novamind_api import _capture
+times = []
+submit = _capture.submit
+def measured(record):
+    start = time.perf_counter()
+    try:
+        return submit(record)
+    finally:
+        times.append(time.perf_counter() - start)
+_capture.submit = measured
+print(n.query('SELECT 7 AS n'))
+open('stage2-callback.json', 'w').write(json.dumps(times))'''
+    command = './novamind-operation python-c ' + shlex.quote(code)
+    for scale in (1, 10):
+        runners = [offline_runner(), offline_runner(execution_capture=True)]
+        count, byte_count = 124 * scale, 2480041 * scale
+        for runner in runners:
+            for number in range(count):
+                size = byte_count // count + (byte_count % count if number == count - 1 else 0)
+                block = hashlib.sha256(f'stage2-{number}'.encode()).digest()
+                (runner.agent_workspace / f'stage2-load-{number:04d}.bin').write_bytes(
+                    (block * ((size + len(block) - 1) // len(block)))[:size])
+        store = runners[1].evidence_store
+        phase = defaultdict(float)
+        def timed(obj, name, key):
+            original = getattr(obj, name)
+            def call(*args, **kwargs):
+                start = time.perf_counter()
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    phase[key] += time.perf_counter() - start
+            monkeypatch.setattr(obj, name, call)
+            return original
+        original_digest = timed(execution_capture, 'digest', 'hash')
+        original_version = timed(store, 'version', 'storage')
+        original_mapping = timed(execution_capture, 'model_request', 'request_mapping')
+        usage = [ModelUsage(None, 'agent', evidence_store=runner.evidence_store) for runner in runners]
+        clients = [usage[i].attach(OpenAI(api_key='offline-only', max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json=reply('chat')))))) for i in range(2)]
+        samples = {False: [], True: []}
+        try:
+            def measure(index, warmup=False):
+                runner = runners[index]
+                before = dict(phase)
+                size_before = sum(p.stat().st_size for p in
+                    (store.path, Path(str(store.path) + '-wal')) if p.exists())
+                known = set(event_ids(store)) if index else set()
+                start = time.perf_counter()
+                result = runner.tool_executor.execute('bash', {'command': command})
+                request = dict(model='test-model', messages=[{'role': 'tool',
+                    'tool_call_id': 'stage2-fixture', 'content': result}])
+                usage[index].call('chat', request,
+                    lambda: clients[index].chat.completions.create(**request))
+                total = time.perf_counter() - start
+                assert 'row_count' in result and 'timed out' not in result.lower()
+                callback = sum(json.loads((runner.agent_workspace / 'stage2-callback.json').read_text()))
+                row = {'total_seconds': total, 'callback_roundtrip_seconds': callback}
+                if index:
+                    events = set(event_ids(store)) - known
+                    bash = next(store.read_event(event) for event in events
+                                if store.read_event(event)['request']['kind'] == 'bash')
+                    facts = bash['result']
+                    assert facts['status'] == 'succeeded'
+                    row.update(before_scan_seconds=facts['before_scan_seconds'],
+                               after_scan_seconds=facts['after_scan_seconds'])
+                    row.update({key + '_seconds': phase[key] - before.get(key, 0)
+                        for key in ('hash', 'storage', 'request_mapping')})
+                    row['storage_growth_bytes'] = sum(p.stat().st_size for p in
+                        (store.path, Path(str(store.path) + '-wal')) if p.exists()) - size_before
+                    if warmup:
+                        items = json.loads(store.get_content(
+                            bash['request']['event_id'] + ':workspace_before')[1])
+                        report['scales'][str(scale)] = {'synthetic_files': count,
+                            'synthetic_bytes': byte_count,
+                            'scanned_files': sum(x['type'] == 'file' for x in items.values()),
+                            'scanned_bytes': sum(x['size'] for x in items.values() if x['type'] == 'file')}
+                if not warmup:
+                    samples[bool(index)].append(row)
+            measure(0, warmup=True)
+            measure(1, warmup=True)
+            for repeat in range(5):
+                for index in ((0, 1) if repeat % 2 == 0 else (1, 0)):
+                    measure(index)
+            for index in (0, 1):
+                values = samples[bool(index)]
+                report['scales'][str(scale)]['capture_on' if index else 'capture_off'] = {
+                    'raw': values,
+                    'median': {key: statistics.median(v[key] for v in values) for key in values[0]},
+                    'maximum': {key: max(v[key] for v in values) for key in values[0]}}
+            store.assert_healthy()
+        finally:
+            for client in clients:
+                client.close()
+            monkeypatch.setattr(execution_capture, 'digest', original_digest)
+            monkeypatch.setattr(execution_capture, 'model_request', original_mapping)
+            monkeypatch.setattr(store, 'version', original_version)
+    (output / 'overhead.json').write_text(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+@pytest.mark.parametrize('action,body', [
+    ('price', {'tool': 'set_prices', 'args': {'A': 31}}),
+    ('research', {'tool': 'start_research_project', 'args': {'tier': 1}}),
+    ('week', {'rationale': 'fixed offline action', 'predictions': {
+        h: {'point': 100000, 'lower': -100000, 'upper': 1000000}
+        for h in ('cash_1wk', 'cash_4wk', 'cash_12wk', 'cash_26wk')}}),
+])
+def test_crashed_outer_action_is_never_replayed(offline_runner, monkeypatch, tmp_path, action, body):
+    """Kill the client after a real world commit, before the public response is sent."""
+    from test_sql_evidence import event_ids
+    import time
+    endpoint = '/next-week' if action == 'week' else '/call'
+    marker, release = tmp_path / 'response-pending', tmp_path / 'release-response'
+    monkeypatch.setenv('CEOBENCH_TEST_PAUSE_RESPONSE_PATH', endpoint)
+    monkeypatch.setenv('CEOBENCH_TEST_RESPONSE_MARKER', str(marker))
+    monkeypatch.setenv('CEOBENCH_TEST_RESPONSE_RELEASE', str(release))
+    runner = offline_runner(execution_capture=True)
+    runner._save_checkpoint(0)
+    pointer = (runner.workspace_dir / 'checkpoint.json').read_bytes()
+    runner._begin_operation(action, 0)
+    code = '''import json, os, sys, urllib.request
+request = urllib.request.Request(sys.argv[1], data=sys.argv[2].encode(),
+    headers={'Content-Type': 'application/json'})
+with urllib.request.urlopen(request, timeout=120) as response:
+    assert json.loads(response.read())['success']
+os._exit(77)
+'''
+    child = subprocess.Popen([sys.executable, '-c', code, runner._server_url(endpoint), json.dumps(body)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 30
+        while not marker.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert marker.exists(), child.communicate(timeout=2)
+        if action == 'price':
+            state = runner._http_post('/query', {'sql': 'SELECT price_A FROM config_history ORDER BY day DESC LIMIT 1'})
+            assert state['rows'][0]['price_A'] == 31
+        elif action == 'research':
+            state = runner._http_post('/query', {'sql': 'SELECT project_id FROM research_projects WHERE tier=1'})
+            assert len(state['rows']) == 1
+        else:
+            assert runner._get_game_status()['day'] == 7
+        child.kill()
+        child.communicate(timeout=5)
+        assert child.returncode < 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate(timeout=5)
+        release.write_text('continue')
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        relevant = [runner.evidence_store.read_event(event) for event in event_ids(runner.evidence_store)
+                    if runner.evidence_store.read_event(event)['request']['kind'] == 'public_http'
+                    and runner.evidence_store.read_event(event)['request']['request']['path'] == endpoint]
+        if relevant and relevant[0]['result']['status'] == 'succeeded':
+            break
+        time.sleep(.01)
+    relevant = [runner.evidence_store.read_event(event) for event in event_ids(runner.evidence_store)
+                if runner.evidence_store.read_event(event)['request']['kind'] == 'public_http'
+                and runner.evidence_store.read_event(event)['request']['request']['path'] == endpoint]
+    assert len(relevant) == 1
+    assert relevant[0]['result']['status'] == 'succeeded'
+    assert relevant[0]['delivery']['receive_state'] == 'unknown'
+    assert (runner.workspace_dir / 'checkpoint.json').read_bytes() == pointer
+    with pytest.raises(ValueError, match='outcome unknown'):
+        runner._load_checkpoint()
+    with pytest.raises(ValueError, match='outcome unknown'):
+        offline_runner(runner.workspace_dir)
+    destination = os.environ.get('CEOBENCH_STAGE2_ARTIFACTS')
+    if destination:
+        output = Path(destination)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / f'crash-{action}.json').write_text(json.dumps({
+            'evidence_kind': 'actually_executed_local_process_exit',
+            'action': action, 'fault_boundary': 'world_mutated_before_public_response',
+            'child_exit_code': child.returncode, 'public_attempts': len(relevant),
+            'public_result_status': relevant[0]['result']['status'],
+            'receive_state': relevant[0]['delivery']['receive_state'],
+            'checkpoint_unchanged': True, 'restore_refused': True}, indent=2))
+
+
 def test_harness_preserves_unfinished_descendants_and_server(offline_runner, monkeypatch):
     import signal
     from saas_bench.environment import Action

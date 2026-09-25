@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -69,17 +71,15 @@ def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api, captur
     from openai import OpenAI
     from anthropic import Anthropic
     from test_preflight_usage import reply
+    from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
     captured = []
     store = None
-    observation = 'contents A'
     if capture:
         from saas_bench.sql_evidence import SQLEvidenceStore
-        from saas_bench.model_usage import ModelUsage
-        from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
         from test_sql_evidence import identity, event_ids
         store = SQLEvidenceStore(tmp_path.parent / (tmp_path.name + '.sqlite'), identity(capture_scope='execution'))
-        (tmp_path / 'contents.txt').write_text('contents A')
-        observation = BashAgentToolExecutor(tmp_path, evidence_store=store).execute('read_file', {'path': 'contents.txt'})
+    (tmp_path / 'contents.txt').write_text('contents A')
+    observation = BashAgentToolExecutor(tmp_path, evidence_store=store).execute('read_file', {'path': 'contents.txt'})
     def handle(request):
         captured.append(json.loads(request.content))
         body = reply(api)
@@ -159,6 +159,25 @@ def test_real_sdk_context_matches_continuous_after_restore(tmp_path, api, captur
         memory_maps = [[item for item in mapping if item['role'] == 'system'] for mapping in maps]
         assert bool(memory_maps[0]) == bool(initial_memory)
         assert [item['version_id'] for item in memory_maps[0]] == [item['version_id'] for item in memory_maps[2]]
+        destination = os.environ.get('CEOBENCH_STAGE2_ARTIFACTS')
+        if destination and initial_memory == 'memory A':
+            output = Path(destination)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / f'model-api-{api}.json').write_text(json.dumps({
+                'evidence_kind': 'actually_executed_local_mock_transport',
+                'external_provider_calls': 0, 'api': api,
+                'requests_before_reset': captured[:4], 'source_occurrences': maps,
+                'same_week_restored_request_equal': captured[1] == captured[2],
+            }, indent=2, ensure_ascii=False))
+            store.snapshot(output / f'model-api-{api}.sqlite')
+    if not capture and initial_memory == 'memory A' and os.environ.get('CEOBENCH_STAGE2_ARTIFACTS'):
+        output = Path(os.environ['CEOBENCH_STAGE2_ARTIFACTS'])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / f'model-api-{api}-uncaptured.json').write_text(json.dumps({
+            'evidence_kind': 'actually_executed_local_mock_transport',
+            'external_provider_calls': 0, 'api': api,
+            'requests_before_reset': captured[:4],
+        }, indent=2, ensure_ascii=False))
     second.reset()
     assert second.current_day == -1
     second.act('reset day zero', 0, False, {'day': 0})

@@ -107,12 +107,11 @@ backups/
 analysis/
 build/
 dist/
-# Generated docs are in public/docs; we DO track top-level docs/ for
-# user-facing markdown (e.g. docs/analyze_trajectory.md).
+# Generated docs are in public/docs. Track only the user-facing guide here.
 docs/*
-!docs/*.md
-!docs/evidence-recording/
-!docs/execution-capture/
+!docs/analyze_trajectory.md
+# Local acceptance reports and raw evidence live outside docs/ and Git.
+acceptance-materials/
 modal_deploy/
 monitor/
 paper/

@@ -179,7 +179,8 @@ def finish_http(store, event, status, headers, body, execution):
     store.version(event, 'public_response', body, layer='server_public_response',
                   source_truncated=bool(value.get('truncated')), objects=objects, public_fields=execution.get('public_fields', []),
                   content_time={'status': 'declared', 'fields': dates} if dates else {'status': 'unknown', 'reason': 'not_declared'})
-    outcome = 'succeeded' if status < 400 and value.get('success', True) else 'failed'
+    outcome = ('result_unknown' if execution.get('world_outcome_unknown') else
+               'succeeded' if status < 400 and value.get('success', True) else 'failed')
     if outcome == 'succeeded' and any(not item['success'] for item in outcomes):
         outcome = 'partially_succeeded' if any(item['success'] for item in outcomes) else 'failed'
     store.complete(event, outcome,
