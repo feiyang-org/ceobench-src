@@ -40,6 +40,7 @@ def tree_hash(path):
 def artifact_hashes(public):
     public = Path(public)
     return {'bundle': file_hash(public / 'novamind-operation'),
+            'client': file_hash(public / 'novamind-client'),
             'sdk': tree_hash(public / 'docs' / 'novamind_api'),
             'docs': tree_hash(public / 'docs')}
 

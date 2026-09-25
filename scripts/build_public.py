@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build the public/ directory from source.
 
-After this runs, public/ contains exactly two artifacts:
+The runtime artifacts in public/ are:
 
-    novamind-operation    Single-file zipapp — bundles compiled engine + CLI
+    novamind-operation    Host zipapp with compiled engine + CLI
+    novamind-client       Client-only zipapp copied to the agent workspace
     docs/                 Reference material (docs/api, docs/tables, cli.md,
                           docs/novamind_api source)
 
@@ -12,11 +13,9 @@ The zipapp's ``__main__`` dispatches by environment variable:
     NOVAMIND_SERVER_MODE=1  → saas_bench.server_entry.main() (engine)
     (unset)                 → _public_cli.main() (user-facing CLI)
 
-The agent's SDK source lives at docs/novamind_api/ — readable reference material
-the agent can open with ``cat`` and import via PYTHONPATH at runtime. The
-compiled ``_engine`` sits inside the zipapp at the archive root so that
-``import saas_bench.X`` only works for code running *inside* the zipapp (the
-engine itself); agent-spawned child processes never see it.
+The agent's SDK source lives at docs/novamind_api/. The Runner copies only
+novamind-client (renamed novamind-operation) and docs into the sandbox. Engine
+bytecode and database decryption code remain in the host zipapp.
 
 Usage:
     uv run python scripts/build_public.py
@@ -203,13 +202,14 @@ def build():
         if p.is_file():
             print(f"  {rel}")
 
-    print(f"\n✅ public/ is ready — single-file CLI + docs.")
-    print(f"   novamind-operation: zipapp with bundled engine")
+    print(f"\n✅ public/ is ready — host runtime, agent client, and docs.")
+    print(f"   novamind-operation: host zipapp with bundled engine")
+    print(f"   novamind-client: client-only zipapp for the agent workspace")
     print(f"   docs/: api/, tables/, cli.md, novamind_api/ source")
 
 
 def _build_zipapp():
-    """Create public/novamind-operation as a Python zipapp.
+    """Create separate host and client Python zipapps.
 
     Staging layout (before zipping):
         staging/
@@ -225,13 +225,17 @@ def _build_zipapp():
 
         # __main__.py (entry point, stays as source — it's tiny and must run
         # *before* any saas_bench import happens because of PYTHONHASHSEED).
-        (staging / "__main__.py").write_text(_ZIPAPP_MAIN_SOURCE)
+        (staging / "__main__.py").write_text(_CLIENT_MAIN_SOURCE)
 
         _compile_pyc(SRC_DIR / "novamind_api" / "_capture.py", staging / "_client_capture.pyc", "_client_capture.py")
 
         # Compile _public_cli.py → _public_cli.pyc at the archive root
         src_cli = SRC_DIR / "_public_cli.py"
         _compile_pyc(src_cli, staging / "_public_cli.pyc", "_public_cli.py")
+
+        # Publish the agent archive before adding any engine modules or keys.
+        _write_zipapp(staging, PUBLIC_DIR / "novamind-client")
+        (staging / "__main__.py").write_text(_ZIPAPP_MAIN_SOURCE)
 
         # Build saas_bench/ package inside the archive
         engine_dir = staging / "saas_bench"
@@ -281,24 +285,16 @@ def _build_zipapp():
 
         print(f"  Compiled {compiled} modules into zipapp")
 
-        # Create the zipapp with shebang
-        target = PUBLIC_DIR / "novamind-operation"
-        if target.exists():
-            target.unlink()
-        PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
+        _write_zipapp(staging, PUBLIC_DIR / "novamind-operation")
 
-        _normalize_tree_mtime(staging)
-        zipapp.create_archive(
-            source=str(staging),
-            target=str(target),
-            interpreter='/usr/bin/env python3',
-            compressed=False,
-        )
 
-        # chmod +x
-        target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-        size_kb = target.stat().st_size / 1024
-        print(f"  Zipapp size: {size_kb:.1f} KB")
+def _write_zipapp(staging: Path, target: Path):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _normalize_tree_mtime(staging)
+    zipapp.create_archive(source=str(staging), target=str(target),
+                          interpreter='/usr/bin/env python3', compressed=False)
+    target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    print(f"  {target.name}: {target.stat().st_size / 1024:.1f} KB")
 
 
 def _compile_pyc(src_file: Path, dst_file: Path, archive_name: str):
@@ -325,6 +321,23 @@ def _ensure_deterministic_hash_seed():
         return
     os.environ["PYTHONHASHSEED"] = "0"
     os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+_CLIENT_MAIN_SOURCE = '''\
+"""Agent client. The simulation server is managed by the host Runner."""
+import os
+import sys
+
+if os.environ.get("PYTHONHASHSEED") != "0":
+    os.environ["PYTHONHASHSEED"] = "0"
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+if os.environ.get("NOVAMIND_SERVER_MODE") == "1":
+    sys.exit("Simulation server is managed by the host Runner.")
+
+from _public_cli import main
+main()
+'''
 
 
 _ZIPAPP_MAIN_SOURCE = '''\

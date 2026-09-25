@@ -556,16 +556,9 @@ __pycache__/
     def _initialize_from_public_repo(self):
         """Copy the published layout into the agent workspace and create a session.
 
-        After the zipapp refactor the published repo is just two artifacts:
-
-            novamind-operation    # zipapp (engine + CLI)
-            docs/                 # reference material (incl. SDK source)
-
-        Flow:
-        1. Copy those two into agent_workspace.
-        2. Create a session via the HOST-SIDE zipapp invoked in server mode,
-           so the agent never sees simulator bytecode directly.
-        3. Return the session metadata.
+        Copy novamind-client as novamind-operation plus docs into the workspace.
+        Create the session with the full host novamind-operation zipapp; its
+        simulator bytecode and database decryption modules stay on the host.
 
         public/ must be built first via `uv run python scripts/build_public.py`.
         """
@@ -588,9 +581,8 @@ __pycache__/
                 ignore=shutil.ignore_patterns('__pycache__'),
             )
 
-        # Copy novamind-operation (zipapp). This is the ONLY executable the
-        # agent has — no separate novamind-server, no install.sh, nothing else.
-        src_op = public_dir / "novamind-operation"
+        # Only client code goes into the sandbox, including its initial Git tree.
+        src_op = public_dir / "novamind-client"
         dst_op = self.agent_workspace / "novamind-operation"
         if not src_op.exists():
             raise FileNotFoundError(
@@ -607,7 +599,7 @@ __pycache__/
         env = self._server_environment()
         result = subprocess.run(
             [
-                sys.executable, str(src_op),
+                sys.executable, str(public_dir / "novamind-operation"),
                 "--base", str(self.agent_workspace),
                 "new-session",
                 "--days", str(self.total_days),

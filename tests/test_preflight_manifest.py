@@ -6,9 +6,11 @@ import pytest
 from saas_bench.run_state import artifact_hashes, verify_build, write_json, runtime_versions, tree_hash, file_hash
 
 
-def test_artifact_drift_and_atomic_manifest(tmp_path):
+@pytest.mark.parametrize('changed', ['docs/novamind_api/client.py', 'novamind-client'])
+def test_artifact_drift_and_atomic_manifest(tmp_path, changed):
     (tmp_path / 'docs' / 'novamind_api').mkdir(parents=True)
     (tmp_path / 'novamind-operation').write_text('bundle')
+    (tmp_path / 'novamind-client').write_text('client')
     sdk = tmp_path / 'docs' / 'novamind_api' / 'client.py'
     sdk.write_text('sdk')
     original = dict(python=platform.python_version(), artifacts=artifact_hashes(tmp_path), runtime=runtime_versions())
@@ -17,7 +19,7 @@ def test_artifact_drift_and_atomic_manifest(tmp_path):
     with pytest.raises(ValueError):
         write_json(tmp_path / 'build.json', {'bad': float('nan')})
     assert json.loads((tmp_path / 'build.json').read_text()) == original
-    sdk.write_text('changed')
+    (tmp_path / changed).write_text('changed')
     with pytest.raises(ValueError, match='artifacts'):
         verify_build(tmp_path)
 
@@ -26,6 +28,7 @@ def test_build_rejects_python_sdk_and_source_drift(tmp_path):
     public = tmp_path / 'public'
     (public / 'docs' / 'novamind_api').mkdir(parents=True)
     (public / 'novamind-operation').write_text('bundle')
+    (public / 'novamind-client').write_text('client')
     (tmp_path / 'src').mkdir()
     (tmp_path / 'scripts').mkdir()
     source = tmp_path / 'src' / 'engine.py'
