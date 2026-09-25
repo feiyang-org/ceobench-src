@@ -44,6 +44,10 @@ _ENGINE_MODULES = [
     "_embedded_key",
     "_sql_chunk",
     "api_server",
+    "public_sql",
+    "sql_evidence",
+    "execution_capture",
+    "process_boundary",
     "config",
     "customer_llm",
     "database",
@@ -54,8 +58,10 @@ _ENGINE_MODULES = [
     "event_logger",
     "llm",
     "llm_replay",
+    "model_usage",
     "novamind_cli",
     "personas",
+    "run_state",
     "server_entry",
     "shocks",
     "simulation",
@@ -68,6 +74,7 @@ _ENGINE_MODULES = [
 _ENGINE_API_MODULES = [
     "__init__",
     "_client",
+    "_capture",
     "analytics",
     "enterprise",
     "infrastructure",
@@ -157,6 +164,8 @@ def build():
     # ── Step 3: Build the novamind-operation zipapp ──
     step("3. Building novamind-operation zipapp")
     _build_zipapp()
+    from saas_bench.run_state import build_manifest, write_json
+    write_json(PUBLIC_DIR / 'build.json', build_manifest(PROJECT_ROOT, PUBLIC_DIR))
     print("✅ Wrote public/novamind-operation (zipapp)")
 
     # ── Step 4: Purge legacy artifacts left by the pre-zipapp layout ──
@@ -218,6 +227,8 @@ def _build_zipapp():
         # *before* any saas_bench import happens because of PYTHONHASHSEED).
         (staging / "__main__.py").write_text(_ZIPAPP_MAIN_SOURCE)
 
+        _compile_pyc(SRC_DIR / "novamind_api" / "_capture.py", staging / "_client_capture.pyc", "_client_capture.py")
+
         # Compile _public_cli.py → _public_cli.pyc at the archive root
         src_cli = SRC_DIR / "_public_cli.py"
         _compile_pyc(src_cli, staging / "_public_cli.pyc", "_public_cli.py")
@@ -257,6 +268,16 @@ def _build_zipapp():
                 f"saas_bench/novamind_api/{mod_name}.py",
             )
             compiled += 1
+
+        # Weekly registered scripts use the same executor as the CEO's Bash tool.
+        for relative in ('agents/__init__.py', 'agents/base.py',
+                         'agents/bash_agent/__init__.py', 'agents/bash_agent/tools.py'):
+            target_module = engine_dir / Path(relative).with_suffix('.pyc')
+            target_module.parent.mkdir(parents=True, exist_ok=True)
+            _compile_pyc(SRC_DIR / relative, target_module, 'saas_bench/' + relative)
+        resource = Path('agents/bash_agent/_sandbox_init/sitecustomize.py')
+        (engine_dir / resource).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SRC_DIR / resource, engine_dir / resource)
 
         print(f"  Compiled {compiled} modules into zipapp")
 

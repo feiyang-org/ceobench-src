@@ -676,7 +676,7 @@ class BenchmarkConfig:
     # Social Post LLM (for generating social media posts).
     # Local Opus benchmark runs use direct Anthropic here so the simulator does
     # not require Bedrock credentials.
-    # Supported providers: "bedrock", "anthropic", "openai", or "deepseek".
+    # Supported providers: "bedrock", "anthropic", "openai", "deepseek", "opencode".
     #   - "bedrock":   AnthropicBedrock SDK; requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION.
     #                  Use a Bedrock model id (e.g. "us.anthropic.claude-haiku-4-5-20251001-v1:0").
     #   - "anthropic": Direct Anthropic SDK; requires ANTHROPIC_API_KEY.
@@ -685,8 +685,9 @@ class BenchmarkConfig:
     #   - "deepseek":  Official DeepSeek Chat Completions; requires DEEPSEEK_API_KEY.
     #                  Thinking is disabled. Override via CEOBENCH_SIMULATOR_LLM_PROVIDER /
     #                  CEOBENCH_SIMULATOR_LLM_MODEL (used by DeepSeek / OpenCode agent runs).
+    #   - "opencode":  OpenCode Go Chat Completions; requires OPENCODE_API_KEY.
     social_post_llm_model: str = "claude-haiku-4-5"
-    social_post_llm_provider: str = "anthropic"  # "bedrock" | "anthropic" | "openai" | "deepseek"
+    social_post_llm_provider: str = "anthropic"
     social_post_llm_temperature: float = 0.9  # Higher for creative variety
     social_post_llm_max_tokens: int = 1000
 
@@ -694,12 +695,18 @@ class BenchmarkConfig:
     # Local Opus benchmark runs use direct Anthropic here so the simulator does
     # not require Bedrock credentials.
     enterprise_llm_model: str = "claude-sonnet-4-5"
-    enterprise_llm_provider: str = "anthropic"  # "bedrock" | "anthropic" | "openai" | "deepseek"
+    enterprise_llm_provider: str = "anthropic"
     enterprise_llm_temperature: float = 0.7
     enterprise_llm_max_tokens: int = 300
 
     # Bedrock configuration
     bedrock_region: str = "us-east-2"  # Ohio — AWS Bedrock region
+
+    # Exact served-model IDs -> USD/1k input, output, cache_read, cache_write.
+    # Empty means no registered price; receipts retain an unknown cost.
+    model_pricing: Dict[str, Dict[str, float | str]] = field(default_factory=dict)
+    simulator_openai_base_url: str = 'https://api.openai.com/v1'
+    simulator_anthropic_base_url: str = 'https://api.anthropic.com'
 
     # Temperature settings
     agent_llm_temperature: float = 0.7  # For agent responses

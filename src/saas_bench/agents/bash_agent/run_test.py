@@ -80,16 +80,66 @@ class BashAgentRunner:
         provider: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        seed: int = 42,
-        scenario: str = "default",
-        total_days: int = 3650,
-        initial_cash: float = 1_000_000.0,
+        seed: Optional[int] = None,
+        scenario: Optional[str] = None,
+        total_days: Optional[int] = None,
+        initial_cash: Optional[float] = None,
         workspace_base: Optional[Path] = None,
         reasoning_effort: Optional[str] = None,
         continue_from: Optional[Path] = None,
         label: Optional[str] = None,
+        run_kind: Optional[str] = None,
+        pricing_file: Optional[Path] = None,
+        sql_capture: Optional[bool] = None,
+        execution_capture: Optional[bool] = None,
     ):
+        from saas_bench.model_usage import load_pricing
+        self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
         default_config = BenchmarkConfig()
+        if continue_from:
+            saved_manifest = json.loads((Path(continue_from) / 'manifest.json').read_text())
+            saved = saved_manifest['configuration']
+            saved_capture = bool(saved_manifest.get('sql_evidence'))
+            saved_execution = (saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution'
+            if execution_capture is not None and execution_capture != saved_execution:
+                raise ValueError('Resume execution capture configuration mismatch')
+            execution_capture = saved_execution
+            if sql_capture is not None and sql_capture != saved_capture:
+                raise ValueError('Resume SQL capture configuration mismatch')
+            sql_capture = saved_capture
+            if pricing_file and self.pricing_registration != saved_manifest.get('pricing'):
+                raise ValueError('Resume pricing configuration mismatch')
+            self.pricing_registration = saved_manifest.get('pricing')
+            supplied = dict(model=model, provider=provider, base_url=base_url,
+                            seed=seed, scenario=scenario, total_days=total_days,
+                            initial_cash=initial_cash, reasoning_effort=reasoning_effort, run_kind=run_kind)
+            for key, value in supplied.items():
+                if key == 'total_days' and value is not None:
+                    value = value // 7 * 7
+                if key == 'base_url' and value is not None:
+                    value = value.rstrip('/') + '/'
+                expected = saved[key]
+                if key == 'base_url' and expected is not None:
+                    expected = expected.rstrip('/') + '/'
+                if value is not None and value != expected:
+                    raise ValueError(f'Resume configuration mismatch: {key}')
+            model, provider, base_url = (saved[k] for k in ('model', 'provider', 'base_url'))
+            seed, scenario, total_days, initial_cash, reasoning_effort = (
+                saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
+            run_kind = saved['run_kind']
+        if execution_capture:
+            if sql_capture is False:
+                raise ValueError('Execution capture requires SQL capture')
+            sql_capture = True
+        self.execution_capture = bool(execution_capture)
+        self.evidence_store = None
+        self.run_kind = run_kind or 'engineering'
+        if self.run_kind not in ('engineering', 'pilot', 'formal'):
+            raise ValueError('Invalid run kind')
+        seed = 42 if seed is None else seed
+        scenario = 'default' if scenario is None else scenario
+        total_days = 3650 if total_days is None else total_days
+        initial_cash = 1_000_000.0 if initial_cash is None else initial_cash
         self.model = model or default_config.agent_llm_model
         self.provider = provider or default_config.agent_llm_provider
         self.seed = seed
@@ -131,6 +181,14 @@ class BashAgentRunner:
 
         # Agent working directory (inside the run directory)
         self.agent_workspace = self.workspace_dir / "agent_workspace"
+        from saas_bench.sql_evidence import FORMAT
+        self.sql_evidence_config = (saved_manifest.get('sql_evidence') if continue_from else
+            dict(format=FORMAT, run_id=self.run_id, branch_id='prefix',
+                 data_source_id=uuid.uuid4().hex) if sql_capture else None)
+
+        if self.sql_evidence_config and self.execution_capture and not continue_from:
+            from saas_bench.execution_capture import EXCLUSIONS
+            self.sql_evidence_config.update(capture_scope='execution', file_exclusions=EXCLUSIONS)
 
         # Logs directory
         self.logs_dir = self.workspace_dir / "logs"
@@ -256,11 +314,12 @@ class BashAgentRunner:
                 aws_secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
                 aws_session_token=os.environ.get("AWS_SESSION_TOKEN"),
                 aws_region=os.environ.get("AWS_REGION", "us-east-2"),
+                base_url=self.base_url,
             )
         elif self.provider == "anthropic":
             if not ANTHROPIC_AVAILABLE:
                 raise ImportError("anthropic package required")
-            self.client = anthropic.Anthropic(api_key=self.api_key)
+            self.client = anthropic.Anthropic(api_key=self.api_key, base_url=self.base_url)
         elif self.provider == "ai_sandbox":
             try:
                 from portkey_ai import Portkey
@@ -276,7 +335,14 @@ class BashAgentRunner:
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
             client_kwargs["timeout"] = httpx.Timeout(600.0)  # 10min max per LLM call; retry on timeout
+            if self.provider == 'opencode':
+                client_kwargs['default_headers'] = {
+                    'User-Agent': 'CEO-Bench/1.0',
+                    'x-opencode-session': str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.workspace_dir))),
+                }
             self.client = OpenAI(**client_kwargs)
+
+        self.base_url = str(self.client.base_url)
 
         # Components (initialized in setup)
         self.agent = None
@@ -294,6 +360,30 @@ class BashAgentRunner:
 
     def _http_get(self, path: str, timeout: float = 30) -> Dict:
         req = urllib.request.Request(self._server_url(path))
+        if path == '/dashboard' and self.evidence_store:
+            from saas_bench.execution_capture import ExecutionCapture, CapturedText, origin
+            capture = ExecutionCapture(self.evidence_store)
+            capture.begin('dashboard_acquisition', {'path': path})
+            if capture.event:
+                req.add_header('X-Capture-Context', capture.store.context(capture.event))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read()
+                capture.blob('received', raw, 'program_body')
+                result = json.loads(raw)
+                text = result.get('dashboard', '')
+                source = capture.store.load_state('dashboard') or {}
+                from saas_bench.sql_evidence import digest
+                if source.get('sha256') != digest(text.encode()):
+                    raise ValueError('Dashboard receipt differs from captured generation')
+                version = capture.blob('dashboard', text, 'dashboard', derived_from=source.get('version'))
+                if version:
+                    result['dashboard'] = CapturedText(text, [origin(version, text)] + source.get('origins', []))
+                capture.safe(capture.store.complete, capture.event)
+                return result
+            except Exception as exc:
+                capture.store.fail(exc)
+                raise
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read())
 
@@ -307,21 +397,15 @@ class BashAgentRunner:
         return json.loads(resp.read())
 
     def _get_cash(self) -> float:
-        """Get current cash balance via HTTP query."""
-        try:
-            result = self._http_post('/query', {'sql': 'SELECT SUM(amount) FROM ledger'})
-            if result.get('success') and result.get('data', {}).get('rows'):
-                return result['data']['rows'][0][0] or 0
-        except Exception:
-            pass
-        return 0
+        """Use the same status receipt as the run loop."""
+        return float(self._get_game_status()['cash'])
 
     def _get_game_status(self) -> Dict:
         """Get game status (day, cash, subs, timeout) via HTTP."""
-        try:
-            return self._http_get('/game-status')
-        except Exception:
-            return {"day": 0, "cash": 0, "subscribers": 0, "timed_out": False}
+        result = self._http_get('/game-status')
+        if result.get('operation_failed') or result.get('timed_out') or result.get('operation_in_progress'):
+            raise RuntimeError('World operation outcome unknown; branch stopped')
+        return result
 
     def _get_dashboard(self) -> str:
         """Get current dashboard via HTTP."""
@@ -347,7 +431,7 @@ class BashAgentRunner:
             "timestamp": now(),
             "turn": turn,
             "day": day,
-            "messages_count": len(messages),
+            "messages": messages,
             "raw_response": raw_response,
         }
         with open(self.response_log_file, 'a') as f:
@@ -514,6 +598,7 @@ __pycache__/
                 "--days", str(self.total_days),
                 "--seed", str(self.seed),
                 "--cash", str(self.initial_cash),
+                "--scenario", self.scenario,
             ],
             capture_output=True, text=True, env=env,
         )
@@ -560,13 +645,58 @@ __pycache__/
         """Environment for host-side simulator processes."""
         env = os.environ.copy()
         env["NOVAMIND_SERVER_MODE"] = "1"
-        # DeepSeek / OpenCode agent runs keep the simulator on official DeepSeek
-        # so social/enterprise LLM calls do not require Anthropic and do not
-        # burn the OpenCode Go subscription quota.
+        env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
+        env['CEOBENCH_RUN_KIND'] = self.run_kind
+        env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
+        env['CEOBENCH_SIMULATOR_USAGE_LOG'] = str(self.logs_dir / 'simulator_requests.jsonl')
+        env['CEOBENCH_MODEL_SESSION'] = str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.workspace_dir))) + ':simulator'
+        if self.sql_evidence_config:
+            env['CEOBENCH_SQL_EVIDENCE'] = str(self.workspace_dir / 'sql-evidence.sqlite')
+        else:
+            env.pop('CEOBENCH_SQL_EVIDENCE', None)
+        if getattr(self, '_restored_snapshot_dir', None):
+            env['CEOBENCH_RESTORE_SERVER_STATE'] = str(self._restored_snapshot_dir / 'server_state.json')
+        # Use the selected account for both roles unless explicitly overridden.
         if self.provider in ("deepseek", "opencode"):
-            env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", "deepseek")
-            env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", "deepseek-v4-flash")
+            env.setdefault("CEOBENCH_SIMULATOR_LLM_PROVIDER", self.provider)
+            env.setdefault("CEOBENCH_SIMULATOR_LLM_MODEL", self.model)
         return env
+
+    def _prepare_manifest(self):
+        from dataclasses import asdict
+        from saas_bench.config import SCENARIO_PACKS, ScenarioPack
+        from saas_bench.run_state import verify_build, write_json
+        build = verify_build(self._public_dir(), root=package_root.parent)
+        configuration = {key: getattr(self, key) for key in (
+            'model', 'provider', 'base_url', 'seed', 'scenario', 'total_days',
+            'initial_cash', 'reasoning_effort', 'anthropic_fallback_model', 'run_kind')}
+        configuration['bedrock_region'] = os.environ.get('AWS_REGION', 'us-east-2')
+        config = BenchmarkConfig(seed=self.seed, total_days=self.total_days, initial_cash=self.initial_cash)
+        if self.pricing_registration:
+            config.model_pricing = self.pricing_registration['rates']
+        config.simulator_openai_base_url = os.environ.get('OPENAI_BASE_URL', config.simulator_openai_base_url)
+        config.simulator_anthropic_base_url = os.environ.get('ANTHROPIC_BASE_URL', config.simulator_anthropic_base_url)
+        env = self._server_environment()
+        for suffix in ('provider', 'model'):
+            value = env.get('CEOBENCH_SIMULATOR_LLM_' + suffix.upper())
+            if value:
+                for prefix in ('social_post_llm_', 'enterprise_llm_'):
+                    setattr(config, prefix + suffix, value)
+        manifest = dict(version=1, build=build, configuration=configuration,
+                        benchmark_config=asdict(config), scenario_config=asdict(SCENARIO_PACKS.get(
+                            self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
+        if self.sql_evidence_config:
+            manifest['sql_evidence'] = self.sql_evidence_config
+        if self.pricing_registration:
+            manifest['pricing'] = self.pricing_registration
+        manifest = json.loads(json.dumps(manifest))
+        self._pricing = manifest['benchmark_config']['model_pricing']
+        path = self.workspace_dir / 'manifest.json'
+        if self.continue_from:
+            if json.loads(path.read_text()) != manifest:
+                raise ValueError('Run manifest differs: artifacts or effective configuration changed')
+        else:
+            write_json(path, manifest)
 
     def _launch_server(self):
         """Launch the host-side novamind-operation zipapp in server mode.
@@ -676,199 +806,135 @@ __pycache__/
         return flagged
 
     def _save_checkpoint(self, day: int, fetch_daily_scripts: bool = True):
-        """Save checkpoint for resume capability."""
-        # Tamper detection: log + persist any suspicious files in workspace.
-        tamper_hits = self._check_tamper(day)
-        if tamper_hits:
-            tamper_log = self.workspace_dir / "tamper_alerts.jsonl"
-            entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "day": day,
-                "files": tamper_hits,
-            }
-            with open(tamper_log, "a") as f:
-                f.write(json.dumps(entry) + "\n")
-            print(f"  ⚠️  TAMPER ALERT day {day}: {len(tamper_hits)} suspicious file(s): {tamper_hits[:5]}")
+        """Publish only a complete, quiescent generation; keep the previous one on failure."""
+        from saas_bench.run_state import copy_workspace, file_hash, tree_hash, write_json
+        if self.agent and self.agent._pending_tool_calls:
+            raise RuntimeError('Cannot checkpoint a tool with an unknown outcome')
+        if self.agent:
+            self.agent._save_conversation_snapshot(strict=True)
+        receipt = self._http_post('/checkpoint', {'expected_day': day}, timeout=600)
+        if not receipt.get('success') or receipt.get('day') != day:
+            raise RuntimeError('Server did not acknowledge the requested checkpoint')
+        snapshot_id = receipt['snapshot_id']
+        if len(snapshot_id) != 32 or any(c not in '0123456789abcdef' for c in snapshot_id):
+            raise ValueError('Invalid server snapshot identifier')
+        directory = self.workspace_dir / 'checkpoints' / snapshot_id
+        for name in ('world.nmdb', 'session.json', 'server_state.json'):
+            if file_hash(directory / name) != receipt['files'].get(name):
+                raise ValueError('Server snapshot checksum mismatch: ' + name)
+        shutil.copy2(self.workspace_dir / 'manifest.json', directory / 'manifest.json')
+        receipt['files']['manifest.json'] = file_hash(directory / 'manifest.json')
+        copy_workspace(self.agent_workspace, directory / 'agent_workspace', omit_session_world=self._session_id)
+        request_logs = {}
+        for name in ('agent_requests.jsonl', 'simulator_requests.jsonl'):
+            source = self.logs_dir / name
+            if source.exists():
+                (directory / 'request_logs').mkdir(exist_ok=True)
+                shutil.copy2(source, directory / 'request_logs' / name)
+                request_logs[name] = file_hash(directory / 'request_logs' / name)
+        checkpoint = dict(version=2, day=day, run_id=self.run_id,
+                          session_id=self._session_id, snapshot_id=snapshot_id,
+                          files=receipt['files'], request_logs=request_logs,
+                          workspace_sha256=tree_hash(directory / 'agent_workspace'))
+        if self.sql_evidence_config:
+            evidence = receipt.get('sql_evidence')
+            if not evidence or evidence['identity'] != self.sql_evidence_config:
+                raise ValueError('Missing or mismatched SQL evidence checkpoint')
+            if file_hash(directory / 'sql-evidence.sqlite') != evidence['sha256']:
+                raise ValueError('SQL evidence checkpoint checksum mismatch')
+            checkpoint['sql_evidence'] = evidence
+        checkpoint['context_boundary'] = 'same_week' if self.agent and self.agent.current_day == day else 'new_week'
+        progress = self.workspace_dir / 'operation.json'
+        checkpoint['operation_id'] = json.loads(progress.read_text())['id'] if progress.exists() else None
+        checkpoint['usage'] = self.agent.usage_recorder.summary if self.agent else None
+        for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
+                      'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
+            checkpoint[field] = getattr(self.agent, field, 0)
+        write_json(directory / 'checkpoint.json', checkpoint)
+        write_json(self.workspace_dir / 'checkpoint.json', checkpoint)
+        write_json(self.workspace_dir / 'usage_summary.json', {
+            'snapshot_id': snapshot_id, 'day': day, 'agent': checkpoint['usage'],
+            'simulator': json.loads((directory / 'server_state.json').read_text())['usage']})
 
-        # Get daily scripts from server
-        daily_scripts = {}
-        if fetch_daily_scripts:
-            try:
-                resp = self._http_get('/daily-scripts')
-                if resp.get('success'):
-                    # The GET endpoint returns script names/sizes, not content
-                    # For full content we need to query differently
-                    # For now, save empty — the scripts are also in the session dir
-                    pass
-            except Exception:
-                pass
-
-        checkpoint = {
-            'day': day,
-            'run_id': self.run_id,
-            'model': self.model,
-            'provider': self.provider,
-            'reasoning_effort': self.reasoning_effort,
-            'anthropic_fallback_model': self.anthropic_fallback_model,
-            'seed': self.seed,
-            'scenario': self.scenario,
-            'agent_total_turns': self.agent.total_turns if self.agent else 0,
-            'total_input_tokens': self.agent.total_input_tokens if self.agent else 0,
-            'total_output_tokens': self.agent.total_output_tokens if self.agent else 0,
-            'total_cached_tokens': self.agent.total_cached_tokens if self.agent else 0,
-            'total_reasoning_tokens': self.agent.total_reasoning_tokens if self.agent else 0,
-            'total_anthropic_fallbacks': self.agent.total_anthropic_fallbacks if self.agent else 0,
-            'daily_scripts': daily_scripts,
-            'session_id': self._session_id,
-        }
-        checkpoint_file = self.workspace_dir / "checkpoint.json"
-        with open(checkpoint_file, 'w') as f:
-            json.dump(checkpoint, f, indent=2)
-
-        # Copy session nmdb to run directory for analysis / resume
-        session_nmdb = self.agent_workspace / "sessions" / self._session_id / "world.nmdb"
-        harness_nmdb = self.workspace_dir / "world.nmdb"
+    def _restore_checkpoint_files(self, checkpoint):
+        from saas_bench.run_state import checkpoint_directory, copy_workspace, restore_sql_evidence
+        directory = checkpoint_directory(self.workspace_dir, checkpoint)
+        saved_manifest = json.loads((directory / 'manifest.json').read_text())
+        current_manifest = json.loads((self.workspace_dir / 'manifest.json').read_text())
+        expected_manifest = dict(current_manifest)
+        if (self.sql_evidence_config != saved_manifest.get('sql_evidence') and
+                self.sql_evidence_config and self.sql_evidence_config.get('source_manifest_sha256')):
+            from saas_bench.run_state import file_hash
+            if file_hash(directory / 'manifest.json') != self.sql_evidence_config['source_manifest_sha256']:
+                raise ValueError('Clone source manifest mismatch')
+            expected_manifest['sql_evidence'] = saved_manifest['sql_evidence']
+        if saved_manifest != expected_manifest:
+            raise ValueError('Checkpoint configuration differs from run manifest')
+        if self.sql_evidence_config:
+            restore_sql_evidence(self.workspace_dir, directory, checkpoint, self.sql_evidence_config)
+            controls = directory / 'sql-evidence.controls.jsonl'
+            if controls.exists() and not (self.workspace_dir / controls.name).exists():
+                shutil.copy2(controls, self.workspace_dir / controls.name)
+        staged = self.workspace_dir / ('restore-' + uuid.uuid4().hex)
+        copy_workspace(directory / 'agent_workspace', staged)
+        self._session_id = checkpoint['session_id']
+        session = staged / 'sessions' / self._session_id
+        session.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(directory / 'world.nmdb', session / 'world.nmdb')
+        shutil.copy2(directory / 'session.json', session / 'session.json')
+        previous = self.workspace_dir / ('previous-' + uuid.uuid4().hex)
+        if self.agent_workspace.exists():
+            os.replace(self.agent_workspace, previous)
         try:
-            if session_nmdb.exists():
-                shutil.copy2(session_nmdb, harness_nmdb)
+            os.replace(staged, self.agent_workspace)
         except Exception:
-            pass  # Non-critical
+            if previous.exists():
+                os.replace(previous, self.agent_workspace)
+            raise
+        if previous.exists():
+            shutil.rmtree(previous)
+        for name in checkpoint['request_logs']:
+            shutil.copy2(directory / 'request_logs' / name, self.logs_dir / name)
+        self._restored_snapshot_dir = directory
 
     def _load_checkpoint(self) -> Optional[Dict]:
         """Load checkpoint from disk."""
         checkpoint_file = self.workspace_dir / "checkpoint.json"
         if checkpoint_file.exists():
             with open(checkpoint_file) as f:
-                return json.load(f)
+                checkpoint = json.load(f)
+            progress = self.workspace_dir / 'operation.json'
+            if progress.exists() and json.loads(progress.read_text())['id'] != checkpoint.get('operation_id'):
+                raise ValueError('Uncheckpointed operation outcome unknown; branch cannot resume')
+            return checkpoint
         return None
 
+    def _begin_operation(self, kind, day):
+        from saas_bench.run_state import write_json
+        self._check_capture_health()
+        write_json(self.workspace_dir / 'operation.json', {'id': uuid.uuid4().hex, 'kind': kind, 'day': day})
+
+    def _check_capture_health(self):
+        if self.evidence_store:
+            self.evidence_store.assert_healthy(settle=5)
+        if self.sql_evidence_config:
+            if ((self.workspace_dir / 'sql-evidence.fault.json').exists() or
+                    self._http_get('/health').get('status') != 'ok'):
+                raise RuntimeError('SQL evidence capture failed; collection stopped')
+
     def _restore_from_checkpoint(self, checkpoint: Dict):
-        """Restore state from checkpoint.
-
-        Copies the harness nmdb back to the session directory (so the server
-        loads the correct state), truncates harness log files, and restores
-        agent state.
-        """
-        cp_day = checkpoint['day']
-
-        # Restore session ID
-        self._session_id = checkpoint.get('session_id', self._session_id)
-
-        # Copy harness nmdb back to session directory
-        harness_nmdb = self.workspace_dir / "world.nmdb"
-        session_nmdb = self.agent_workspace / "sessions" / self._session_id / "world.nmdb"
-        if harness_nmdb.exists() and session_nmdb.parent.exists():
-            shutil.copy2(harness_nmdb, session_nmdb)
-            print(f"  Restored DB from checkpoint (day {cp_day})")
-
-        # Update session metadata to reflect checkpoint day
-        session_meta = self.agent_workspace / "sessions" / self._session_id / "session.json"
-        if session_meta.exists():
-            meta = json.loads(session_meta.read_text())
-            meta["current_day"] = cp_day
-            meta["status"] = "created"  # Will be set to "running" when server starts
-            session_meta.write_text(json.dumps(meta, indent=2))
-
-        # Truncate JSONL logs to remove entries from days beyond checkpoint
-        for log_file in [
-            self.logs_dir / f"tool_results_{self.run_id}.jsonl",
-            self.logs_dir / f"raw_responses_{self.run_id}.jsonl",
-            self.logs_dir / f"timing_{self.run_id}.jsonl",
-        ]:
-            if log_file.exists():
-                kept_lines = []
-                with open(log_file, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            entry_day = entry.get('day', 0)
-                            if entry_day <= cp_day:
-                                kept_lines.append(line)
-                        except json.JSONDecodeError:
-                            kept_lines.append(line)
-                with open(log_file, 'w') as f:
-                    for line in kept_lines:
-                        f.write(line + "\n")
-                print(f"  Trimmed {log_file.name}: kept entries for days <= {cp_day}")
-
+        """Restore agent accounting after the server has loaded the saved world."""
         if self.agent:
-            self.agent.total_turns = checkpoint.get('agent_total_turns', 0)
-            self.agent.total_input_tokens = checkpoint.get('total_input_tokens', 0)
-            self.agent.total_output_tokens = checkpoint.get('total_output_tokens', 0)
-            self.agent.total_cached_tokens = checkpoint.get('total_cached_tokens', 0)
-            self.agent.total_reasoning_tokens = checkpoint.get('total_reasoning_tokens', 0)
-            self.agent.total_anthropic_fallbacks = checkpoint.get('total_anthropic_fallbacks', 0)
-
-        # If the crash happened mid-day (last logged tool wasn't a next-week
-        # invocation), suppress the outer loop's force step_day on the resume
-        # iteration so the agent can keep planning instead of being skipped
-        # forward. Cleared after one outer iteration.
-        last_tool = None
-        last_cmd = ""
-        last_result = ""
-        tool_results_file = self.logs_dir / f"tool_results_{self.run_id}.jsonl"
-        if tool_results_file.exists():
-            try:
-                with open(tool_results_file, "rb") as f:
-                    f.seek(0, 2)
-                    size = f.tell()
-                    chunk_size = min(size, 8192)
-                    f.seek(size - chunk_size)
-                    tail = f.read().decode("utf-8", errors="ignore").strip().splitlines()
-                    if tail:
-                        entry = json.loads(tail[-1])
-                        last_tool = entry.get("tool")
-                        last_cmd = (entry.get("arguments", {}) or {}).get("command", "") or ""
-                        last_result = entry.get("result", "") or ""
-            except Exception:
-                pass
-        last_was_next_week = (last_tool == "bash" and "next-week" in last_cmd)
-
-        # If the last logged tool was a ``next-week`` call, decide whether it
-        # actually completed. The server's success response begins with
-        # ``=== Week N Dashboard (Day X) ===`` — a reliable marker. An
-        # interrupted next-week (server timeout, harness crash mid-call) won't
-        # contain that header.
-        last_next_week_finished = (
-            last_was_next_week
-            and isinstance(last_result, str)
-            and "=== Week " in last_result
-        )
-
-        if last_was_next_week and not last_next_week_finished:
-            # next-week was the last action but it didn't complete — recover
-            # by forcing the harness to re-issue /next-week on the resume iter.
-            self._suppress_force_step_day_once = False
-        else:
-            # Either the last next-week finished cleanly (trust the agent to
-            # decide), or the last action wasn't next-week at all (mid-day
-            # crash — the conversation snapshot below will pick up where it
-            # left off).
-            self._suppress_force_step_day_once = True
-
-        print(
-            f"  Last logged tool: {last_tool!r} "
-            f"(next-week={last_was_next_week}, "
-            f"finished={last_next_week_finished if last_was_next_week else 'n/a'}) — "
-            f"force /next-week on resume iter: "
-            f"{'SKIP' if self._suppress_force_step_day_once else 'force'}"
-        )
-
-        # Mid-day resume: if the agent was in the middle of a day (last tool
-        # wasn't next-week), restore its accumulated conversation from the
-        # per-turn snapshot. Day-boundary resume (last_was_next_week=True)
-        # gets a fresh context as usual — _refresh_context() will fire on
-        # the next act() because the conversation is empty.
-        if self.agent and not last_was_next_week:
-            snap = self.agent._snapshot_path
-            if snap and snap.exists():
-                self.agent.load_conversation_snapshot(snap)
+            for field in ('total_turns', 'total_input_tokens', 'total_output_tokens',
+                          'total_cached_tokens', 'total_cache_creation_tokens', 'total_reasoning_tokens', 'total_anthropic_fallbacks'):
+                setattr(self.agent, field, checkpoint[field])
+            self.agent.usage_recorder.summary = checkpoint['usage']
+            if checkpoint['context_boundary'] == 'same_week':
+                if not self.agent.load_conversation_snapshot(self.agent._snapshot_path):
+                    raise ValueError('Cannot restore the checkpoint conversation')
             else:
-                print(f"  [resume] No conversation snapshot at {snap} — "
-                      f"agent will start day {cp_day} with fresh context.")
+                self.agent.reset()
+        self._suppress_force_step_day_once = True
 
     # =========================================================================
     # Setup
@@ -887,56 +953,12 @@ __pycache__/
         """
         from .agent import BashAgent
         from .tools import get_bash_agent_tool_descriptions, BashAgentToolExecutor, NextDayTimeoutError
+        if self.run_kind == 'formal':
+            BashAgentToolExecutor(self.agent_workspace, require_sandbox=True).verify_sandbox()
+            if os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1':
+                raise ValueError('Formal runs cannot enable replay or oracle mode')
+        self._prepare_manifest()
         self._NextDayTimeoutError = NextDayTimeoutError
-
-        # Belt-and-suspenders: if a pre-patch run left legacy files in the
-        # workspace, purge them so the agent always sees the latest layout.
-        # Never let simulator bytecode leak into the workspace.
-        if self.agent_workspace.exists():
-            stale_names = [
-                "_engine",          # pre-L1: bundled engine bytecode
-                "novamind-server",  # pre-zipapp: separate server launcher
-                "novamind_api",     # pre-zipapp: top-level SDK (now docs/novamind_api)
-                "examples",         # pre-zipapp: top-level examples (removed 2026-05-10)
-                "install.sh",       # pre-zipapp: PyInstaller bootstrap
-            ]
-            for stale_name in stale_names:
-                stale_path = self.agent_workspace / stale_name
-                if stale_path.is_dir():
-                    shutil.rmtree(stale_path, ignore_errors=True)
-                elif stale_path.is_file() or stale_path.is_symlink():
-                    try:
-                        stale_path.unlink()
-                    except OSError:
-                        pass
-
-            # Refresh docs/ and novamind-operation from the published build so
-            # resumed sessions pick up the new zipapp + relocated SDK source.
-            # Safe to overwrite: the agent never writes into docs/, and the
-            # old novamind-operation script is incompatible with the new
-            # NOVAMIND_SERVER_MODE dispatch.
-            if self.continue_from:
-                public_dir = self._public_dir()
-                src_docs = public_dir / "docs"
-                dst_docs = self.agent_workspace / "docs"
-                if src_docs.exists():
-                    if dst_docs.exists():
-                        shutil.rmtree(dst_docs, ignore_errors=True)
-                    shutil.copytree(
-                        src_docs, dst_docs,
-                        ignore=shutil.ignore_patterns('__pycache__'),
-                    )
-                src_op = public_dir / "novamind-operation"
-                dst_op = self.agent_workspace / "novamind-operation"
-                if src_op.exists():
-                    if dst_op.exists():
-                        try:
-                            dst_op.unlink()
-                        except OSError:
-                            pass
-                    shutil.copy2(src_op, dst_op)
-                    import stat as _stat
-                    dst_op.chmod(dst_op.stat().st_mode | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH)
 
         # ── Step 1: Copy public/ and create session via CLI ──
         if not self.continue_from:
@@ -945,20 +967,18 @@ __pycache__/
             # Resuming — session already exists, find it
             checkpoint = self._load_checkpoint()
             if checkpoint:
-                self._session_id = checkpoint.get('session_id')
-            if not self._session_id:
-                # Fallback: find session in workspace
-                sessions_dir = self.agent_workspace / "sessions"
-                if sessions_dir.exists():
-                    dirs = sorted(sessions_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True)
-                    if dirs:
-                        self._session_id = dirs[0].name
-
+                self._restore_checkpoint_files(checkpoint)
+            else:
+                raise ValueError('Cannot resume without a complete checkpoint')
         if not self._session_id:
             raise RuntimeError("No session ID found. Cannot proceed.")
 
         # ── Step 2: Launch server subprocess ──
         self._launch_server()
+
+        if self.execution_capture:
+            from saas_bench.sql_evidence import SQLEvidenceStore
+            self.evidence_store = SQLEvidenceStore(self.workspace_dir / 'sql-evidence.sqlite', self.sql_evidence_config)
 
         # ── Step 3: Create tool executor + agent ──
         # Pass NOVAMIND_API_PORT so the CLI (./novamind-operation) connects to
@@ -966,9 +986,12 @@ __pycache__/
         self.tool_executor = BashAgentToolExecutor(
             workspace_path=self.agent_workspace,
             env={"NOVAMIND_API_PORT": str(self._server_port)},
+            require_sandbox=self.run_kind == 'formal', stop_on_timeout=True,
+            evidence_store=self.evidence_store,
         )
 
         tool_descriptions = get_bash_agent_tool_descriptions()
+        from saas_bench.model_usage import ModelUsage
 
         self.agent = BashAgent(
             tool_descriptions=tool_descriptions,
@@ -981,6 +1004,7 @@ __pycache__/
             workspace_path=self.agent_workspace,
             total_days=self.total_days,
             anthropic_fallback_model=self.anthropic_fallback_model,
+            usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing, self.evidence_store),
         )
 
         # Wire the per-session conversation snapshot path. The agent writes
@@ -1029,7 +1053,22 @@ __pycache__/
     # =========================================================================
 
     def run(self, verbose: bool = True) -> Dict[str, Any]:
-        """Run the full simulation."""
+        """Stop the branch on any unknown outcome; never publish partial state."""
+        from saas_bench.run_state import write_json
+        try:
+            return self._run(verbose)
+        except BaseException as exc:
+            write_json(self.workspace_dir / 'branch_stop.json', {'error': type(exc).__name__, 'reason': str(exc)})
+            raise
+        finally:
+            fault_path = self.workspace_dir / 'sql-evidence.fault.json'
+            preserve = bool(getattr(self.tool_executor, 'preserved_process', None))
+            if fault_path.exists():
+                preserve = preserve or json.loads(fault_path.read_text()).get('preserve_scene', False)
+            if not preserve:
+                self._stop_server()
+
+    def _run(self, verbose=True):
         self.setup()
 
         start_day = 1
@@ -1104,8 +1143,10 @@ __pycache__/
             self._log_timing("dashboard", sim_day, elapsed_s=round(_dashboard_elapsed, 3))
 
             # Agent loop for this day
-            observation = dashboard
-            info = {'day': sim_day, 'cash': status.get('cash', self._get_cash())}
+            observation = (self.agent._last_observation
+                           if getattr(self.agent, '_observation_recorded', False) and self.agent.current_day == sim_day
+                           else dashboard)
+            info = {'day': sim_day, 'cash': status['cash']}
             turns_today = 0
             day_ended = False
             _day_llm_total = 0.0
@@ -1120,13 +1161,14 @@ __pycache__/
 
                 # LLM call (timed)
                 _t0 = _time.monotonic()
+                self._begin_operation('model_and_tool', sim_day)
                 action = self.agent.act(observation, 0, False, info)
                 _llm_elapsed = _time.monotonic() - _t0
                 _day_llm_total += _llm_elapsed
-                _day_input_tokens += self.agent.last_input_tokens
-                _day_output_tokens += self.agent.last_output_tokens
-                _day_cached_tokens += self.agent.last_cached_tokens
-                _day_reasoning_tokens += self.agent.last_reasoning_tokens
+                _day_input_tokens += self.agent.last_input_tokens or 0
+                _day_output_tokens += self.agent.last_output_tokens or 0
+                _day_cached_tokens += self.agent.last_cached_tokens or 0
+                _day_reasoning_tokens += self.agent.last_reasoning_tokens or 0
 
                 if action is None:
                     # With the agent's retry-with-feedback loop, _call_* should no
@@ -1171,14 +1213,11 @@ __pycache__/
                 except self._NextDayTimeoutError as e:
                     _tool_elapsed = _time.monotonic() - _t0
                     print(f"\n⚠️  next_week timed out on sim day {sim_day} ({e})")
-                    print(f"Auto-quitting. Saving checkpoint...")
-                    self._save_checkpoint(sim_day)
-                    game_ended = True
-                    game_outcome = 'timeout'
-                    break
+                    raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
                 _tool_elapsed = _time.monotonic() - _t0
                 _day_tool_total += _tool_elapsed
                 observation = result if isinstance(result, str) else json.dumps(result)
+                self.agent.record_tool_result(observation)
 
                 self._log_timing("tool_exec", sim_day, turn=turns_today,
                                  elapsed_s=round(_tool_elapsed, 3),
@@ -1190,6 +1229,7 @@ __pycache__/
                     action.tool, action.arguments or {},
                     observation  # Full result in JSONL (tool already caps at 50K)
                 )
+                self._check_capture_health()
 
                 if verbose:
                     print(f"      → {observation[:200]}")
@@ -1216,11 +1256,7 @@ __pycache__/
 
                 if status.get('timed_out'):
                     print(f"\n⚠️  step_day timed out on sim day {sim_day}")
-                    print(f"Auto-quitting. Saving checkpoint...")
-                    self._save_checkpoint(sim_day)
-                    game_ended = True
-                    game_outcome = 'timeout'
-                    break
+                    raise RuntimeError('Operation outcome unknown after timeout; branch stopped')
 
                 _cash_inner = status.get('cash', 0)
                 info = {'day': sim_day, 'cash': _cash_inner}
@@ -1356,10 +1392,9 @@ __pycache__/
         if final_cash is None:
             final_cash = self._get_cash() if self._server_port else _cash
 
-        # Stop server, then checkpoint so world.nmdb is copied after shutdown
-        # has drained async saves and written the fresh session DB.
+        # Publish while the server can synchronize its complete state.
+        self._save_checkpoint(sim_day)
         self._stop_server()
-        self._save_checkpoint(sim_day, fetch_daily_scripts=False)
 
         if verbose:
             print(f"\n{'='*60}")
@@ -1370,7 +1405,7 @@ __pycache__/
             print(f"Outcome: {game_outcome}")
             print(f"Total Turns: {self.agent.total_turns}")
             _total_cache_pct = (self.agent.total_cached_tokens / self.agent.total_input_tokens * 100) if self.agent.total_input_tokens > 0 else 0
-            print(f"Total Tokens: {self.agent.total_input_tokens:,} input / {self.agent.total_output_tokens:,} output")
+            print('Usage (known subtotals and missing counts): ' + json.dumps(self.agent.usage_recorder.summary))
             print(f"Cached Tokens: {self.agent.total_cached_tokens:,} ({_total_cache_pct:.0f}% of input)")
             print(f"Reasoning Tokens: {self.agent.total_reasoning_tokens:,}")
             if self.anthropic_fallback_model or self.agent.total_anthropic_fallbacks:
@@ -1401,9 +1436,9 @@ def main():
                         choices=["openai", "xai", "google", "anthropic", "bedrock", "modal", "together", "deepseek", "opencode", "ai_sandbox"],
                         help=f"API provider (default: BenchmarkConfig.agent_llm_provider={default_config.agent_llm_provider})")
     parser.add_argument("--base-url", help="Custom API base URL")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--scenario", default="default", help="Scenario name")
-    parser.add_argument("--days", type=int, default=3650, help="Total simulation days")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (new run: 42)")
+    parser.add_argument("--scenario", default=None, help="Scenario name (new run: default)")
+    parser.add_argument("--days", type=int, default=None, help="Total simulation days (new run: 3650)")
     parser.add_argument("--workspace", type=Path, help="Workspace base directory")
     parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
     parser.add_argument("--reasoning-effort",
@@ -1417,6 +1452,11 @@ def main():
                         help="Variant tag stored in config.json and shown on the dashboard "
                              "(e.g. 'leads_x1.25'). Lets multiple config variants be "
                              "distinguished without forking the run_id scheme.")
+    parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
+    parser.add_argument('--pricing-file', type=Path, help='JSON with source, basis, and exact-model USD/1k token rates')
+    parser.add_argument('--execution-capture', action=argparse.BooleanOptionalAction, default=None, help='Capture public receipts, files, Bash and model source occurrences')
+    parser.add_argument('--sql-capture', action=argparse.BooleanOptionalAction, default=None,
+                        help='Privately capture SQL responses; defaults off for new runs')
     args = parser.parse_args()
 
     runner = BashAgentRunner(
@@ -1431,6 +1471,9 @@ def main():
         reasoning_effort=args.reasoning_effort,
         continue_from=args.continue_from,
         label=args.label,
+        run_kind=args.run_kind,
+        pricing_file=args.pricing_file,
+        sql_capture=args.sql_capture, execution_capture=args.execution_capture,
     )
 
     result = runner.run(verbose=not args.quiet)

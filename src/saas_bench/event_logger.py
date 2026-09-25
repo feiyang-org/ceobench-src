@@ -74,7 +74,8 @@ class EventLogger:
         )
 
         self.current_day = 0
-        self._total_llm_cost = 0.0
+        self._total_llm_cost = None
+        self._missing_llm_cost = 0
         self._event_count = 0
 
         # Open JSONL file for streaming writes
@@ -281,7 +282,10 @@ class EventLogger:
     def log_llm_call(self, purpose: str, model: str, input_tokens: int,
                     output_tokens: int, cost_usd: float, details: Optional[Dict] = None):
         """Log a simulation-side LLM call (customer simulation, negotiations, etc.)."""
-        self._total_llm_cost += cost_usd
+        if cost_usd is None:
+            self._missing_llm_cost += 1
+        else:
+            self._total_llm_cost = (self._total_llm_cost or 0) + cost_usd
 
         self._write_event(EventLogEntry(
             timestamp=self._now(),
@@ -292,6 +296,8 @@ class EventLogger:
                 "model": model,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cost_usd": cost_usd,
+                "missing_cost_count": self._missing_llm_cost,
                 **(details or {})
             },
             cost_usd=cost_usd

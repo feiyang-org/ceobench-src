@@ -197,7 +197,7 @@ class BashAgentToolExecutor:
     """Executes bash_agent tools within a working directory."""
 
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
-                 bash_timeout: int = 1200):
+                 bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None):
         """Initialize the tool executor.
 
         Args:
@@ -208,6 +208,23 @@ class BashAgentToolExecutor:
         self.workspace_path = workspace_path
         self.extra_env = env or {}
         self.bash_timeout = bash_timeout
+        self.require_sandbox = require_sandbox
+        self.stop_on_timeout = stop_on_timeout
+        self.evidence_store = evidence_store
+        self.capture = None
+        self.preserved_process = None
+
+    def verify_sandbox(self):
+        if sys.platform != 'linux':
+            raise RuntimeError('Formal runs require Linux and bubblewrap')
+        self.workspace_path.mkdir(parents=True, exist_ok=True)
+        env = {'PATH': os.path.join(sys.prefix, 'bin') + os.pathsep + os.defpath}
+        command = self._build_bwrap_cmd('true', str(self.workspace_path), env)
+        if command is None:
+            raise RuntimeError('Formal runs require bubblewrap')
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise RuntimeError('Bubblewrap startup failed: ' + result.stderr)
 
     def execute(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Execute a tool and return the result string."""
@@ -222,12 +239,71 @@ class BashAgentToolExecutor:
         handler = dispatch.get(tool_name)
         if handler is None:
             return f"Error: Unknown tool '{tool_name}'"
+        if self.evidence_store:
+            self.evidence_store.assert_healthy(quiescent=False)
+        from saas_bench.execution_capture import ExecutionCapture, CURRENT_EVENT
+        capture = ExecutionCapture(self.evidence_store) if self.evidence_store else None
+        self.capture = capture
+        previous_env = dict(self.extra_env)
+        token = None
+        before = None
+        result, status = '', 'succeeded'
         try:
-            return handler(args)
+            if capture:
+                capture.begin(tool_name, args)
+                token = CURRENT_EVENT.set(capture.event)
+                if capture.event:
+                    context = capture.safe(capture.store.context, capture.event)
+                    if context:
+                        self.extra_env['NOVAMIND_CAPTURE_CONTEXT'] = context
+                if tool_name in ('bash', 'write_file', 'edit_file'):
+                    before = capture.safe(capture.snapshot, self.workspace_path, 'before')
+                if tool_name == 'bash':
+                    capture.facts['capture_gaps'] = [
+                        'unobserved_internal_file_reads', 'unobserved_intermediate_file_versions',
+                        'unobserved_pipe_streams', 'unobserved_program_data_dependencies']
+            result = handler(args)
+            if tool_name != 'bash' and result.startswith('Error:'):
+                status = 'failed'
+            elif capture and capture.facts.get('timed_out'):
+                status = 'timed_out'
+            elif capture and capture.facts.get('exit_code', 0):
+                status = 'failed'
         except NextDayTimeoutError:
+            result = None
+            status = 'result_unknown'
             raise
-        except Exception as e:
-            return f"Error: {e}"
+        except Exception as exc:
+            result, status = f"Error: {exc}", 'failed'
+        finally:
+            if capture:
+                if before is not None:
+                    after = capture.safe(capture.snapshot, self.workspace_path, 'after')
+                    if after is not None:
+                        capture.facts['changed_paths'] = sorted(k for k in before.keys() | after.keys()
+                            if {x:v for x,v in before.get(k, {}).items() if x != 'version'} !=
+                               {x:v for x,v in after.get(k, {}).items() if x != 'version'})
+                result = capture.finish(result, status)
+                if status == 'result_unknown':
+                    capture.store.fail('Execution outcome unknown; branch paused')
+            if token is not None:
+                CURRENT_EVENT.reset(token)
+            self.extra_env = previous_env
+            self.capture = None
+        return result
+
+    def _read_text(self, path):
+        from saas_bench.execution_capture import decoded
+        raw = path.read_bytes()
+        raw_version = self.capture.file(str(path.relative_to(self.workspace_path)), raw) if self.capture else None
+        text = decoded(raw)
+        version = self.capture.blob(f'file_{self.capture.slots}_text', text, 'file_text', derived_from=raw_version) if self.capture else None
+        return text, version
+
+    def _source(self, version, text, start, end, target):
+        if self.capture and version:
+            from saas_bench.execution_capture import origin
+            self.capture.origins.append(origin(version, text, start, end, target))
 
     def _resolve_path(self, path_str: str) -> Path:
         """Resolve a path relative to the workspace, preventing escape."""
@@ -238,7 +314,7 @@ class BashAgentToolExecutor:
             resolved = (self.workspace_path / p).resolve()
         # Ensure it's within workspace
         ws_resolved = self.workspace_path.resolve()
-        if not str(resolved).startswith(str(ws_resolved)):
+        if not resolved.is_relative_to(ws_resolved):
             raise ValueError(f"Path escapes workspace: {path_str}")
         return resolved
 
@@ -272,6 +348,8 @@ class BashAgentToolExecutor:
         import shutil
         bwrap = shutil.which('bwrap')
         if not bwrap:
+            if self.require_sandbox:
+                raise RuntimeError('Formal runs require bubblewrap')
             return None  # Fall back to unsandboxed execution
 
         env = self._scrub_sandbox_env(env)
@@ -323,6 +401,17 @@ class BashAgentToolExecutor:
         # fixed path inside the sandbox and prepended to PYTHONPATH so
         # site.py picks up sitecustomize on every interpreter start.
         sandbox_init_host = self._SANDBOX_INIT_DIR
+        if not sandbox_init_host.is_dir():
+            # The server also uses this executor from inside the zipapp.
+            import pkgutil
+            import tempfile
+            if not hasattr(self, '_sandbox_resources'):
+                self._sandbox_resources = tempfile.TemporaryDirectory(prefix='novamind-sandbox-')
+                data = pkgutil.get_data('saas_bench.agents.bash_agent', '_sandbox_init/sitecustomize.py')
+                if data is None:
+                    raise RuntimeError('Sandbox import blocker is missing')
+                (Path(self._sandbox_resources.name) / 'sitecustomize.py').write_bytes(data)
+            sandbox_init_host = Path(self._sandbox_resources.name)
         sandbox_init_guest = "/opt/_sandbox_init"
         if sandbox_init_host.is_dir():
             cmd.extend(['--ro-bind', str(sandbox_init_host), sandbox_init_guest])
@@ -377,7 +466,17 @@ class BashAgentToolExecutor:
         if not command:
             return "Error: No command provided"
 
+        from saas_bench.process_boundary import Boundary
+        boundary = Boundary(command)
+        try:
+            return self._run_bash(command, boundary)
+        finally:
+            boundary.close()
+
+    def _run_bash(self, command, boundary):
+        from saas_bench.process_boundary import BoundaryOpen
         ws = str(self.workspace_path)
+        supervised_command = boundary.command
 
         # Build a minimal, sandboxed environment.
         # Start from scratch — do NOT inherit os.environ (which contains
@@ -396,12 +495,14 @@ class BashAgentToolExecutor:
         env = self._scrub_sandbox_env(env)
 
         # Try bwrap sandbox; fall back to basic Popen if unavailable
-        bwrap_cmd = self._build_bwrap_cmd(command, ws, env)
+        bwrap_cmd = self._build_bwrap_cmd(supervised_command, ws, env)
 
         # Use Popen so we can explicitly kill the process group on timeout.
         # subprocess.run() does NOT kill children on TimeoutExpired, leaving
         # zombie processes that can hold DB locks or resources.
         import signal
+        if self.capture:
+            self.capture.facts['process_started'] = False
         if bwrap_cmd:
             # CRITICAL: pass env=env so bwrap inherits a clean dict.
             # Without this, bwrap inherits the launcher's full os.environ —
@@ -414,22 +515,27 @@ class BashAgentToolExecutor:
                 bwrap_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                text=False,
                 env=env,
                 start_new_session=True,
             )
         else:
             proc = subprocess.Popen(
-                ['bash', '-c', command],
+                ['bash', '-c', supervised_command],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                text=False,
                 cwd=ws,
                 env=env,
                 start_new_session=True,
             )
+        if self.capture:
+            self.capture.facts.update(process_started=True, pid=proc.pid)
         try:
-            stdout, stderr = proc.communicate(timeout=self.bash_timeout)
+            raw_stdout, raw_stderr = boundary.communicate(proc, self.bash_timeout)
+            if self.capture:
+                self.capture.facts['process_boundary'] = boundary.record
+            stdout, stderr = self._streams(raw_stdout, raw_stderr, proc.returncode)
 
             output_parts = []
             if stdout:
@@ -442,66 +548,61 @@ class BashAgentToolExecutor:
             output = '\n'.join(output_parts) if output_parts else "(no output)"
 
             # Truncate very long output (same limit as Claude Code: 30K chars)
+            if self.capture:
+                self.capture.origins = self._stream_origins(stdout, stderr)
             if len(output) > 30000:
+                if self.capture:
+                    from saas_bench.execution_capture import slice_origins
+                    marker = '\n\n... (output truncated — exceeded 30,000 character limit) ...\n\n'
+                    self.capture.origins = (slice_origins(self.capture.origins, 0, 15000) +
+                        slice_origins(self.capture.origins, len(output) - 15000, len(output), 15000 + len(marker)))
                 output = output[:15000] + "\n\n... (output truncated — exceeded 30,000 character limit) ...\n\n" + output[-15000:]
 
-            # Engine-level next-week timeout: api_server's STEP_WEEK_TIMEOUT
-            # fired (step_week didn't return within ~70min). The bash command
-            # exits cleanly with returncode=1 and "step_week_timeout" in
-            # stderr — the bash subprocess didn't hang, the engine did. Raise
-            # NextDayTimeoutError so the harness ends the run instead of
-            # letting the agent retry into a wedged engine.
-            if (
-                './novamind-operation next-week' in command
-                and proc.returncode != 0
-                and ('step_week_timeout' in output or 'step_day_timeout' in output)
-            ):
-                raise NextDayTimeoutError(
-                    "next_week engine-side timeout (step_week_timeout)",
-                    partial_stdout=stdout or "",
-                    partial_stderr=stderr or "",
-                )
+            port = self.extra_env.get('NOVAMIND_API_PORT')
+            if port and int(port) > 0:
+                import json
+                import urllib.request
+                with urllib.request.urlopen(f'http://127.0.0.1:{int(port)}/game-status', timeout=5) as response:
+                    state = json.load(response)
+                if state.get('timed_out') or state.get('operation_failed'):
+                    raise NextDayTimeoutError('Server operation outcome unknown',
+                                              partial_stdout=stdout, partial_stderr=stderr)
 
             return output
 
-        except subprocess.TimeoutExpired:
-            # Capture any partial output before killing
-            partial_stdout = ""
-            partial_stderr = ""
+        except BoundaryOpen as exc:
+            self._preserve_process(proc, exc.record)
             try:
-                # Read whatever's in the pipe buffers
-                import selectors
-                sel = selectors.DefaultSelector()
-                sel.register(proc.stdout, selectors.EVENT_READ)
-                sel.register(proc.stderr, selectors.EVENT_READ)
-                while sel.select(timeout=0.1):
-                    for key, _ in sel.select(timeout=0):
-                        data = key.fileobj.read1(65536) if hasattr(key.fileobj, 'read1') else ''
-                        if key.fileobj == proc.stdout:
-                            partial_stdout += data if isinstance(data, str) else data.decode('utf-8', errors='replace')
-                        else:
-                            partial_stderr += data if isinstance(data, str) else data.decode('utf-8', errors='replace')
-                sel.close()
-            except Exception:
-                pass
-
+                self._streams(exc.stdout, exc.stderr, exc.record['exit_code'], partial=True)
+            except UnicodeError:
+                pass  # Raw streams were retained; decoding cannot close an open execution.
+            raise NextDayTimeoutError(str(exc), partial_stdout=repr(exc.stdout), partial_stderr=repr(exc.stderr))
+        except subprocess.TimeoutExpired:
             # Kill the entire process group (bash + all children)
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-            proc.kill()  # Fallback: kill the direct child
             try:
-                proc.wait(timeout=5)  # Reap the zombie
-            except Exception:
-                pass
-
-            # If command is ./novamind-operation next-week, raise to kill the run
-            if './novamind-operation next-week' in command:
+                proc.kill()  # Fallback: kill the direct child
+            except OSError as exc:
+                self._preserve_process(proc, dict(unknown='process cleanup failed: ' + str(exc)))
+                raise NextDayTimeoutError('Process cleanup failed; outcome unknown') from exc
+            try:
+                raw_stdout, raw_stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired as exc:
+                self._preserve_process(proc, dict(unknown='second stream collection timed out'))
+                self._streams(exc.output or b'', exc.stderr or b'', proc.poll(), partial=True)
+                raise NextDayTimeoutError('Process cleanup did not finish; outcome unknown',
+                    partial_stdout=repr(exc.output), partial_stderr=repr(exc.stderr))
+            partial_stdout, partial_stderr = self._streams(raw_stdout, raw_stderr, proc.returncode)
+            if self.capture:
+                self.capture.facts['timed_out'] = True
+            if self.stop_on_timeout or './novamind-operation next-week' in command:
                 raise NextDayTimeoutError(
-                    f"next_week timed out after {self.bash_timeout}s",
-                    partial_stdout=partial_stdout,
-                    partial_stderr=partial_stderr,
+                    f"Tool timed out after {self.bash_timeout}s; outcome unknown",
+                    partial_stdout=partial_stdout or "",
+                    partial_stderr=partial_stderr or "",
                 )
 
             # For all other commands: return partial output + timeout message
@@ -513,6 +614,37 @@ class BashAgentToolExecutor:
             output_parts.append(f"Error: Command timed out after {self.bash_timeout} seconds")
             return '\n'.join(output_parts)
 
+    def _preserve_process(self, proc, record):
+        self.preserved_process = proc
+        if self.capture:
+            self.capture.facts.update(process_boundary=record, boundary_closed=False, preserved_pid=proc.pid)
+            self.capture.store.fail('Process boundary unresolved; branch paused')
+            self.capture.store.fault.update(preserve_scene=True, supervisor_pid=proc.pid, process_boundary=record)
+            from saas_bench.run_state import write_json
+            write_json(self.capture.store.fault_path, self.capture.store.fault)
+
+    def _streams(self, stdout, stderr, exit_code, partial=False):
+        from saas_bench.execution_capture import decoded
+        if self.capture:
+            self.capture.facts['exit_code'] = exit_code
+            self.capture.blob('stdout_bytes', stdout, 'stdout_bytes', extent='partial' if partial else 'full')
+            self.capture.blob('stderr_bytes', stderr, 'stderr_bytes', extent='partial' if partial else 'full')
+        out, err = decoded(stdout), decoded(stderr)
+        if self.capture:
+            self.capture.blob('stdout', out, 'stdout', derived_from=self.capture.event + ':stdout_bytes', extent='partial' if partial else 'full')
+            self.capture.blob('stderr', err, 'stderr', derived_from=self.capture.event + ':stderr_bytes', extent='partial' if partial else 'full')
+        return out, err
+
+    def _stream_origins(self, stdout, stderr):
+        from saas_bench.execution_capture import origin
+        result = []
+        if stdout:
+            result.append(origin(self.capture.event + ':stdout', stdout))
+        if stderr:
+            result.append(origin(self.capture.event + ':stderr', stderr,
+                                 target=(len(stdout) + 1 if stdout else 0) + len('[stderr]\n')))
+        return result
+
     def _exec_read_file(self, args: Dict) -> str:
         """Read file contents."""
         path = self._resolve_path(args['path'])
@@ -521,11 +653,13 @@ class BashAgentToolExecutor:
         if not path.is_file():
             return f"Error: Not a file: {args['path']}"
 
-        content = path.read_text()
+        content, version = self._read_text(path)
         lines = content.split('\n')
 
         offset = args.get('offset', 1)
         limit = args.get('limit')
+        if type(offset) is not int or offset < 1 or (limit is not None and (type(limit) is not int or limit < 1)):
+            return 'Error: offset and limit must be positive integers'
 
         # Apply offset (1-indexed)
         start = max(0, offset - 1)
@@ -537,8 +671,14 @@ class BashAgentToolExecutor:
 
         # Format with line numbers
         numbered = []
+        source_start = sum(len(line) + 1 for line in content.split('\n')[:start])
+        target = 0
         for i, line in enumerate(lines, start=start + 1):
-            numbered.append(f"{i:6d}\t{line}")
+            prefix = f'{i:6d}\t'
+            self._source(version, content, source_start, source_start + len(line), target + len(prefix))
+            numbered.append(prefix + line)
+            source_start += len(line) + 1
+            target += len(prefix) + len(line) + 1
 
         return '\n'.join(numbered)
 
@@ -547,7 +687,7 @@ class BashAgentToolExecutor:
         path = self._resolve_path(args['path'])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(args['content'])
-        return f"File written: {args['path']} ({len(args['content'])} bytes)"
+        return f"File written: {args['path']} ({path.stat().st_size} bytes)"
 
     def _exec_edit_file(self, args: Dict) -> str:
         """Edit a file by replacing old_string with new_string."""
@@ -555,7 +695,7 @@ class BashAgentToolExecutor:
         if not path.exists():
             return f"Error: File not found: {args['path']}"
 
-        content = path.read_text()
+        content, version = self._read_text(path)
         old_str = args['old_string']
         new_str = args['new_string']
 
@@ -590,22 +730,43 @@ class BashAgentToolExecutor:
         else:
             files = sorted(resolved.rglob(glob_filter))
 
+        target = 0
+        scanned, skipped = [], []
         for fpath in files[:100]:  # Limit file count
+            try:
+                self._resolve_path(str(fpath))
+            except ValueError:
+                skipped.append(str(fpath))
+                continue
             if not fpath.is_file():
                 continue
             try:
-                content = fpath.read_text()
+                content, version = self._read_text(fpath)
+                scanned.append(str(fpath))
             except (UnicodeDecodeError, PermissionError):
+                skipped.append(str(fpath))
                 continue
+            source_start = 0
             for i, line in enumerate(content.split('\n'), 1):
                 if regex.search(line):
                     rel = fpath.relative_to(self.workspace_path)
-                    matches.append(f"{rel}:{i}: {line}")
+                    prefix = f"{rel}:{i}: "
+                    self._source(version, content, source_start, source_start + len(line), target + len(prefix))
+                    matches.append(prefix + line)
+                    target += len(prefix) + len(line) + 1
                     if len(matches) >= 200:
                         break
+                source_start += len(line) + 1
             if len(matches) >= 200:
                 break
 
+        if self.capture:
+            self.capture.facts.update(scanned=scanned, skipped=skipped, candidates=len(files),
+                                      source_truncated=len(files) > 100 or len(matches) >= 200)
+        if len(files) > 100 or len(matches) >= 200:
+            matches.append('[Search truncated: at most 100 candidates and 200 matches.]')
+        if skipped:
+            matches.append(f'[Skipped {len(skipped)} unreadable or out-of-workspace candidates.]')
         if not matches:
             return "No matches found."
         return '\n'.join(matches)
@@ -613,14 +774,21 @@ class BashAgentToolExecutor:
     def _exec_glob_files(self, args: Dict) -> str:
         """Find files matching a glob pattern."""
         pattern = args['pattern']
+        if Path(pattern).is_absolute() or '..' in Path(pattern).parts:
+            return 'Error: Glob must stay within workspace'
         matches = sorted(self.workspace_path.glob(pattern))
         if not matches:
             return "No matching files."
         result = []
         for m in matches[:200]:
             try:
+                self._resolve_path(str(m))
                 rel = m.relative_to(self.workspace_path)
                 result.append(str(rel))
             except ValueError:
-                result.append(str(m))
+                result.append('[Skipped out-of-workspace path]')
+        if len(matches) > 200:
+            result.append('[Glob truncated: first 200 paths.]')
+        if self.capture:
+            self.capture.facts.update(candidates=len(matches), source_truncated=len(matches) > 200)
         return '\n'.join(result)

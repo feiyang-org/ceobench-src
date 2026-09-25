@@ -6,6 +6,8 @@ Two entry points:
 """
 
 import argparse
+from .novamind_api._capture import observed, urlopen, print
+
 import json
 import os
 import shutil
@@ -25,6 +27,7 @@ def _get_workspace() -> Path:
 # novamind-operation CLI
 # =========================================================================
 
+@observed
 def _cmd_next_week(args):
     """Advance the simulator by one week (7 days) — REQUIRES a rationale string
     plus cash predictions at four horizons, each with point estimate + 95% CI bounds.
@@ -151,6 +154,7 @@ def _daily_scripts_dir() -> Path:
     return d
 
 
+@observed
 def _cmd_register_daily_script(args):
     """Register a Python script to run automatically at the start of each day.
 
@@ -191,6 +195,7 @@ def _cmd_register_daily_script(args):
                           "warning": "Snapshot not saved to server"}))
 
 
+@observed
 def _cmd_list_daily_scripts(args):
     """List all registered daily scripts.
 
@@ -214,6 +219,7 @@ def _cmd_list_daily_scripts(args):
         print(json.dumps({"scripts": result}))
 
 
+@observed
 def _cmd_remove_daily_script(args):
     """Remove a registered daily script.
 

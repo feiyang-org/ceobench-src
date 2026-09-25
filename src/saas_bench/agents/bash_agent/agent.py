@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, asdict
 
 from ..base import BaseAgent
 from ...environment import Action
+from ...model_usage import ModelUsage, usage_values
 
 
 @dataclass
@@ -29,7 +30,7 @@ class Message:
 
 
 # Regex to detect dashboard in bash output (day advancement)
-_DASHBOARD_RE = re.compile(r'=== Day (\d+) Dashboard ===')
+_DASHBOARD_RE = re.compile(r'=== (?:Day (\d+) Dashboard|Week \d+ Dashboard \(Day (\d+)\)) ===')
 
 
 class BashAgent(BaseAgent):
@@ -57,9 +58,14 @@ class BashAgent(BaseAgent):
         workspace_path: Optional[Path] = None,
         total_days: int = 3650,
         anthropic_fallback_model: Optional[str] = None,
+        usage_recorder: Optional[ModelUsage] = None,
     ):
+        if not tool_descriptions:
+            raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
         super().__init__(tool_descriptions)
         self.client = client
+        self.usage_recorder = usage_recorder or ModelUsage(None, 'agent')
+        self.usage_recorder.attach(client)
         self.model = model
         self.max_turns_per_day = max_turns_per_day
         self.response_callback = response_callback
@@ -93,7 +99,7 @@ class BashAgent(BaseAgent):
 
         # Agent state
         self.conversation: List[Message] = []
-        self.current_day: int = 0
+        self.current_day: int = -1
         self.turns_today: int = 0
         self._pending_tool_calls: List[Dict] = []
         self._last_observation: str = ""
@@ -107,10 +113,12 @@ class BashAgent(BaseAgent):
         self.total_output_tokens: int = 0
         self.total_cached_tokens: int = 0
         self.total_reasoning_tokens: int = 0
-        self.last_input_tokens: int = 0
-        self.last_output_tokens: int = 0
-        self.last_cached_tokens: int = 0
-        self.last_reasoning_tokens: int = 0
+        self.total_cache_creation_tokens = 0
+        self.last_input_tokens = None
+        self.last_output_tokens = None
+        self.last_cached_tokens = None
+        self.last_reasoning_tokens = None
+        self.last_cache_creation_tokens = None
         self.last_serving_model: str = model
         self.last_anthropic_fallback_used: bool = False
         self.last_anthropic_fallbacks: List[Dict[str, str]] = []
@@ -168,17 +176,30 @@ class BashAgent(BaseAgent):
                 prompt = oracle_preamble + "\n\n" + prompt
         return prompt
 
-    def _get_system_prompt_with_memory(self) -> str:
-        """Return system prompt with MEMORY.md contents appended.
+    @property
+    def evidence_store(self):
+        return getattr(getattr(self, 'usage_recorder', None), 'evidence_store', None)
 
-        MEMORY.md is always injected into the system prompt so the agent
-        has its persistent notes available without needing to read the file.
-        """
+    def _get_system_prompt_with_memory(self) -> str:
+        """Read MEMORY.md once when building a new week's system prompt."""
         prompt = self.system_prompt
         memory_path = self.workspace_path / 'MEMORY.md'
         if memory_path.exists():
             try:
-                memory_content = memory_path.read_text().strip()
+                original_memory = memory_path.read_bytes()
+                from saas_bench.execution_capture import ExecutionCapture, CapturedText, decoded, origin
+                memory_text = decoded(original_memory)
+                memory_content = memory_text.strip()
+                memory_origin = None
+                if self.evidence_store:
+                    capture = ExecutionCapture(self.evidence_store)
+                    capture.begin('memory_read', {'path': 'MEMORY.md'})
+                    memory_version = capture.file('MEMORY.md', original_memory, memory_text)
+                    if memory_version and memory_content:
+                        begin = len(memory_text) - len(memory_text.lstrip())
+                        memory_origin = origin(memory_version, memory_text, begin, begin + min(40000, len(memory_content)))
+                    if capture.event:
+                        capture.safe(capture.store.complete, capture.event)
                 if memory_content:
                     max_memory_chars = 40_000
                     if len(memory_content) > max_memory_chars:
@@ -193,19 +214,37 @@ class BashAgent(BaseAgent):
                         "This is automatically loaded into your context at the start of every day.\n\n"
                         f"{memory_content}"
                     )
-            except Exception:
-                pass
+                    if memory_origin:
+                        length = memory_origin['request_range'][1]
+                        offset = len(prompt) - len(memory_content)
+                        memory_origin['request_range'] = [offset, offset + length]
+                        prompt = CapturedText(prompt, [memory_origin])
+            except Exception as exc:
+                if self.evidence_store:
+                    self.evidence_store.fail(exc)
+        return prompt
+
+    def _context_system_prompt(self) -> str:
+        """Reuse the frozen prompt, including its private source ranges."""
+        for message in self.conversation:
+            if message.role == 'system':
+                return message.content
+        # Legacy snapshots may have no system message. Freeze once on migration.
+        prompt = self._get_system_prompt_with_memory()
+        self.conversation.insert(0, Message(role='system', content=prompt))
         return prompt
 
     def reset(self):
         """Reset agent state for a new episode."""
         self.conversation = []
-        self.current_day = 0
+        self.current_day = -1
         self.turns_today = 0
         self._pending_tool_calls = []
         self._last_observation = ""
+        self._observation_recorded = False
         self._day_advanced = False
         self._new_dashboard = ""
+        self._skip_next_refresh = False
 
     def _refresh_context(self, dashboard: str, new_day: int):
         """Refresh conversation context for a new day.
@@ -214,14 +253,13 @@ class BashAgent(BaseAgent):
         The agent reads its own files via tools when it needs context.
         """
         self.conversation = []
+        if self.evidence_store:
+            import uuid
+            self.usage_recorder.context_id = uuid.uuid4().hex
         self._pending_tool_calls = []
+        self._observation_recorded = False
 
-        if not self.use_anthropic:
-            # OpenAI: system prompt goes in messages
-            self.conversation.append(Message(
-                role='system',
-                content=self._get_system_prompt_with_memory(),
-            ))
+        self._context_system_prompt()
 
     def check_day_advanced(self, bash_output: str) -> bool:
         """Check if bash output contains a dashboard (day advanced).
@@ -231,12 +269,16 @@ class BashAgent(BaseAgent):
         """
         match = _DASHBOARD_RE.search(bash_output)
         if match:
-            new_day = int(match.group(1))
+            new_day = int(match.group(1) or match.group(2))
             if new_day > self.current_day:
                 self._day_advanced = True
                 # Extract dashboard from the output (everything from === Day N ===)
-                dashboard_start = bash_output.index(f"=== Day {new_day} Dashboard ===")
+                dashboard_start = match.start()
                 self._new_dashboard = bash_output[dashboard_start:]
+                if hasattr(bash_output, 'origins'):
+                    from saas_bench.execution_capture import CapturedText, slice_origins
+                    self._new_dashboard = CapturedText(self._new_dashboard,
+                        slice_origins(bash_output.origins, dashboard_start, len(bash_output)))
                 return True
         return False
 
@@ -284,6 +326,38 @@ class BashAgent(BaseAgent):
             return Action(tool='bash', arguments={'command': './novamind-operation next-week'})
 
         # If we have pending tool call results to process, add them
+        if getattr(self, '_observation_recorded', False):
+            self._observation_recorded = False
+        else:
+            self.record_tool_result(observation)
+            self._observation_recorded = False
+
+        # Call LLM
+        self._llm_attempt = 0
+        action = self._call_llm()
+        self.turns_today += 1
+
+        # Persist conversation snapshot so a mid-day crash can be resumed
+        # with the exact accumulated context. Best-effort: failure here must
+        # not derail the run, just log.
+        self._save_conversation_snapshot()
+
+        return action
+
+    def _request_model(self, api, request, invoke):
+        self._llm_attempt = getattr(self, '_llm_attempt', 0) + 1
+        try:
+            response = self.usage_recorder.call(api, request, invoke, day=self.current_day,
+                                                turn=self.total_turns + 1, outer_attempt=self._llm_attempt)
+        finally:
+            for field in ('input_tokens', 'output_tokens', 'cached_tokens', 'cache_creation_tokens', 'reasoning_tokens'):
+                setattr(self, 'total_' + field, self.usage_recorder.summary['known'][field] or 0)
+        for field, value in usage_values(response, api).items():
+            setattr(self, 'last_' + field, value)
+        return response
+
+    def record_tool_result(self, observation):
+        """Attach a completed result before making a resumable checkpoint."""
         if self._pending_tool_calls:
             if self.use_anthropic:
                 partial_results = self._pending_tool_calls[0].get('_partial_results', [])
@@ -313,16 +387,8 @@ class BashAgent(BaseAgent):
                 content=observation
             ))
 
-        # Call LLM
-        action = self._call_llm()
-        self.turns_today += 1
-
-        # Persist conversation snapshot so a mid-day crash can be resumed
-        # with the exact accumulated context. Best-effort: failure here must
-        # not derail the run, just log.
-        self._save_conversation_snapshot()
-
-        return action
+        self._last_observation = observation
+        self._observation_recorded = True
 
     def _serialize_content_item(self, item: Any) -> Any:
         """Convert a single content item to a JSON-safe form.
@@ -356,7 +422,7 @@ class BashAgent(BaseAgent):
             "name": m.name,
         }
 
-    def _save_conversation_snapshot(self) -> None:
+    def _save_conversation_snapshot(self, strict=False) -> None:
         """Atomically write self.conversation + minimal turn state to disk.
 
         Overwrites the same file each call (single snapshot, not append-only).
@@ -376,7 +442,8 @@ class BashAgent(BaseAgent):
                 "current_day": self.current_day,
                 "turns_today": self.turns_today,
                 "total_turns": self.total_turns,
-                "last_observation_preview": (self._last_observation or "")[:2000],
+                "last_observation": self._last_observation,
+                "observation_recorded": getattr(self, "_observation_recorded", False),
                 "saved_at": time.time(),
             }
             tmp_path = self._snapshot_path.with_suffix(self._snapshot_path.suffix + ".tmp")
@@ -384,17 +451,25 @@ class BashAgent(BaseAgent):
             with open(tmp_path, "w") as f:
                 json.dump(payload, f)
             os.replace(tmp_path, self._snapshot_path)
+            if self.evidence_store:
+                from saas_bench.execution_capture import text_sources
+                from saas_bench.sql_evidence import digest
+                self.evidence_store.save_state('agent_sources',
+                    dict(snapshot_sha256=digest(self._snapshot_path.read_bytes()),
+                         context_id=self.usage_recorder.context_id, sources=text_sources(payload)))
         except Exception as e:
-            # Never let snapshot failure kill the run.
+            if self.evidence_store:
+                self.evidence_store.fail(e)
+            if strict:
+                raise
+            # Per-turn best effort files are not published checkpoints.
             print(f"[snapshot] WARN failed to save conversation snapshot: {e}")
 
     def load_conversation_snapshot(self, path: Path) -> bool:
         """Restore self.conversation + turn state from a snapshot file.
 
-        Drops any trailing assistant message that contains tool_calls (the
-        in-flight tool was never executed/recorded, so we discard it). Clears
-        _pending_tool_calls. Sets _skip_next_refresh so the next act() does
-        not wipe the restored conversation.
+        Rejects unresolved tool calls. Completed tool results are kept and
+        the same-week observation is not inserted a second time.
 
         Returns True if restoration succeeded, False otherwise.
         """
@@ -403,6 +478,14 @@ class BashAgent(BaseAgent):
         try:
             with open(path, "r") as f:
                 payload = json.load(f)
+            if self.evidence_store:
+                from saas_bench.execution_capture import restore_sources
+                from saas_bench.sql_evidence import digest
+                state = self.evidence_store.load_state('agent_sources')
+                if not state or state['snapshot_sha256'] != digest(path.read_bytes()):
+                    raise ValueError('Missing or mismatched private source state')
+                restore_sources(payload, state['sources'])
+                self.usage_recorder.context_id = state['context_id']
             raw_msgs = payload.get("conversation", [])
             msgs: List[Message] = []
             for m in raw_msgs:
@@ -414,41 +497,18 @@ class BashAgent(BaseAgent):
                     name=m.get("name"),
                 ))
 
-            def _has_in_flight_tool_call(msg: "Message") -> bool:
-                """Detect an assistant turn whose tool call was never executed.
-
-                Covers two shapes:
-                  - chat-completions style:  msg.tool_calls is set
-                  - Responses API style:    msg.content is a list containing
-                    `{'type': 'function_call', ...}` items
-                """
-                if msg.role != "assistant":
-                    return False
-                if msg.tool_calls:
-                    return True
-                if isinstance(msg.content, list):
-                    for item in msg.content:
-                        t = item.get("type") if isinstance(item, dict) else getattr(item, "type", "")
-                        if t == "function_call":
-                            return True
-                return False
-
-            # Drop trailing assistant w/ in-flight tool_call — that tool was
-            # never executed at crash time, so discarding leaves us at "right
-            # after the previous tool_result was delivered" — a clean re-entry
-            # point. The next LLM call regenerates from the prior context.
-            dropped = 0
-            while msgs and _has_in_flight_tool_call(msgs[-1]):
-                msgs.pop()
-                dropped += 1
+            if payload.get('pending_tool_calls'):
+                raise ValueError('Snapshot has a tool with an unknown outcome')
             self.conversation = msgs
             self._pending_tool_calls = []
             self.current_day = int(payload.get("current_day", 0) or 0)
             self.turns_today = int(payload.get("turns_today", 0) or 0)
-            self._skip_next_refresh = True
-            print(f"[snapshot] Restored conversation: {len(msgs)} messages "
-                  f"(dropped {dropped} in-flight assistant tool_call), "
-                  f"current_day={self.current_day}, turns_today={self.turns_today}")
+            self._skip_next_refresh = False
+            self._last_observation = payload['last_observation']
+            self._observation_recorded = payload['observation_recorded']
+            if not any(message.role == 'system' for message in self.conversation):
+                print('[snapshot] Legacy context has no system prompt; freezing current system/MEMORY once.')
+                self._context_system_prompt()
             return True
         except Exception as e:
             print(f"[snapshot] WARN failed to load conversation snapshot: {e}")
@@ -469,6 +529,7 @@ class BashAgent(BaseAgent):
 
     def _call_openai(self) -> Optional[Action]:
         """Call OpenAI-compatible API and parse the response."""
+        self._context_system_prompt()
         import time as _time
         import traceback
         import signal
@@ -547,32 +608,13 @@ class BashAgent(BaseAgent):
                 old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
                 signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
                 try:
-                    response = self.client.chat.completions.create(**api_kwargs)
+                    response = self._request_model('chat', api_kwargs,
+                                                   lambda: self.client.chat.completions.create(**api_kwargs))
                 finally:
                     signal.alarm(0)  # Cancel alarm
                     signal.signal(signal.SIGALRM, old_handler)  # Restore handler
                 self.total_turns += 1
                 self._consecutive_errors = 0
-
-                # Capture token usage (OpenAI chat completions format)
-                usage = getattr(response, 'usage', None)
-                if usage:
-                    self.last_input_tokens = getattr(usage, 'prompt_tokens', 0) or 0
-                    self.last_output_tokens = getattr(usage, 'completion_tokens', 0) or 0
-                    # Cache and reasoning details
-                    ptd = getattr(usage, 'prompt_tokens_details', None)
-                    self.last_cached_tokens = getattr(ptd, 'cached_tokens', 0) or 0 if ptd else 0
-                    ctd = getattr(usage, 'completion_tokens_details', None)
-                    self.last_reasoning_tokens = getattr(ctd, 'reasoning_tokens', 0) or 0 if ctd else 0
-                else:
-                    self.last_input_tokens = 0
-                    self.last_output_tokens = 0
-                    self.last_cached_tokens = 0
-                    self.last_reasoning_tokens = 0
-                self.total_input_tokens += self.last_input_tokens
-                self.total_output_tokens += self.last_output_tokens
-                self.total_cached_tokens += self.last_cached_tokens
-                self.total_reasoning_tokens += self.last_reasoning_tokens
 
                 if self.response_callback:
                     self.response_callback(
@@ -685,6 +727,8 @@ class BashAgent(BaseAgent):
                 return Action(tool=first_tc.function.name, arguments=args)
 
             except Exception as e:
+                if self.evidence_store:
+                    self.evidence_store.assert_healthy(quiescent=False)
                 status = getattr(e, 'status_code', 0) or 0
                 is_retryable = isinstance(e, openai.APIStatusError) and (status >= 500 or status == 429)
                 if not is_retryable:
@@ -777,7 +821,7 @@ class BashAgent(BaseAgent):
                     'tools': tools,
                     'tool_choice': 'auto',
                     'max_output_tokens': 16384,
-                    'instructions': self._get_system_prompt_with_memory(),
+                    'instructions': self._context_system_prompt(),
                 }
                 if self.reasoning_effort:
                     api_kwargs['reasoning'] = {'effort': self.reasoning_effort, 'summary': 'auto'}
@@ -786,33 +830,14 @@ class BashAgent(BaseAgent):
                 old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
                 signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
                 try:
-                    response = self.client.responses.create(**api_kwargs)
+                    response = self._request_model('responses', api_kwargs,
+                                                   lambda: self.client.responses.create(**api_kwargs))
                 finally:
                     signal.alarm(0)
                     signal.signal(signal.SIGALRM, old_handler)
 
                 self.total_turns += 1
                 self._consecutive_errors = 0
-
-                # Capture token usage (Responses API uses input_tokens/output_tokens)
-                usage = getattr(response, 'usage', None)
-                if usage:
-                    self.last_input_tokens = getattr(usage, 'input_tokens', 0) or 0
-                    self.last_output_tokens = getattr(usage, 'output_tokens', 0) or 0
-                    # Cache and reasoning details
-                    itd = getattr(usage, 'input_tokens_details', None)
-                    self.last_cached_tokens = getattr(itd, 'cached_tokens', 0) or 0 if itd else 0
-                    otd = getattr(usage, 'output_tokens_details', None)
-                    self.last_reasoning_tokens = getattr(otd, 'reasoning_tokens', 0) or 0 if otd else 0
-                else:
-                    self.last_input_tokens = 0
-                    self.last_output_tokens = 0
-                    self.last_cached_tokens = 0
-                    self.last_reasoning_tokens = 0
-                self.total_input_tokens += self.last_input_tokens
-                self.total_output_tokens += self.last_output_tokens
-                self.total_cached_tokens += self.last_cached_tokens
-                self.total_reasoning_tokens += self.last_reasoning_tokens
 
                 if self.response_callback:
                     self.response_callback(
@@ -906,6 +931,8 @@ class BashAgent(BaseAgent):
                 return Action(tool=first_fc.name, arguments=args)
 
             except Exception as e:
+                if self.evidence_store:
+                    self.evidence_store.assert_healthy(quiescent=False)
                 status = getattr(e, 'status_code', 0) or 0
                 is_retryable = isinstance(e, openai.APIStatusError) and (status >= 500 or status == 429)
                 if not is_retryable:
@@ -1090,7 +1117,7 @@ class BashAgent(BaseAgent):
                     if isinstance(last_block, dict):
                         last_block['cache_control'] = {"type": "ephemeral"}
 
-            system_text = self._get_system_prompt_with_memory()
+            system_text = self._context_system_prompt()
             system_content = [
                 {
                     "type": "text",
@@ -1130,33 +1157,16 @@ class BashAgent(BaseAgent):
                 use_streaming = True
 
             try:
-                if use_streaming:
-                    with anthropic_messages.stream(**api_kwargs) as stream:
-                        response = stream.get_final_message()
-                else:
-                    response = anthropic_messages.create(**api_kwargs)
+                def invoke():
+                    if use_streaming:
+                        with anthropic_messages.stream(**api_kwargs) as stream:
+                            return stream.get_final_message()
+                    return anthropic_messages.create(**api_kwargs)
+                response = self._request_model('messages', dict(api_kwargs, stream=use_streaming), invoke)
 
                 self.total_turns += 1
                 self._consecutive_errors = 0
                 self._record_anthropic_response_metadata(response)
-
-                # Capture token usage (Anthropic format)
-                usage = getattr(response, 'usage', None)
-                if usage:
-                    self.last_input_tokens = getattr(usage, 'input_tokens', 0) or 0
-                    self.last_output_tokens = getattr(usage, 'output_tokens', 0) or 0
-                    # Anthropic cache tracking: cache_creation_input_tokens + cache_read_input_tokens
-                    self.last_cached_tokens = getattr(usage, 'cache_read_input_tokens', 0) or 0
-                    self.last_reasoning_tokens = 0  # Anthropic doesn't expose reasoning tokens separately
-                else:
-                    self.last_input_tokens = 0
-                    self.last_output_tokens = 0
-                    self.last_cached_tokens = 0
-                    self.last_reasoning_tokens = 0
-                self.total_input_tokens += self.last_input_tokens
-                self.total_output_tokens += self.last_output_tokens
-                self.total_cached_tokens += self.last_cached_tokens
-                self.total_reasoning_tokens += self.last_reasoning_tokens
 
                 if self.response_callback:
                     self.response_callback(
@@ -1227,6 +1237,8 @@ class BashAgent(BaseAgent):
                 return Action(tool=first_tool.name, arguments=first_tool.input or {})
 
             except Exception as e:
+                if self.evidence_store:
+                    self.evidence_store.assert_healthy(quiescent=False)
                 import traceback
                 if str(e).startswith("Anthropic response did not include a tool_use block"):
                     raise

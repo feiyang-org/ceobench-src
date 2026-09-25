@@ -662,9 +662,9 @@ def init_database(db_path: Path) -> sqlite3.Connection:
             day INTEGER NOT NULL,
             model TEXT NOT NULL,
             purpose TEXT NOT NULL,  -- 'env_llm' or 'agent'
-            input_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            cost_usd REAL NOT NULL
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cost_usd REAL
         );
 
         -- Social media posts (public customer feedback)

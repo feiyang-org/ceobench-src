@@ -1,12 +1,23 @@
 """Shared fixtures for source-level CEOBench regression tests."""
 
 import pytest
+import socket
 from numpy.random import default_rng
 
 from saas_bench.config import BenchmarkConfig
 from saas_bench.database import init_database
 from saas_bench.simulation import Simulator
 from saas_bench.tools import AgentTools
+
+
+@pytest.fixture(autouse=True)
+def block_external_network(monkeypatch):
+    connect = socket.socket.connect
+    def local_only(sock, address):
+        if isinstance(address, tuple) and address[0] not in ('127.0.0.1', '::1', 'localhost'):
+            raise RuntimeError('Offline tests prohibit external connections')
+        return connect(sock, address)
+    monkeypatch.setattr(socket.socket, 'connect', local_only)
 
 
 @pytest.fixture

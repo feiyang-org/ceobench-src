@@ -184,6 +184,7 @@ class Simulator:
         # of how many posts are generated (which may vary with agent actions).
         comp_post_noise_seed = int(rng.integers(0, 2**63))
         self._competitor_post_noise_rng = Generator(PCG64(comp_post_noise_seed ^ 0x4E4F4953))  # XOR with 'NOIS'
+        self._competitor_template_rng = Generator(PCG64(comp_post_noise_seed ^ 0x544D504C))
 
         # Separate RNG for quality improvement noise — ensures identical noise
         # sequence across agent strategies for cross-run comparability.
@@ -817,13 +818,18 @@ class Simulator:
             return s
 
         states = {
+            'version': 2,
             'rng': _serialize_state(self.rng),
             '_macro_rng': _serialize_state(self._macro_rng),
             '_competitor_rng': _serialize_state(self._competitor_rng),
+            '_competitor_post_noise_rng': _serialize_state(self._competitor_post_noise_rng),
+            '_competitor_template_rng': _serialize_state(self._competitor_template_rng),
             '_quality_rng': _serialize_state(self._quality_rng),
             '_customer_quality_noise_rng': _serialize_state(self._customer_quality_noise_rng),
             '_customer_pick_rng': _serialize_state(self._customer_pick_rng),
         }
+        if getattr(self, 'shock_manager', None) is not None:
+            states['_shock_rng'] = _serialize_state(self.shock_manager.rng)
 
         # Save per-group RNGs
         if hasattr(self, '_group_rngs'):
@@ -834,6 +840,11 @@ class Simulator:
 
         # Save simulator state variables that affect RNG-dependent behavior
         states['_sim_state'] = {
+            'current_day': self.current_day,
+            'shutdown_mode': self.shutdown_mode,
+            'consecutive_negative_cash_days': self.consecutive_negative_cash_days,
+            '_involuntary_churn_seed': self._involuntary_churn_seed,
+            '_leads_drift_seed': self._leads_drift_seed,
             '_macro_pmi_current': self._macro_pmi_current,
             '_macro_cycle_phase_offset': self._macro_cycle_phase_offset,
             '_macro_last_update_day': self._macro_last_update_day,
@@ -875,6 +886,21 @@ class Simulator:
             return False
 
         states = _json.loads(row['state_json'])
+        required = {'rng', '_macro_rng', '_competitor_rng', '_competitor_post_noise_rng',
+                    '_competitor_template_rng', '_quality_rng', '_customer_quality_noise_rng',
+                    '_customer_pick_rng', '_group_rngs', '_sim_state'}
+        if getattr(self, 'shock_manager', None) is not None:
+            required.add('_shock_rng')
+        missing = required - states.keys()
+        if states.get('version') != 2 or missing:
+            raise ValueError(f'Incomplete RNG checkpoint; missing {sorted(missing)}; version 2 required')
+        required_state = {'current_day', 'shutdown_mode', 'consecutive_negative_cash_days',
+                          '_involuntary_churn_seed', '_leads_drift_seed', '_macro_pmi_current',
+                          '_macro_cycle_phase_offset', '_macro_last_update_day', '_macro_last_social_post_day',
+                          '_macro_next_social_post_day', '_macro_multipliers', '_macro_pmi_daily_history',
+                          '_macro_pending_publications', '_customer_quality_noise', '_leads_per_1k_overrides'}
+        if required_state - states['_sim_state'].keys() or states['_group_rngs'].keys() != self._group_rngs.keys():
+            raise ValueError('Incomplete simulation memory or group random states')
 
         def _restore_state(rng_obj, saved):
             """Restore a numpy Generator's bit_generator state from saved dict."""
@@ -894,6 +920,10 @@ class Simulator:
         _restore_state(self.rng, states['rng'])
         _restore_state(self._macro_rng, states['_macro_rng'])
         _restore_state(self._competitor_rng, states['_competitor_rng'])
+        _restore_state(self._competitor_post_noise_rng, states['_competitor_post_noise_rng'])
+        _restore_state(self._competitor_template_rng, states['_competitor_template_rng'])
+        if '_shock_rng' in states:
+            _restore_state(self.shock_manager.rng, states['_shock_rng'])
         _restore_state(self._quality_rng, states['_quality_rng'])
         if '_customer_quality_noise_rng' in states:
             _restore_state(self._customer_quality_noise_rng, states['_customer_quality_noise_rng'])
@@ -912,6 +942,10 @@ class Simulator:
         # Restore simulator state variables
         if '_sim_state' in states:
             ss = states['_sim_state']
+            for key in ('current_day', 'shutdown_mode', 'consecutive_negative_cash_days',
+                        '_involuntary_churn_seed', '_leads_drift_seed'):
+                setattr(self, key, ss[key])
+            self._involuntary_churn_mu_cache.clear()
             self._macro_pmi_current = ss.get('_macro_pmi_current', self._macro_pmi_current)
             self._macro_cycle_phase_offset = ss.get('_macro_cycle_phase_offset', self._macro_cycle_phase_offset)
             self._macro_last_update_day = ss.get('_macro_last_update_day', self._macro_last_update_day)
@@ -5797,10 +5831,8 @@ Guidelines:
 
         return post_text
 
-    @staticmethod
-    def _generate_competitor_post_template(competitor_name: str, severity: str) -> str:
+    def _generate_competitor_post_template(self, competitor_name: str, severity: str) -> str:
         """Fallback template-based competitor post generation."""
-        import random as _random
         templates_by_severity = {
             'minor': [
                 "Interesting update from {competitor}. Nothing game-changing but shows they're still iterating.",
@@ -5832,7 +5864,7 @@ Guidelines:
             ],
         }
         templates = templates_by_severity[severity]
-        template = _random.choice(templates)
+        template = templates[int(self._competitor_template_rng.integers(len(templates)))]
         return template.format(competitor=competitor_name)
 
     # =========================================================================
@@ -7494,6 +7526,8 @@ Guidelines:
                 self._group_rngs[gid] = Generator(PCG64(group_seed ^ gid_hash))
 
         self.current_day += 1
+        if self.customer_simulator:
+            self.customer_simulator.set_current_day(self.current_day)
         config = self.get_current_config()
 
         # LLM-replay: if source had an agent_social_media_post on (current_day - 1)

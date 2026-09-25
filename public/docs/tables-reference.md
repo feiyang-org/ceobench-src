@@ -4,6 +4,10 @@ Reference for all queryable database tables. Query via:
 - `novamind-operation query "SELECT * FROM table_name LIMIT 10"`
 - Python: `novamind_api.query("SELECT * FROM table_name LIMIT 10")`
 
+`SELECT *` expands only the public columns below. Internal tables and columns are denied,
+including reads in filters, joins, ordering, aggregates and subqueries. Queries use a fresh
+read-only snapshot of the current world. Use single quotes for string literals.
+
 **Note:** Schema introspection queries (PRAGMA, sqlite_master) are blocked.
 Use this reference or `docs/tables/*.json` for schema information.
 

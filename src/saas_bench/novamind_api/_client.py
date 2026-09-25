@@ -6,6 +6,7 @@ import sys
 import urllib.request
 import urllib.error
 from typing import Any, Dict, Optional
+from ._capture import observed, urlopen, print
 
 
 class NovaMindAPIError(Exception):
@@ -17,6 +18,7 @@ class _Vars:
     """Namespace for simulator variables (e.g., current_day)."""
 
     @property
+    @observed
     def current_day(self) -> int:
         """Get the current simulation day."""
         data = get_vars()
@@ -37,6 +39,7 @@ def _base_url() -> str:
     return f"http://127.0.0.1:{_get_port()}"
 
 
+@observed
 def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Call a tool on the API server and return the result.
 
@@ -61,7 +64,7 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     )
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urlopen(req) as resp:
             result = json.loads(resp.read())
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"Failed to connect to API server: {e}")
@@ -75,6 +78,7 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     return result.get('data', {})
 
 
+@observed
 def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict[str, Any]:
     """Advance the simulator by one week (7 days).
 
@@ -132,7 +136,7 @@ def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict
     )
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urlopen(req) as resp:
             result = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read()
@@ -154,10 +158,11 @@ def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict
 
 
 
+@observed
 def query(sql: str) -> Dict[str, Any]:
     """Execute a read-only SQL query against the simulator database.
 
-    Hidden columns and internal tables are automatically filtered.
+    SELECT * expands only public columns. Internal tables and columns are denied.
     Write queries are blocked — use the novamind_api functions instead.
 
     Args:
@@ -181,7 +186,7 @@ def query(sql: str) -> Dict[str, Any]:
     )
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urlopen(req) as resp:
             result = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read()
@@ -211,18 +216,20 @@ def query(sql: str) -> Dict[str, Any]:
     return result
 
 
+@observed
 def get_vars() -> Dict[str, Any]:
     """Get simulator variables."""
     url = f"{_base_url()}/vars"
     req = urllib.request.Request(url, method='GET')
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urlopen(req) as resp:
             return json.loads(resp.read())
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"Failed to connect to API server: {e}")
 
 
+@observed
 def _post(path: str, body: Dict[str, Any] = None) -> Dict[str, Any]:
     """Generic POST to the API server."""
     url = f"{_base_url()}{path}"
@@ -231,23 +238,25 @@ def _post(path: str, body: Dict[str, Any] = None) -> Dict[str, Any]:
                                  headers={'Content-Type': 'application/json'},
                                  method='POST')
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urlopen(req) as resp:
             return json.loads(resp.read())
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"POST {path} failed: {e}")
 
 
+@observed
 def _get(path: str) -> Dict[str, Any]:
     """Generic GET from the API server."""
     url = f"{_base_url()}{path}"
     req = urllib.request.Request(url, method='GET')
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urlopen(req) as resp:
             return json.loads(resp.read())
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"GET {path} failed: {e}")
 
 
+@observed
 def _delete(path: str, body: Dict[str, Any] = None) -> Dict[str, Any]:
     """Generic DELETE to the API server."""
     url = f"{_base_url()}{path}"
@@ -256,7 +265,7 @@ def _delete(path: str, body: Dict[str, Any] = None) -> Dict[str, Any]:
                                  headers={'Content-Type': 'application/json'},
                                  method='DELETE')
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urlopen(req) as resp:
             return json.loads(resp.read())
     except urllib.error.URLError as e:
         raise NovaMindAPIError(f"DELETE {path} failed: {e}")

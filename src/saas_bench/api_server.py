@@ -6,6 +6,7 @@ is via HTTP on localhost with a random OS-assigned port.
 """
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -14,13 +15,10 @@ import threading
 import traceback
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
-# Oracle mode: when set, all hidden-table/column/schema filters are bypassed
-# so the agent can see internal simulation state (latent customer params,
-# competitor events, hidden snapshots, etc.). Default = OFF; only set this
-# env var for an oracle benchmark run. Normal benchmark runs MUST leave it
-# unset so the hide-policy stays enforced.
+# Oracle debug reads expose internal data but still execute on read-only snapshots.
+# Formal runs reject this startup setting.
 _ORACLE_MODE: bool = os.environ.get("ORACLE_MODE") == "1"
 
 from .tools import AgentTools, ToolResult
@@ -28,133 +26,9 @@ from .database import TABLE_DOCS
 from .environment import build_weekly_dashboard
 
 
-# ---- Hidden columns / tables (same policy as python_exec sandbox) ----
+from .public_sql import PUBLIC_COLUMNS, QueryDenied, SnapshotUnavailable, execute_query
 
-_HIDDEN_TABLES: Set[str] = {
-    'events',             # Internal shock/event tracking
-    'api_costs',          # Meta-simulation API cost tracking
-    'customer_state',     # Internal satisfaction/relationship state
-    'group_reputation',   # Internal reputation tracking
-    'group_awareness',    # Internal awareness tracking
-    'reputation_history', # Internal reputation history
-    'global_state',       # Internal simulation state
-    'feature_tests',      # Internal feature test tracking
-    'test_assignments',   # Internal test assignments
-    'customer_personas',  # Internal persona templates
-    'customer_persona_map', # Internal persona mapping
-    'group_characteristics', # Internal group characteristics
-    'enterprise_thread_counter',  # Internal thread ID counter
-    'world_context',      # Internal world context
-    'pending_group_research', # Internal async research tracking
-    'group_parameters',       # V2.1: Internal preference drift tracking
-    'competitor_events',      # V4: Hidden — agent should not see internal competitor boost mechanics
-    '_hidden_leads_per_1k_snapshot',  # v3.4ai: monthly leads_per_1000_dollars snapshot (engine-only)
-}
-
-_HIDDEN_COLUMNS: Set[str] = {
-    # Social media hidden columns
-    'sentiment', 'reputation_impact', 'influence_score',
-    # Latent customer satisfaction curve parameters (customers table)
-    'steepness_left', 'steepness_right', 'c_max',
-    # Latent customer preferences (customers table)
-    'usage_demand', 'quality_sensitivity', 'price_sensitivity',
-    'willingness_to_pay', 'usage_scale', 'patience',
-    # Enterprise negotiation parameters (customers table)
-    'reply_delay_mean', 'reply_delay_std', 'negotiation_rate', 'max_negotiation_turns',
-    # Thread hidden columns - customer/VC reply timing is internal simulation state
-    'next_reply_day',
-    # Internal tracking columns
-    'current_offer_price',
-    # Usage rate hidden - agent should only see actual (quota-capped) usage from daily_usage table
-    'daily_usage_rate', 'billing_period_usage',
-    # Customer state hidden columns (customer_state table) - internal satisfaction tracking
-    'satisfaction', 'relationship', 'open_issue_days',
-    'current_steepness_left', 'current_steepness_right', 'current_c_max', 'current_slope',
-    'last_drift_day', 'plan_was_acceptable', 'last_quality', 'last_satisfaction', 'shock_event_id',
-    # Group-level hidden state (group_reputation, group_awareness tables)
-    'reputation', 'awareness', 'last_updated_day', 'last_marketing_day',
-    # Reputation history internals
-    'change_reason',
-    # R&D project internals
-    'actual_completion_day',
-    # Enterprise negotiation internal parameter (customers table)
-    'initial_offer_factor',
-    # Customer persona internal attribute (customers table)
-    'persona_communication',
-    # Internal thread status tracking (enterprise_turns)
-    '_internal_status',
-    # V4: Latent customer quality parameters (customers table)
-    'q_max', 'q_min', 'contract_lockin_penalty',
-    # V4: Internal ads sensitivity parameters (customers table)
-    'ads_quality_sensitivity', 'ads_return_sensitivity',
-    # V4: Subscription internals
-    'effective_c_max',        # Willingness-to-pay at subscription time
-    'churn_reason',           # Internal churn categorization
-    # V4: Social media internals (agent sees content but not engagement mechanics)
-    'likes', 'shares', 'virality_score',
-    # V4: R&D internals
-    'current_decay_reduction', 'decay_reduction_expiry_day',
-    # V4: Ads revenue internals
-    'sensitivity',            # Per-customer ads return sensitivity
-    # V4: Segment discovery internals
-    'remaining_undiscovered',
-}
-
-# Table-specific hidden columns (hidden only when querying these tables)
-_TABLE_HIDDEN_COLUMNS: Dict[str, Set[str]] = {
-    # seat_count hidden from customers/ads_revenue (internal float for drift)
-    # but visible on subscriptions table (floored integer for agent)
-    'customers': {'seat_count'},
-    'ads_revenue': {'seat_count'},
-    'social_media_posts': {'customer_id'},  # V4: Hide which customer posted
-}
-
-
-def _is_schema_query(query: str) -> bool:
-    """Check if query is trying to inspect database schema."""
-    q = query.lower().strip()
-    blocked_patterns = [
-        'sqlite_master', 'sqlite_schema', 'pragma', 'table_info',
-        'index_list', 'index_info', 'foreign_key_list'
-    ]
-    return any(p in q for p in blocked_patterns)
-
-
-def _references_hidden_table(query: str) -> Optional[str]:
-    """Check if query references a hidden table. Returns table name or None."""
-    q = query.lower()
-    for table in _HIDDEN_TABLES:
-        if re.search(r'\b' + re.escape(table) + r'\b', q):
-            return table
-    return None
-
-
-def _get_effective_hidden(sql: str = None) -> Set[str]:
-    """Get the effective set of hidden columns, including table-specific ones."""
-    hidden = set(_HIDDEN_COLUMNS)
-    if sql:
-        q = sql.lower()
-        for table, cols in _TABLE_HIDDEN_COLUMNS.items():
-            if re.search(r'\b' + re.escape(table) + r'\b', q):
-                hidden |= cols
-    return hidden
-
-
-def _strip_hidden_columns(rows: List[Dict], columns: List[str], sql: str = None) -> List[Dict]:
-    """Remove hidden columns from result rows."""
-    hidden = _get_effective_hidden(sql)
-    visible = [c for c in columns if c not in hidden]
-    return [{k: row[k] for k in visible if k in row} for row in rows]
-
-
-# Build table→columns mapping for helpful error messages (exclude hidden columns)
-_TABLE_COLUMNS: Dict[str, List[str]] = {
-    table_name: [
-        c for c in table_info['columns'].keys()
-        if c not in _HIDDEN_COLUMNS and c not in _TABLE_HIDDEN_COLUMNS.get(table_name, set())
-    ]
-    for table_name, table_info in TABLE_DOCS.items()
-}
+_TABLE_COLUMNS = {table: list(columns) for table, columns in PUBLIC_COLUMNS.items()}
 
 # Build column→valid_values mapping for enum hint messages.
 # Parses TABLE_DOCS column descriptions for patterns like "'val1', 'val2', 'val3'"
@@ -290,6 +164,9 @@ def _get_helpful_query_error(error: Exception, sql: str) -> str:
     return str(error)
 
 
+from .execution_capture import public_handler
+
+
 class _APIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the NovaMind API server."""
 
@@ -297,6 +174,7 @@ class _APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    @public_handler
     def do_POST(self):
         try:
             if self.path == '/call':
@@ -307,6 +185,12 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._handle_query()
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_post()
+            elif self.path == '/checkpoint':
+                body = self._read_body()
+                if set(body) != {'expected_day'} or not isinstance(body['expected_day'], int):
+                    self._send_json({'success': False, 'error': 'expected_day is required; no other fields allowed'}, 400)
+                    return
+                self._send_json(self.server._api_server.checkpoint(body['expected_day']))
             elif self.path == '/reinitialize':
                 self._handle_reinitialize()
             else:
@@ -314,12 +198,15 @@ class _APIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_internal_error(exc, op=f"POST {self.path}")
 
+    @public_handler
     def do_GET(self):
         try:
             if self.path == '/vars':
                 self._handle_vars()
             elif self.path == '/health':
-                self._send_json({"status": "ok"})
+                evidence = self.server._api_server.sql_evidence
+                self._send_json({"status": "capture_failed" if evidence and
+                                 (evidence.fault or evidence.fault_path.exists()) else "ok"})
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_get()
             elif self.path == '/dashboard':
@@ -331,6 +218,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_internal_error(exc, op=f"GET {self.path}")
 
+    @public_handler
     def do_DELETE(self):
         try:
             if self.path == '/daily-scripts':
@@ -380,15 +268,67 @@ class _APIHandler(BaseHTTPRequestHandler):
     def _read_body(self) -> Dict:
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length)
+        if getattr(self, '_control_capture', False):
+            self._control_request = body.hex()
         return json.loads(body) if body else {}
 
     def _send_json(self, data: Dict, status: int = 200):
+        if getattr(self, '_generic_capture', False):
+            from .execution_capture import text_sources
+            self._sql_execution['public_fields'] = text_sources(data)
+            if self.path == '/next-week' and self.server._api_server._step_day_timed_out:
+                self._sql_execution['world_outcome_unknown'] = True
         response = json.dumps(data, default=str).encode()
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
+        self._capture_response(status, response)
+        try:
+            if self.path == '/query':
+                self._query_response_started = True
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+        except OSError:
+            self._capture_delivery('failed')
+            raise
+        else:
+            self._capture_delivery('sent')
+
+    def _capture_sql(self, method, *args):
+        store = self.server._api_server.sql_evidence
+        if store is None or getattr(self, '_sql_capture_failed', False):
+            return
+        try:
+            if method == 'finish' and getattr(self, '_generic_capture', False):
+                from .execution_capture import finish_http
+                return finish_http(store, *args)
+            return getattr(store, method)(*args)
+        except Exception as exc:
+            self._sql_capture_failed = True
+            store.fail(exc)
+
+    def _capture_response(self, status, response):
+        if getattr(self, '_control_capture', False):
+            self._control_record = dict(path=self.path, method=self.command, status=status, body_hex=response.hex(), request_hex=getattr(self, '_control_request', ''))
+        if getattr(self, '_sql_event', None):
+            self._sql_response = status, response
+
+    def end_headers(self):
+        if hasattr(self, '_control_record'):
+            self._control_record['headers'] = (b''.join(self._headers_buffer) + b'\r\n').decode('latin-1')
+        if getattr(self, '_sql_event', None) and getattr(self, '_sql_response', None):
+            status, body = self._sql_response
+            self._sql_response = None
+            # Includes BaseHTTPRequestHandler's actual Server/Date/status line too.
+            headers = (b''.join(self._headers_buffer) + b'\r\n').decode('latin-1')
+            self._capture_sql('finish', self._sql_event, status, headers, body, self._sql_execution)
+        super().end_headers()
+
+    def _capture_delivery(self, state):
+        if hasattr(self, '_control_record'):
+            self._control_record['send_state'] = state
+        if getattr(self, '_sql_event', None):
+            self._capture_sql('delivered', self._sql_event, state)
 
     def _handle_call(self):
         """Handle a tool call: POST /call {"tool": "...", "args": {...}}."""
@@ -489,6 +429,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                         "error": f"Prediction '{key}' fields point/lower/upper must all be numbers, got {entry!r}.",
                     }, 400)
                     return
+                if not all(math.isfinite(v) for v in (point, lower, upper)):
+                    self._send_json({'success': False, 'error': f"Prediction '{key}' must contain finite numbers."}, 400)
+                    return
                 if lower > upper:
                     self._send_json({
                         "success": False,
@@ -509,121 +452,103 @@ class _APIHandler(BaseHTTPRequestHandler):
             self._send_internal_error(e, op="next-week")
 
     def _handle_query(self):
-        """Handle SQL queries: POST /query {"sql": "SELECT ..."}
-
-        Applies hidden column/table filtering so the agent cannot
-        access internal simulation state.
-        """
+        api = self.server._api_server
+        if api.sql_evidence and api.sql_evidence.execution_capture:
+            self._query_response_started = False
+            return self._handle_query_request()
+        with api._sql_lock:
+            while api._sql_paused:
+                api._sql_lock.wait()
+            api._sql_active += 1
         try:
-            body = self._read_body()
-            sql = body.get('sql', '').strip()
-            if not sql:
-                self._send_json({"success": False, "error": "No SQL query provided"}, 400)
+            self._query_response_started = False
+            self._sql_event = None
+            self._sql_response = None
+            self._sql_capture_failed = False
+            self._sql_execution = {}
+            self._handle_query_request()
+        finally:
+            self._sql_event = None
+            with api._sql_lock:
+                api._sql_active -= 1
+                api._sql_lock.notify_all()
+
+    def _handle_query_request(self):
+        """Execute SQL on a separately authorized, read-only world snapshot."""
+        sql = ''
+        try:
+            raw = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            from .public_sql import PUBLIC_POLICY_VERSION
+            if not (self.server._api_server.sql_evidence and self.server._api_server.sql_evidence.execution_capture):
+                self._sql_event = self._capture_sql('begin', raw, PUBLIC_POLICY_VERSION)
+            body = json.loads(raw) if raw else {}
+            if not isinstance(body, dict) or not isinstance(body.get('sql'), str) or not body['sql'].strip():
+                self._send_json({'success': False, 'error': 'sql must be a non-empty string'}, 400)
                 return
-
-            # Block schema introspection (bypassed in oracle mode)
-            if not _ORACLE_MODE and _is_schema_query(sql):
-                self._send_json({
-                    "success": False,
-                    "error": "Schema introspection queries (PRAGMA, sqlite_master) are not allowed. Read docs/tables/ for table schemas.",
-                }, 403)
-                return
-
-            # Block hidden tables (bypassed in oracle mode)
-            if not _ORACLE_MODE:
-                hidden_table = _references_hidden_table(sql)
-                if hidden_table:
-                    self._send_json({
-                        "success": False,
-                        "error": f"Table '{hidden_table}' is not accessible.",
-                    }, 403)
-                    return
-
-            # Block writes
-            sql_lower = sql.lower().lstrip()
-            if sql_lower.startswith(('insert', 'update', 'delete', 'drop', 'alter', 'create')):
-                self._send_json({
-                    "success": False,
-                    "error": "Write queries are not allowed. Use the novamind_api for all actions.",
-                }, 403)
-                return
-
-            # Enforce a row limit to prevent 60MB+ JSON responses from
-            # killing the agent's bash command timeout.  If the user's SQL
-            # already contains a LIMIT we respect it; otherwise we cap at
-            # _QUERY_ROW_LIMIT and tell the agent to narrow its query.
-            _QUERY_ROW_LIMIT = 5000
-
-            server: NovaMindAPIServer = self.server._api_server
-            import time as _qt_time
-            with server._lock:
-                server._query_deadline = _qt_time.monotonic() + server.QUERY_TIMEOUT_SECONDS
-                try:
-                    cursor = server.conn.execute(sql)
-                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                    # Fetch up to limit+1 rows to detect overflow
-                    rows_raw = cursor.fetchmany(_QUERY_ROW_LIMIT + 1)
-                finally:
-                    server._query_deadline = 0.0
-                truncated = len(rows_raw) > _QUERY_ROW_LIMIT
-                if truncated:
-                    rows_raw = rows_raw[:_QUERY_ROW_LIMIT]
-                rows = [dict(row) for row in rows_raw]
-
-            # Strip hidden columns from results (bypassed in oracle mode)
-            if _ORACLE_MODE:
-                hidden = set()
-            else:
-                hidden = _get_effective_hidden(sql)
-                if rows and columns:
-                    rows = _strip_hidden_columns(rows, columns, sql)
-
-            response = {
-                "success": True,
-                "columns": [c for c in columns if c not in hidden],
-                "rows": rows,
-                "row_count": len(rows),
-            }
-
-            if truncated:
-                response["truncated"] = True
-                response["warning"] = (
-                    f"Result exceeded {_QUERY_ROW_LIMIT} rows and was truncated. "
-                    f"Add a LIMIT clause to your query, or use COUNT/GROUP BY to "
-                    f"aggregate results instead of fetching all rows."
-                )
-
-            # Add enum value hints if query returned 0 rows with wrong enum values
-            enum_hint = _get_enum_hint_for_query(sql, rows)
+            sql = body['sql']
+            response = execute_query(self.server._api_server, sql, metadata=self._sql_execution)
+            enum_hint = _get_enum_hint_for_query(sql, response['rows'])
             if enum_hint:
-                response["hint"] = enum_hint
+                response['hint'] = enum_hint
+            self._send_query_json(response)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json({'success': False, 'error': 'Invalid JSON body'}, 400)
+        except QueryDenied as exc:
+            self._send_json({'success': False, 'error': str(exc)}, 403)
+        except SnapshotUnavailable as exc:
+            self._send_json({'success': False, 'error': str(exc)}, 503)
+        except TimeoutError:
+            if not self._query_response_started:
+                self._send_json({'success': False, 'error': 'Query exceeded its time limit. Narrow the query or try again when the world is idle.'}, 504)
+        except sqlite3.Error as exc:
+            self._send_json({'success': False, 'error': _get_helpful_query_error(exc, sql)}, 500)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            if not self._query_response_started:
+                self._send_internal_error(exc, op='query')
 
-            self._send_json(response)
-
-        except sqlite3.OperationalError as e:
-            # Server-side query deadline (set_progress_handler) was hit.
-            # Surface a concrete, recoverable message so the agent can narrow
-            # the query instead of retrying the same expensive SQL.
-            if "interrupt" in str(e).lower():
-                self._send_json({
-                    "success": False,
-                    "error": (
-                        f"Query exceeded {NovaMindAPIServer.QUERY_TIMEOUT_SECONDS}s "
-                        f"server-side limit and was aborted. Add a LIMIT, narrow "
-                        f"the WHERE clause, or use COUNT/aggregation instead of "
-                        f"a full scan."
-                    ),
-                }, 504)
-            else:
-                self._send_json({"success": False, "error": _get_helpful_query_error(e, sql)}, 500)
-        except sqlite3.Error as e:
-            # SQL errors are deliberately surfaced to the agent (the helper
-            # rewrites them into typed hints — no source paths or tracebacks).
-            self._send_json({"success": False, "error": _get_helpful_query_error(e, sql)}, 500)
-        except Exception as e:
-            # Anything non-SQL (e.g. a programming error in the handler) must
-            # NOT leak details — route through the centralized scrubber.
-            self._send_internal_error(e, op="query")
+    def _send_query_json(self, data):
+        """Bound serialization and socket writes separately from SQL execution."""
+        import time
+        from .public_sql import check_deadline
+        started = time.monotonic()
+        chunks = []
+        deadline = started + self.server._api_server.QUERY_RESPONSE_TIMEOUT_SECONDS
+        for chunk in json.JSONEncoder(default=str).iterencode(data):
+            check_deadline(deadline)
+            chunks.append(chunk.encode())
+        response = b''.join(chunks)
+        check_deadline(deadline)
+        capture_started = time.monotonic()
+        self._capture_response(200, response)
+        # Capture has its own accounting, never spend SQL/response execution budgets on it.
+        deadline += time.monotonic() - capture_started
+        serialized = time.monotonic()
+        self.connection.settimeout(max(0.001, deadline - serialized))
+        try:
+            self._query_response_started = True
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+            self._capture_delivery('sent')
+        except TimeoutError:
+            # Headers have already been sent; never append a second HTTP response.
+            self.close_connection = True
+            self._capture_delivery('failed')
+        except OSError:
+            self._capture_delivery('failed')
+            raise
+        finally:
+            try:
+                print('[public_sql_response] ' + json.dumps({
+                    'serialization_seconds': serialized - started,
+                    'send_seconds': time.monotonic() - serialized,
+                }), file=sys.stderr, flush=True)
+            except OSError:
+                pass
 
     def _handle_daily_scripts_post(self):
         """Register a daily script snapshot: POST /daily-scripts {"name": "x.py", "content": "..."}."""
@@ -631,12 +556,14 @@ class _APIHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             name = body.get('name', '')
             content = body.get('content', '')
-            if not name:
-                self._send_json({"success": False, "error": "name required"}, 400)
+            if not isinstance(name, str) or not name or not isinstance(content, str):
+                self._send_json({"success": False, "error": "name and content must be strings; name cannot be empty"}, 400)
                 return
             server: NovaMindAPIServer = self.server._api_server
             with server._lock:
-                server._daily_scripts[name] = content
+                scripts = server.get_daily_scripts()
+                scripts[name] = content
+                server.set_daily_scripts(scripts, registration=name)
             self._send_json({"success": True, "data": {"name": name, "registered": True}})
         except Exception as e:
             self._send_internal_error(e, op="daily-scripts:post")
@@ -658,7 +585,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                 if name not in server._daily_scripts:
                     self._send_json({"success": False, "error": f"Script not found: {name}"}, 404)
                     return
-                del server._daily_scripts[name]
+                scripts = server.get_daily_scripts()
+                del scripts[name]
+                server.set_daily_scripts(scripts)
             self._send_json({"success": True, "data": {"removed": name}})
         except Exception as e:
             self._send_internal_error(e, op="daily-scripts:delete")
@@ -681,6 +610,8 @@ class _APIHandler(BaseHTTPRequestHandler):
         if not dashboard and server.conn:
             day = server.tools.current_day
             dashboard = build_weekly_dashboard(server.conn, day)
+            from .execution_capture import dashboard_version
+            dashboard = dashboard_version(server, dashboard, day)
         self._send_json({
             "dashboard": dashboard or f"=== Day {server.tools.current_day} ===\n(No data)",
             "day": server.tools.current_day,
@@ -695,7 +626,7 @@ class _APIHandler(BaseHTTPRequestHandler):
         server: NovaMindAPIServer = self.server._api_server
         cash = 0
         subs = 0
-        if server.conn:
+        if server.conn and not (server._advance_lock.locked() or server._operation_failed or server._step_day_timed_out):
             cash = get_cash(server.conn)
             subs = get_active_subscriber_count(server.conn)
         self._send_json({
@@ -703,6 +634,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             "cash": cash,
             "subscribers": subs,
             "timed_out": server._step_day_timed_out,
+            "operation_failed": server._operation_failed,
+            "operation_in_progress": server._advance_lock.locked(),
         })
 
 
@@ -760,7 +693,8 @@ class NovaMindAPIServer:
 
     def __init__(self, tools: AgentTools, simulator=None, conn=None,
                  day_callback=None, dashboard_callback=None,
-                 shock_manager=None, event_logger=None):
+                 shock_manager=None, event_logger=None, script_workspace=None,
+                 require_sandbox=False, sql_evidence=None):
         """Initialize the API server.
 
         Args:
@@ -772,6 +706,17 @@ class NovaMindAPIServer:
             shock_manager: Optional ShockManager for generating shocks each day
             event_logger: Optional EventLogger for logging events
         """
+        self.oracle_mode = _ORACLE_MODE
+        self.sql_evidence = sql_evidence
+        if sql_evidence is not None:
+            if self.oracle_mode:
+                raise ValueError('Oracle cannot write public SQL evidence')
+            from pathlib import Path
+            if sql_evidence.path.is_relative_to(Path(script_workspace or tools.workspace_path).resolve()):
+                raise ValueError('SQL evidence must be outside the agent workspace')
+            sql_evidence.assert_healthy()
+        if self.oracle_mode and (require_sandbox or os.environ.get('CEOBENCH_RUN_KIND') == 'formal'):
+            raise ValueError('Formal runs cannot enable oracle mode')
         self.tools = tools
         self.simulator = simulator
         self.conn = conn
@@ -783,29 +728,27 @@ class NovaMindAPIServer:
         self._thread: Optional[threading.Thread] = None
         self.port: int = 0
         self._lock = threading.RLock()
+        self._sql_lock = threading.Condition()
+        self._sql_active = 0
+        self._sql_paused = False
+        self._advance_lock = threading.Lock()
+        self._operation_failed = False
+        self.checkpoint_callback = None
         self._last_dashboard: str = ""
         self._last_day_result = None
         self._daily_scripts: Dict[str, str] = {}  # name -> content snapshot
+        self.script_workspace = script_workspace or tools.workspace_path
+        self.require_sandbox = require_sandbox
+        self.last_script_results = []
+        if conn is not None:
+            conn.execute('CREATE TABLE IF NOT EXISTS _registered_scripts (position INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, content TEXT NOT NULL, sha256 TEXT NOT NULL)')
+            saved_scripts = conn.execute('SELECT name, content, sha256 FROM _registered_scripts ORDER BY position').fetchall()
+            import hashlib
+            for name, content, checksum in saved_scripts:
+                if hashlib.sha256(content.encode()).hexdigest() != checksum:
+                    raise ValueError('Registered script checksum mismatch: ' + name)
+                self._daily_scripts[name] = content
         self._step_day_timed_out: bool = False  # Set when step_day exceeds timeout
-
-        # Per-query wall-clock deadline (monotonic seconds; 0 = disabled).
-        # Set inside _handle_query before cursor.execute, cleared in finally.
-        # The progress handler below reads this and aborts the SQL when exceeded
-        # so a killed HTTP client cannot leak server._lock for the full SQL
-        # duration (run 15c3d364 wedge, 2026-05-01).
-        self._query_deadline: float = 0.0
-        if self.conn is not None:
-            import time as _qd_time
-            def _query_watchdog():
-                dl = self._query_deadline
-                if dl and _qd_time.monotonic() > dl:
-                    return 1  # non-zero => sqlite3 raises OperationalError("interrupted")
-                return 0
-            try:
-                self.conn.set_progress_handler(_query_watchdog, 100000)
-            except Exception:
-                # Best-effort: some sqlite builds may not support it.
-                pass
 
     def start(self):
         """Start the HTTP server in a background thread."""
@@ -832,12 +775,73 @@ class NovaMindAPIServer:
     # Maximum allowed time for step_week before auto-quit (seconds)
     STEP_WEEK_TIMEOUT = 4200  # 7× longer than old per-day timeout
 
-    # Hard server-side deadline for a single /query SQL execution. If exceeded,
-    # the query is interrupted via the progress handler and server._lock is
-    # released, so a stuck SQL can no longer wedge next-week (line 549 wedge).
+    # Lock wait, snapshot backup and SQL share this deadline. SQL executes
+    # on a separate connection after releasing the world lock.
     QUERY_TIMEOUT_SECONDS = 120
+    QUERY_RESPONSE_TIMEOUT_SECONDS = 30
 
-    def advance_week(self, predictions: Optional[Dict[int, Dict[str, float]]] = None,
+    def checkpoint(self, expected_day):
+        if not self._advance_lock.acquire(blocking=False):
+            raise RuntimeError('Cannot checkpoint an in-flight week')
+        try:
+            with self._sql_lock:
+                self._sql_paused = True
+                try:
+                    if self.sql_evidence and self.sql_evidence.execution_capture:
+                        self.sql_evidence.save_state('admission_paused', True)
+                    if not self._sql_lock.wait_for(lambda: self._sql_active == 0, timeout=180):
+                        raise TimeoutError('SQL capture did not finish before checkpoint')
+                    if self.sql_evidence is not None and self.sql_evidence.execution_capture:
+                        import time
+                        deadline = time.monotonic() + 180
+                        while True:
+                            self.sql_evidence.assert_healthy(quiescent=False)
+                            try:
+                                self.sql_evidence.assert_healthy()
+                                if self._sql_active == 0:
+                                    break
+                            except RuntimeError as exc:
+                                if (not str(exc).startswith('Unconfirmed') or
+                                        str(exc).startswith('Unconfirmed execution outcome')):
+                                    raise
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError('Execution capture did not finish before checkpoint')
+                            self._sql_lock.wait(timeout=0.05)
+                    # No query can hold the world lock while this checkpoint owns it.
+                    with self._lock:
+                        if self.sql_evidence is not None:
+                            self.sql_evidence.assert_healthy()
+                        if self._operation_failed or self._step_day_timed_out:
+                            raise RuntimeError('Operation outcome unknown; checkpoint refused')
+                        if expected_day != self.tools.current_day:
+                            raise ValueError('Checkpoint day mismatch')
+                        if self.checkpoint_callback is None:
+                            raise RuntimeError('Harness checkpoint directory is not configured')
+                        return self.checkpoint_callback()
+                finally:
+                    try:
+                        if self.sql_evidence and self.sql_evidence.execution_capture:
+                            self.sql_evidence.save_state('admission_paused', False)
+                    finally:
+                        self._sql_paused = False
+                        self._sql_lock.notify_all()
+        finally:
+            self._advance_lock.release()
+
+    def advance_week(self, predictions=None, rationale=None):
+        if not self._advance_lock.acquire(blocking=False):
+            raise RuntimeError('Week advancement already in progress')
+        try:
+            if self._operation_failed or self._step_day_timed_out:
+                raise RuntimeError('Previous operation outcome unknown; continuation refused')
+            return self._advance_week(predictions, rationale)
+        except Exception:
+            self._operation_failed = True
+            raise
+        finally:
+            self._advance_lock.release()
+
+    def _advance_week(self, predictions: Optional[Dict[int, Dict[str, float]]] = None,
                      rationale: Optional[str] = None) -> Dict[str, Any]:
         """Advance the simulator by one week (7 days) and return the dashboard.
 
@@ -880,13 +884,22 @@ class NovaMindAPIServer:
 
         # Persist predictions before stepping the world (so submit_day reflects
         # the day the prediction was made, not the post-step day).
+        if predictions and self.conn is None:
+            return {'success': False, 'error': 'prediction_save_failed', 'day': old_day}
         if predictions and self.conn is not None:
             from saas_bench.database import save_predictions as _save_predictions
             _pred_exc_tb = None
             try:
                 with self._lock:
-                    _save_predictions(self.conn, old_day, predictions, _time.time())
-                    self.conn.commit()
+                    self.conn.execute('SAVEPOINT week_predictions')
+                    try:
+                        _save_predictions(self.conn, old_day, predictions, _time.time())
+                        self.conn.execute('RELEASE week_predictions')
+                        self.conn.commit()
+                    except Exception:
+                        if self.conn.in_transaction:
+                            self.conn.rollback()
+                        raise
             except Exception:
                 import traceback
                 _pred_exc_tb = traceback.format_exc()
@@ -894,20 +907,29 @@ class NovaMindAPIServer:
                 # Log AFTER releasing the lock so a buffered stderr write can't
                 # back-pressure the lock holder. (run 27c000a5 d105 hang.)
                 print(_pred_exc_tb, file=sys.stderr, flush=True)
-
-        # Check for shocks BEFORE step_week (so shock effects apply this week)
-        if self.shock_manager:
-            for d in range(old_day + 1, old_day + 8):
-                new_shocks = self.shock_manager.check_and_generate_shocks(d)
-                if self.event_logger:
-                    for shock in new_shocks:
-                        self.event_logger.log_shock(shock.shock_type, shock.details)
+                return {'success': False, 'error': 'prediction_save_failed', 'day': old_day}
 
         # Run step_week in a worker thread so we can enforce a timeout.
         _step_start = _time.monotonic()
 
         def _do_step():
-            return self.simulator.step_week()
+            with self._lock:
+                try:
+                    # Publish the new world and day together, including shocks.
+                    if self.shock_manager:
+                        for d in range(old_day + 1, old_day + 8):
+                            new_shocks = self.shock_manager.check_and_generate_shocks(d)
+                            if self.event_logger:
+                                for shock in new_shocks:
+                                    self.event_logger.log_shock(shock.shock_type, shock.details)
+                    result = self.simulator.step_week()
+                    self._last_day_result = result
+                    self.tools.set_current_day(result.day)
+                    return result
+                except Exception:
+                    # Readers must see the failure before this lock is released.
+                    self._operation_failed = True
+                    raise
 
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(_do_step)
@@ -929,10 +951,6 @@ class NovaMindAPIServer:
         self._last_step_elapsed = _time.monotonic() - _step_start
         new_day = week_result.day
 
-        with self._lock:
-            self._last_day_result = week_result
-            self.tools.set_current_day(new_day)
-
         # Build inbox items from shocks + enterprise threads (covering the whole week)
         inbox = []
         if self.shock_manager:
@@ -944,16 +962,18 @@ class NovaMindAPIServer:
 
         # Build dashboard OUTSIDE the lock so weekly scripts can call back
         # to the API server (e.g., nm.query()) without deadlocking.
+        calc_outputs = self._run_daily_scripts_internal()
         if self.dashboard_callback:
             dashboard = self.dashboard_callback(new_day, week_result)
         elif self.conn:
             # Run weekly scripts if available
-            calc_outputs = self._run_daily_scripts_internal() if hasattr(self, '_daily_script_snapshots') else None
             dashboard = build_weekly_dashboard(self.conn, new_day, week_result, calc_outputs, inbox)
         else:
             week = (new_day + 6) // 7
             dashboard = f"=== Week {week} Dashboard (Day {new_day}) ===\n(No dashboard data available)"
 
+        from .execution_capture import dashboard_version
+        dashboard = dashboard_version(self, dashboard, new_day)
         with self._lock:
             self._last_dashboard = dashboard
 
@@ -975,7 +995,71 @@ class NovaMindAPIServer:
         with self._lock:
             return dict(self._daily_scripts)
 
-    def set_daily_scripts(self, scripts: Dict[str, str]):
+    def _run_daily_scripts_internal(self):
+        import hashlib
+        import shlex
+        from pathlib import Path
+        from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+        workspace = Path(self.script_workspace)
+        executor = BashAgentToolExecutor(workspace, bash_timeout=300,
+            evidence_store=self.sql_evidence if self.sql_evidence and self.sql_evidence.execution_capture else None,
+            require_sandbox=self.require_sandbox,
+            env={'NOVAMIND_API_PORT': str(self.port), 'PYTHONHASHSEED': '0',
+                 'PYTHONPATH': os.pathsep.join((str(workspace / 'docs'), str(workspace)))})
+        results = {}
+        self.last_script_results = []
+        for name, code in self.get_daily_scripts().items():
+            from .execution_capture import ExecutionCapture, CURRENT_EVENT
+            capture = ExecutionCapture(executor.evidence_store) if executor.evidence_store else None
+            token = None
+            if capture:
+                versions = capture.store.load_state('script_versions') or {}
+                capture.begin('registered_script_execution', {'name': name, 'registered_version': versions.get(name)})
+                capture.blob('code', code, 'executed_code', derived_from=versions.get(name))
+                token = CURRENT_EVENT.set(capture.event)
+            try:
+                output = executor.execute('bash', {'command': shlex.quote(sys.executable) + ' -c ' + shlex.quote(code)})
+            except BaseException as exc:
+                if capture and capture.event:
+                    capture.safe(capture.store.complete, capture.event, 'result_unknown', error=type(exc).__name__)
+                raise
+            else:
+                if capture and capture.event:
+                    child = output.origins[0]['version_id'].rsplit(':', 1)[0] if getattr(output, 'origins', []) else None
+                    child_record = capture.safe(capture.store.read_event, child) if child else None
+                    status = child_record['result']['status'] if child_record else 'result_unknown'
+                    capture.safe(capture.store.complete, capture.event, status, child_event_id=child)
+            finally:
+                if token is not None:
+                    CURRENT_EVENT.reset(token)
+            results[name] = output
+            self.last_script_results.append(dict(name=name,
+                sha256=hashlib.sha256(code.encode()).hexdigest(), output=output))
+        return results
+
+    def set_daily_scripts(self, scripts: Dict[str, str], registration=None):
         """Restore daily scripts from checkpoint."""
         with self._lock:
+            import hashlib
+            if not isinstance(scripts, dict) or any(not isinstance(n, str) or not n or not isinstance(c, str)
+                                                    for n, c in scripts.items()):
+                raise ValueError('Invalid registered script snapshots')
+            if self.conn is not None:
+                self.conn.execute('SAVEPOINT registered_scripts')
+                try:
+                    self.conn.execute('DELETE FROM _registered_scripts')
+                    self.conn.executemany('INSERT INTO _registered_scripts VALUES (?, ?, ?, ?)',
+                        [(i, n, c, hashlib.sha256(c.encode()).hexdigest())
+                         for i, (n, c) in enumerate(scripts.items())])
+                    self.conn.execute('RELEASE registered_scripts')
+                except Exception:
+                    self.conn.execute('ROLLBACK TO registered_scripts')
+                    self.conn.execute('RELEASE registered_scripts')
+                    raise
+            before = self._daily_scripts
             self._daily_scripts = dict(scripts)
+            from .execution_capture import registered_scripts
+            try:
+                registered_scripts(self, scripts, before, registration)
+            except Exception as exc:
+                self.sql_evidence.fail(exc)

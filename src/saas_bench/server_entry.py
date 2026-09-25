@@ -14,6 +14,7 @@ Commands:
 
 import argparse
 import json
+import uuid
 import os
 import signal
 import sqlite3
@@ -134,7 +135,7 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
         config.social_post_llm_model = override_model
         config.enterprise_llm_model = override_model
 
-    valid_providers = {"bedrock", "anthropic", "openai", "deepseek"}
+    valid_providers = {"bedrock", "anthropic", "openai", "deepseek", "opencode"}
     for attr in ("social_post_llm_provider", "enterprise_llm_provider"):
         provider = getattr(config, attr)
         if provider not in valid_providers:
@@ -174,6 +175,9 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
         )
         sys.exit(1)
 
+    if 'opencode' in (config.social_post_llm_provider, config.enterprise_llm_provider) and not os.environ.get('OPENCODE_API_KEY'):
+        raise ValueError('Simulator OpenCode provider requires OPENCODE_API_KEY')
+
     return {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
 
 
@@ -185,19 +189,48 @@ def _restore_simulator_llm_config(config: BenchmarkConfig, meta: dict) -> None:
             setattr(config, attr, value)
 
 
+def _session_config(seed, total_days, initial_cash, meta=None):
+    frozen = (meta or {}).get('benchmark_config')
+    manifest_path = os.environ.get('CEOBENCH_RUN_MANIFEST')
+    if manifest_path:
+        requested = json.loads(Path(manifest_path).read_text())['benchmark_config']
+        if frozen and frozen != requested:
+            raise ValueError('Session configuration differs from run manifest')
+        frozen = requested
+    config = BenchmarkConfig(**frozen) if frozen else BenchmarkConfig(
+        seed=seed, total_days=total_days, initial_cash=initial_cash)
+    if meta and not frozen:
+        _restore_simulator_llm_config(config, meta)
+    before = {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
+    effective = _apply_simulator_llm_config(config)
+    if frozen and effective != before:
+        raise ValueError('Simulator environment would change frozen model configuration')
+    return config
+
+
 def _create_simulator_openai_client(config: BenchmarkConfig):
     providers = {config.social_post_llm_provider, config.enterprise_llm_provider}
-    if not providers.intersection({"openai", "deepseek"}):
+    compatible = providers.intersection({"openai", "deepseek", "opencode"})
+    if not compatible:
         return None
+    if len(compatible) > 1:
+        raise ValueError('Simulator OpenAI-compatible providers must share one endpoint')
 
     from openai import OpenAI
 
+    if "opencode" in providers:
+        return OpenAI(
+            api_key=os.environ.get('OPENCODE_API_KEY'),
+            base_url='https://opencode.ai/zen/go/v1',
+            default_headers={'User-Agent': 'CEO-Bench/1.0',
+                             'x-opencode-session': os.environ.get('CEOBENCH_MODEL_SESSION') or uuid.uuid4().hex},
+        )
     if "deepseek" in providers:
         return OpenAI(
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com",
         )
-    return OpenAI()
+    return OpenAI(base_url=config.simulator_openai_base_url)
 
 
 # =========================================================================
@@ -215,11 +248,7 @@ def cmd_new_session(args, base: Path):
 
     # Initialize RNG and config
     rng = Generator(PCG64(seed))
-    config = BenchmarkConfig(
-        seed=seed,
-        total_days=total_days,
-        initial_cash=args.cash,
-    )
+    config = _session_config(seed, total_days, args.cash)
     simulator_llm = _apply_simulator_llm_config(config)
 
     # Initialize database in memory (never writes plain SQLite to disk)
@@ -255,6 +284,8 @@ def cmd_new_session(args, base: Path):
         "status": "created",
         "simulator_llm": simulator_llm,
     }
+    from dataclasses import asdict
+    meta['benchmark_config'] = asdict(config)
     _session_meta_path(base, session_id).write_text(json.dumps(meta, indent=2))
 
     # Initialize empty history
@@ -304,12 +335,7 @@ def cmd_start_server(args, base: Path):
 
     # Reconstruct simulator state
     rng = Generator(PCG64(seed))
-    config = BenchmarkConfig(
-        seed=seed,
-        total_days=total_days,
-        initial_cash=meta["initial_cash"],
-    )
-    _restore_simulator_llm_config(config, meta)
+    config = _session_config(seed, total_days, meta['initial_cash'], meta)
     meta["simulator_llm"] = _apply_simulator_llm_config(config)
 
     customer_sim = CustomerSimulator(
@@ -321,12 +347,6 @@ def cmd_start_server(args, base: Path):
     simulator.initialize(resume=True)  # resume=True: skip DB writes, just set up _group_rngs
     current_day = meta.get("current_day", 0)
 
-    # Restore RNG states from database for deterministic resume
-    if current_day > 0:
-        simulator.current_day = current_day
-        if not simulator.restore_rng_states():
-            print(f"WARNING: No saved RNG states found — RNG will NOT match continuous run", file=sys.stderr)
-
     workspace = _session_workspace(base, session_id)
     tools = AgentTools(conn, current_day, workspace, rng=rng, config=config, seed=seed)
 
@@ -336,6 +356,13 @@ def cmd_start_server(args, base: Path):
         name='Default', description='Balanced scenario'
     ))
     shock_manager = ShockManager(conn, rng, scenario_pack)
+    simulator.shock_manager = shock_manager
+    # Construct all random streams before restoring the saved positions.
+    restored = simulator.restore_rng_states()
+    if current_day > 0 and not restored:
+        raise ValueError('Cannot resume: checkpoint has no random states')
+    if restored and simulator.current_day != current_day:
+        raise ValueError('Checkpoint metadata and simulator day differ')
 
     # Event logger
     logs_dir = sdir / "logs"
@@ -375,6 +402,14 @@ def cmd_start_server(args, base: Path):
         _log_history({"type": "next_week", "day": day, "timestamp": time.time()})
 
     # Create and start API server
+    sql_evidence = None
+    evidence_path = os.environ.get('CEOBENCH_SQL_EVIDENCE')
+    if evidence_path:
+        from saas_bench.sql_evidence import SQLEvidenceStore
+        identity = json.loads(Path(os.environ['CEOBENCH_RUN_MANIFEST']).read_text())['sql_evidence']
+        if Path(evidence_path).resolve().is_relative_to(base.resolve()):
+            raise ValueError('SQL evidence must be outside the agent workspace')
+        sql_evidence = SQLEvidenceStore(evidence_path, identity)
     api_server = NovaMindAPIServer(
         tools=tools,
         simulator=simulator,
@@ -382,7 +417,67 @@ def cmd_start_server(args, base: Path):
         day_callback=_day_callback,
         shock_manager=shock_manager,
         event_logger=event_logger,
+        script_workspace=base,
+        require_sandbox=os.environ.get('CEOBENCH_RUN_KIND') == 'formal',
+        sql_evidence=sql_evidence,
     )
+    from saas_bench.run_state import file_hash, write_json
+    checkpoint_root = os.environ.get('CEOBENCH_CHECKPOINT_ROOT')
+    if checkpoint_root:
+        checkpoint_root = Path(checkpoint_root).resolve()
+        if checkpoint_root.is_relative_to(base):
+            raise ValueError('Checkpoint directory must be outside the agent workspace')
+
+        def _checkpoint():
+            import uuid
+            snapshot_id = uuid.uuid4().hex
+            target = checkpoint_root / snapshot_id
+            target.mkdir(parents=True)
+            if not async_saver.drain(timeout=180):
+                raise TimeoutError('Background database save did not finish')
+            simulator.save_rng_states()
+            event_logger.save_incremental()
+            save_session_db(conn, target / 'world.nmdb')
+            saved_meta = dict(meta, current_day=simulator.current_day, status='created')
+            for field in ('port', 'pid'):
+                saved_meta.pop(field, None)
+            write_json(target / 'session.json', saved_meta)
+            write_json(target / 'server_state.json', {
+                'day': simulator.current_day, 'dashboard': api_server.last_dashboard,
+                'script_results': api_server.last_script_results,
+                'usage': customer_sim.usage_recorder.summary,
+                'event_logger': {name: getattr(event_logger, name) for name in
+                                 ('current_day', '_event_count', '_total_llm_cost', '_missing_llm_cost')}})
+            receipt = {'success': True, 'snapshot_id': snapshot_id, 'day': simulator.current_day,
+                    'files': {name: file_hash(target / name) for name in
+                              ('world.nmdb', 'session.json', 'server_state.json')}}
+            if sql_evidence:
+                receipt['sql_evidence'] = sql_evidence.snapshot(target / 'sql-evidence.sqlite')
+                control = sql_evidence.path.with_suffix('.controls.jsonl')
+                if control.exists():
+                    import shutil
+                    shutil.copy2(control, target / control.name)
+                    receipt['files'][control.name] = file_hash(target / control.name)
+            return receipt
+
+        api_server.checkpoint_callback = _checkpoint
+    restored_state = os.environ.get('CEOBENCH_RESTORE_SERVER_STATE')
+    if restored_state:
+        state = json.loads(Path(restored_state).read_text())
+        if state['day'] != current_day:
+            raise ValueError('Restored dashboard day differs from world')
+        api_server._last_dashboard = state['dashboard']
+        if sql_evidence and sql_evidence.execution_capture and state['dashboard']:
+            from saas_bench.execution_capture import CapturedText
+            from saas_bench.sql_evidence import digest
+            saved = sql_evidence.load_state('dashboard')
+            if saved is None or saved['sha256'] != digest(state['dashboard'].encode()):
+                raise ValueError('Restored dashboard source state mismatch')
+            api_server._last_dashboard = CapturedText(state['dashboard'], saved['origins'])
+        api_server.last_script_results = state['script_results']
+        customer_sim.usage_recorder.summary = state['usage']
+        for name, value in state['event_logger'].items():
+            setattr(event_logger, name, value)
     api_server.start()
 
     # Set API port on tools so Python sandbox routes queries through HTTP
@@ -580,6 +675,9 @@ def main():
 
     args = parser.parse_args()
     base = Path(args.base).resolve()
+    if args.command in ('new-session', 'start-server') and os.environ.get('CEOBENCH_RUN_KIND') == 'formal':
+        from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+        BashAgentToolExecutor(base, require_sandbox=True).verify_sandbox()
 
     cmd_map = {
         "new-session": cmd_new_session,
