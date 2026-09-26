@@ -164,11 +164,14 @@ BASH_AGENT_TOOL_DEFS = [
 ]
 
 
-def get_bash_agent_tool_descriptions(text_registration=False) -> List[Dict[str, Any]]:
+def get_bash_agent_tool_descriptions(text_registration=False, pf_queries=False) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
     definitions = BASH_AGENT_TOOL_DEFS
     if text_registration:
         from saas_bench.registration_schema import tool_definitions
+        definitions = definitions + tool_definitions()
+    if pf_queries:
+        from saas_bench.pf_queries import tool_definitions
         definitions = definitions + tool_definitions()
     return [
         {
@@ -217,6 +220,10 @@ class BashAgentToolExecutor:
         self.stop_on_timeout = stop_on_timeout
         self.evidence_store = evidence_store
         self.text_registry = text_registry
+        self.pf_queries = None
+        if text_registry and text_registry.mode == 'pf':
+            from saas_bench.pf_queries import PFQueries
+            self.pf_queries = PFQueries(text_registry)
         self.capture = None
         self.preserved_process = None
 
@@ -245,6 +252,9 @@ class BashAgentToolExecutor:
         if self.text_registry:
             dispatch.update({f'text_{op}': lambda args, op=op: self.text_registry.execute(op, args)
                              for op in ('create', 'revise', 'retire', 'list')})
+        if self.pf_queries:
+            from saas_bench.pf_queries import MODELS
+            dispatch.update({op: lambda args, op=op: self.pf_queries.execute(op, args) for op in MODELS})
         handler = dispatch.get(tool_name)
         if handler is None:
             return f"Error: Unknown tool '{tool_name}'"
@@ -288,12 +298,15 @@ class BashAgentToolExecutor:
             result, status = f"Error: {exc}", 'failed'
         finally:
             if capture:
+                after = None
                 if before is not None:
                     after = capture.safe(capture.snapshot, self.workspace_path, 'after')
                     if after is not None:
                         capture.facts['changed_paths'] = sorted(k for k in before.keys() | after.keys()
                             if {x:v for x,v in before.get(k, {}).items() if x != 'version'} !=
                                {x:v for x,v in after.get(k, {}).items() if x != 'version'})
+                if self.pf_queries and result is not None and status == 'succeeded':
+                    result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
                 result = capture.finish(result, status)
                 if status == 'result_unknown':
                     capture.store.fail('Execution outcome unknown; branch paused')

@@ -78,6 +78,7 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
     from openai import OpenAI
     from anthropic import Anthropic
     from saas_bench.registration_schema import REGISTRATION_PROMPT
+    from saas_bench.pf_queries import PF_PROMPT, MODELS
     from saas_bench.model_usage import ModelUsage
     store, registry, executor = captured(workspace, tmp_path, mode if mode != 'off' else 'git')
     registry.execute('create', declaration(text='DO_NOT_AUTOLOAD_REGISTRATIONS'))
@@ -94,7 +95,7 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
     with (Anthropic if api == 'messages' else OpenAI)(api_key='offline-only', max_retries=0,
             http_client=httpx.Client(transport=httpx.MockTransport(handle))) as client:
         def new_agent():
-            value = BashAgent(get_bash_agent_tool_descriptions(mode != 'off'), client,
+            value = BashAgent(get_bash_agent_tool_descriptions(mode != 'off', mode == 'pf'), client,
                 workspace_path=workspace, total_days=42, text_registration=mode != 'off',
                 reasoning_effort='low' if api == 'responses' else None,
                 usage_recorder=ModelUsage(None, 'agent', evidence_store=store))
@@ -103,6 +104,8 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
         first = new_agent()
         assert first.act('dashboard', 0, False, {'day': 0}).tool == 'read_file'
         base = original_prompt(42) + (REGISTRATION_PROMPT if mode != 'off' else '')
+        if mode == 'pf':
+            base += PF_PROMPT
         expected = (base + '\n\n## Your MEMORY.md (auto-loaded)\n\n'
             'The following is the contents of your MEMORY.md file. '
             'This is automatically loaded into your context at the start of every day.\n\n' + memory[:40000] +
@@ -117,7 +120,7 @@ def test_group_tools_and_memory_in_actual_requests(workspace, tmp_path, api, mod
                 item['parameters'] = item.pop('input_schema')
         assert definitions[:6] == ORIGINAL['tools']
         assert [t['name'] for t in definitions[6:]] == ([] if mode == 'off' else
-            ['text_create', 'text_revise', 'text_retire', 'text_list'])
+            ['text_create', 'text_revise', 'text_retire', 'text_list'] + (list(MODELS) if mode == 'pf' else []))
         assert 'DO_NOT_AUTOLOAD_REGISTRATIONS' not in json.dumps(requests[0])
         first.record_tool_result('completed read')
         first._save_conversation_snapshot(strict=True)
@@ -308,22 +311,26 @@ base = 'http://127.0.0.1:' + os.environ['NOVAMIND_API_PORT']
 results = {}
 for path, payload in [('/checkpoint', {'expected_day': 7}), ('/pf/query', {}),
                       ('/evidence', None), ('/sql-evidence', None),
-                      ('/call', {'tool': 'pf_query', 'args': {}})]:
+                      ('/call', {'tool': 'pf_read', 'args': {}})]:
     request = urllib.request.Request(base + path, None if payload is None else json.dumps(payload).encode(), {'Content-Type':'application/json'})
     try: response = urllib.request.urlopen(request, timeout=5)
     except urllib.error.HTTPError as exc: response = exc
     with response: results[path] = {'status': response.status, 'body': json.load(response)}
 results['token_present'] = 'CEOBENCH_CHECKPOINT_TOKEN' in os.environ
 print(json.dumps(results))'''
-        probes['http'] = json.loads(child._execute_tool('bash', {'command': 'python -c ' + shlex.quote(code)}))
+        probes['http'] = json.loads(child._execute_tool('bash', {'command': 'python -c ' + shlex.quote(code)}).rsplit('\n[', 1)[0])
         assert probes['http']['/checkpoint'] == {'status': 403, 'body': {'error': 'Harness access required'}}
         assert not probes['http']['token_present']
         for path in ('/pf/query', '/evidence', '/sql-evidence'):
             assert probes['http'][path]['status'] == 404
         assert probes['http']['/call']['status'] == 200
         assert probes['http']['/call']['body']['success'] is False
-        assert 'Unknown tool: pf_query' in json.dumps(probes['http']['/call']['body'])
-        assert child._execute_tool('pf_query', {}).startswith('Error: Unknown tool')
+        assert 'Unknown tool: pf_read' in json.dumps(probes['http']['/call']['body'])
+        history = child._execute_tool('pf_read', {'target': {'record': 'r1.1'}})
+        if mode == 'pf':
+            assert json.loads(history.split('\n', 1)[1])['version'] == 'r1.1'
+        else:
+            assert history.startswith('Error: Unknown tool')
         result = child._execute_tool('text_revise', {'record': 'r1', 'reason': 'wording', 'text': 'Revised'})
         if mode == 'pf':
             assert json.loads(result)['evidence'][0]['version'].startswith('v')

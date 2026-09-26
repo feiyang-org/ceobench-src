@@ -100,6 +100,9 @@ class BashAgent(BaseAgent):
         if text_registration:
             from saas_bench.registration_schema import REGISTRATION_PROMPT
             self.system_prompt += REGISTRATION_PROMPT
+        if any(t['name'] == 'pf_dependencies' for t in tool_descriptions):
+            from saas_bench.pf_queries import PF_PROMPT
+            self.system_prompt += PF_PROMPT
 
         # Agent state
         self.conversation: List[Message] = []

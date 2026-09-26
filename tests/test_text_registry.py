@@ -244,7 +244,7 @@ def test_real_cli_query_projection_to_model_and_declared_comparison(workspace, t
     import shlex
     command = 'python -c ' + shlex.quote('from cli_fixture import cmd_query; from argparse import Namespace; cmd_query(Namespace(session=None, sql=' + repr(sql) + '))')
     result = executor.execute('bash', {'command': command})
-    assert json.loads(result)['row_count'] == 2
+    assert json.loads(result.rsplit('\n[', 1)[0])['row_count'] == 2
     settled(server)
     send(store, result)
     ref = dict(evidence={'sql': sql}, purpose='current', predicate=dict(type='compare',
@@ -335,7 +335,8 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
     runner = offline_runner(text_registration='prefix')
     runner.agent.current_day = 0
     runner._execute_tool('write_file', {'path': 'facts.json', 'content': '{"n":7}'})
-    result = runner._execute_tool('bash', {'command': 'git add facts.json && git -c user.name=Fixture -c user.email=fixture@example.invalid commit -m facts'})
+    # Keep this fixture synchronous: Git's detached maintenance is an open process boundary.
+    result = runner._execute_tool('bash', {'command': 'git add facts.json && git -c maintenance.auto=false -c user.name=Fixture -c user.email=fixture@example.invalid commit -m facts'})
     assert '[exit code:' not in result
     send(runner.evidence_store, runner._execute_tool('read_file', {'path': 'facts.json'}))
     assert json.loads(runner._execute_tool('text_create', declaration({'path': 'facts.json'})))['version'] == 'r1.1'
@@ -355,7 +356,11 @@ def test_packed_prefix_registration_restore_and_git_pf_forks(offline_runner, tmp
         result = json.loads(child._execute_tool('text_create', declaration({'record': 'r1.1'})))
         assert result['id'] == 'r2'
         assert ('evidence' in result) == (child.text_registration == 'pf')
-        assert child._execute_tool('pf_query', {}).startswith('Error: Unknown tool')
+        history = child._execute_tool('pf_read', {'target': {'record': 'r1.1'}})
+        if child.text_registration == 'pf':
+            assert json.loads(history.split('\n', 1)[1])['version'] == 'r1.1'
+        else:
+            assert history.startswith('Error: Unknown tool')
         # The only copy of resolved evidence identities is outside the workspace.
         assert not list(child.agent_workspace.rglob('*evidence.sqlite'))
         private = child.workspace_dir / 'sql-evidence.sqlite'

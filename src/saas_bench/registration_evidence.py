@@ -7,8 +7,6 @@ from pathlib import PurePosixPath
 import re
 import subprocess
 
-from .execution_capture import decoded
-
 
 def git_reference(workspace, evidence):
     path = evidence['path']
@@ -205,7 +203,7 @@ class EvidenceResolver:
             raw, _ = self.content(meta['derived_from'])
             return meta['derived_from'], raw['object_id'], body.decode(), 'query'
         if meta['layer'] == 'file_bytes':
-            return version, meta['object_id'], decoded(body), 'file'
+            return version, meta['object_id'], body.decode('utf-8'), 'file'
         if meta['layer'] == 'registered_text':
             return version, meta['object_id'], body.decode(), 'record'
         event = self.store.read_event(meta['created_by_event'])
@@ -232,7 +230,7 @@ class EvidenceResolver:
             explicit = handles.get(evidence['version'])
             if explicit is None:
                 raise ValueError('Unknown version handle; use a path or SQL instead')
-            _, object_id, _, kind = self.identity(explicit)
+            explicit, object_id, _, kind = self.identity(explicit)
         elif 'path' in evidence:
             object_id, kind = evidence['path'], 'file'
         elif 'record' in evidence:
@@ -242,12 +240,18 @@ class EvidenceResolver:
         else:
             raise ValueError('Unsupported PF evidence reference')
         candidates = []
+        query_definition = (self.store.read_event(self.content(explicit)[0]['created_by_event'])['query_definition']
+                            if explicit and kind == 'query' else None)
         for version, meta in versions:
             if kind != 'other' and meta['layer'] not in ('file_bytes', 'server_public_response', 'registered_text'):
                 continue
             if kind == 'query' and 'sql' in evidence:
                 event = self.store.read_event(meta['created_by_event'])
                 if event['request'].get('candidate_sql') != evidence['sql']:
+                    continue
+            elif query_definition:
+                definition = self.store.read_event(meta['created_by_event'])['query_definition']
+                if not definition or [definition[1], *definition[3:]] != [query_definition[1], *query_definition[3:]]:
                     continue
             elif (meta.get('object_id') or version) != object_id:
                 continue

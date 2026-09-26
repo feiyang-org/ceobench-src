@@ -1013,7 +1013,7 @@ __pycache__/
             text_registry=registry,
         )
 
-        tool_descriptions = get_bash_agent_tool_descriptions(registry is not None)
+        tool_descriptions = get_bash_agent_tool_descriptions(registry is not None, self.text_registration == 'pf')
         from saas_bench.model_usage import ModelUsage
 
         self.agent = BashAgent(

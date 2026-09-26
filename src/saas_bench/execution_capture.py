@@ -14,6 +14,10 @@ from .sql_evidence import digest, encoded, now
 CURRENT_EVENT = ContextVar('capture_event', default=None)
 EXCLUSIONS = ['sessions/*/world.nmdb', 'sessions/*/world.nmdb-*',
               'sessions/*/*.plain.tmp*', 'sessions/*/*.nmdb.tmp*']
+OBJECT_FIELDS = dict(project_id='research_project', customer_id='customer', group_id='customer_group',
+                     thread_id='enterprise_thread', post_id='social_post', agent_post_id='agent_social_post',
+                     reply_to_post_id='social_post', discovered_group_id='customer_group',
+                     plan='plan', channel='ad_channel')
 
 
 class CapturedText(str):
@@ -135,9 +139,7 @@ def finish_http(store, event, status, headers, body, execution):
     reads = {'get_social_posts', 'get_cost_info', 'list_research_projects', 'get_market_overview', 'get_group_insights'}
     classification = 'read' if request['method'] == 'GET' or tool in reads else 'write_receipt'
     objects, dates, outcomes = [], [], []
-    scalar_objects = dict(project_id='research_project', customer_id='customer', group_id='customer_group',
-                          thread_id='enterprise_thread', post_id='social_post', agent_post_id='agent_social_post',
-                          reply_to_post_id='social_post', discovered_group_id='customer_group')
+    scalar_objects = dict(OBJECT_FIELDS)
     keyed_objects = dict(by_group='customer_group', by_customer='customer', by_plan='plan',
                          by_channel='ad_channel', model_tiers='model_tier', capacity_tiers='capacity_tier')
     nested_objects = dict(by_group_plan=('customer_group', 'plan'), by_channel_group=('ad_channel', 'customer_group'))
