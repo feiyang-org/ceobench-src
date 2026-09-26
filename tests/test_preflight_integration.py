@@ -103,6 +103,22 @@ def test_agent_zipapp_excludes_engine_and_survives_restore(offline_runner, packe
     assert advance(restored)['success']
 
 
+def test_agent_cannot_reinitialize_simulator(offline_runner):
+    runner = offline_runner()
+    funding = './novamind-operation query "SELECT day, amount FROM ledger WHERE category=\'initial_funding\'"'
+    before = json.loads(runner._execute_tool('bash', {'command': funding}))['rows']
+    probe = ("import os, urllib.error, urllib.request\n"
+             "url = 'http://127.0.0.1:' + os.environ['NOVAMIND_API_PORT'] + '/reinitialize'\n"
+             "try: urllib.request.urlopen(urllib.request.Request(url, data=b'{}', method='POST'))\n"
+             "except urllib.error.HTTPError as error: print(error.code)\n")
+    runner._execute_tool('write_file', {'path': 'reinit_probe.py', 'content': probe})
+    assert runner._execute_tool('bash', {'command': 'python -S reinit_probe.py'}).strip() == '404'
+    # A rejected control request must not leave writes for the next week to commit.
+    assert json.loads(runner._execute_tool('bash', {'command': funding}))['rows'] == before
+    assert advance(runner)['success']
+    assert json.loads(runner._execute_tool('bash', {'command': funding}))['rows'] == before
+
+
 def business_state(runner):
     directory = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
     conn = load_session_db(directory / 'world.nmdb')

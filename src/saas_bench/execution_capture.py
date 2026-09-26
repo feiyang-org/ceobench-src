@@ -199,7 +199,7 @@ def public_handler(method):
             return receive_client(handler)
         if not store or not store.execution_capture:
             return method(handler)
-        if handler.path in ('/health', '/game-status', '/checkpoint', '/reinitialize'):
+        if handler.path in ('/health', '/game-status', '/checkpoint'):
             handler._control_capture = True
             try:
                 return method(handler)

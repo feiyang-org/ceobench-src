@@ -197,8 +197,6 @@ class _APIHandler(BaseHTTPRequestHandler):
                     self._send_json({'success': False, 'error': 'expected_day is required; no other fields allowed'}, 400)
                     return
                 self._send_json(self.server._api_server.checkpoint(body['expected_day']))
-            elif self.path == '/reinitialize':
-                self._handle_reinitialize()
             else:
                 self._send_json({"error": f"Unknown endpoint: {self.path}"}, 404)
         except Exception as exc:
@@ -353,20 +351,6 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": True, "data": {"output": str(result)}, "message": str(result)})
         except Exception as e:
             self._send_internal_error(e, op="call")
-
-    def _handle_reinitialize(self):
-        """Handle reinitialize request: POST /reinitialize."""
-        try:
-            server: NovaMindAPIServer = self.server._api_server
-            # Force reload of the simulation module
-            if 'saas_bench.simulation' in sys.modules:
-                # Delete cached module to force reload
-                del sys.modules['saas_bench.simulation']
-            # Reinitialize the simulator to set up _group_rngs
-            server.simulator.initialize()
-            self._send_json({"success": True, "message": "Simulator reinitialized"})
-        except Exception as e:
-            self._send_internal_error(e, op="reinitialize")
 
     def _handle_next_week(self):
         """Handle next-week advancement: POST /next-week.

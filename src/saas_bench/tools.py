@@ -4177,6 +4177,7 @@ os.chdir('{self.workspace_path}')
                 "INSERT INTO segment_discovery (day, cost, success, discovered_group_id, remaining_undiscovered) VALUES (?, ?, 0, NULL, 0)",
                 (self.current_day, cost)
             )
+            self.conn.commit()
             return ToolResult(True,
                 f"Market research complete (${cost:,.0f}). No new segments to discover — all segments have been identified.",
                 data={'cost': cost})
@@ -4240,6 +4241,7 @@ os.chdir('{self.workspace_path}')
                     (group_id, snapshot_day, snapshot_c_max, snapshot_q_min, snapshot_market_cap)
                 VALUES (?, ?, ?, ?, ?)
             """, (discovered_gid, self.current_day, snap_c_max, snap_q_min, snap_market_cap))
+            self.conn.commit()
 
             return ToolResult(True,
                 f"=== Market Research Success ===\n"
@@ -4258,6 +4260,7 @@ os.chdir('{self.workspace_path}')
                 "INSERT INTO segment_discovery (day, cost, success, discovered_group_id, remaining_undiscovered) VALUES (?, ?, 0, NULL, ?)",
                 (self.current_day, cost, remaining)
             )
+            self.conn.commit()
             return ToolResult(True,
                 f"Market research complete (${cost:,.0f}). No new segments discovered this time. "
                 f"Try again for another chance.",
