@@ -63,7 +63,7 @@ def observed(fn):
 def urlopen(request, *args, **kwargs):
     state = _CALLS.get()
     context = os.environ.get(_CONTEXT)
-    if state is None or not context or request.full_url.rsplit('/', 1)[-1] in ('health', 'game-status', 'checkpoint', 'reinitialize'):
+    if state is None or not context or request.full_url.rsplit('/', 1)[-1] in ('health', 'game-status', 'checkpoint'):
         return urllib.request.urlopen(request, *args, **kwargs)
     call = uuid.uuid4().hex
     request.add_header('X-Capture-Context', context)
