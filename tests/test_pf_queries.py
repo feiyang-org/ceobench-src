@@ -16,6 +16,8 @@ from test_preflight_integration import offline_runner, packed_public
 
 
 def query(executor, name, **args):
+    if name == 'pf_dependencies' and 'cursor' not in args:
+        args.setdefault('purpose', 'historical_only')
     text = executor.execute(name, args)
     assert not text.startswith('Error:'), text
     return json.loads(text)
@@ -343,7 +345,7 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
         traced = json.loads(child._execute_tool('pf_dependencies', dict(
-            target={'path': 'query.json'}, include_execution=True, depth=4)))
+            target={'path': 'query.json'}, include_execution=True, depth=4, purpose='historical_only')))
         assert any(item['target'].get('sql') == 'SELECT COUNT(*) AS n FROM ledger' for item in traced['items'])
         with closing(child.evidence_store.connect()) as conn:
             assert conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0] == count

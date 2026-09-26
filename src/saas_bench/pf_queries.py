@@ -49,19 +49,23 @@ class Dependents(Trace):
     current_only: bool = True
 
 
+class Dependencies(Trace):
+    purpose: Literal['current', 'historical_only'] = 'current'
+
+
 class Read(Page):
     target: Target | None = None
     mode: Literal['history', 'content', 'diff'] = 'content'
     baseline: Target | None = None
 
 
-MODELS = dict(pf_search=Search, pf_dependencies=Trace, pf_dependents=Dependents, pf_read=Read)
+MODELS = dict(pf_search=Search, pf_dependencies=Dependencies, pf_dependents=Dependents, pf_read=Read)
 
 
 def tool_definitions():
     descriptions = {
         'pf_search': 'Find captured evidence and registered text revisions by exact business object kind/id. Returns an index, not evidence contents. Object IDs come only from public fields or explicit declarations.',
-        'pf_dependencies': 'Trace the evidence cited by a captured version or registered text. Explicit references first; include_execution also follows observed execution associations, which do not imply semantic support. This implementation retrieves saved history only; no current-state or stale check runs.',
+        'pf_dependencies': 'Trace dependencies of a captured file or registered text. Explicit references first; include_execution also follows observed execution associations. With the runner stale check enabled, purpose=current refreshes all expanded SQL views and approved public reads, compares current files and evaluates reference predicates. Historical-only paths are skipped. A passing predicate stops downstream propagation; failures and unknown checks retain paths. Scripts never rerun. Results are advisory. purpose=historical_only retrieves saved history without checks.',
         'pf_dependents': 'Find references to an exact captured version, with paths and reference purposes. Defaults to current active registered texts, traversing old revisions to reach them; current_only=false also returns superseded and retired endpoints. Historical-only paths are labeled, never marked invalid. include_execution also returns observed execution associations.',
         'pf_read': 'Read immutable evidence (mode=content), list versions of its object (history), or compare baseline to target (diff). Paths, SQL and bare rN select the latest captured version; rN.M and vN select an exact version. Diff requires the same file, query view, or registered object. SQL comparison preserves types and duplicate rows and separately reports raw order. Content/diff are paged at 30000 characters. A diff does not count as reading the target.',
     }
@@ -72,11 +76,16 @@ def tool_definitions():
 
 PF_PROMPT = '''
 
-PF historical tools are available: pf_search finds business objects,
+PF tools are available: pf_search finds business objects,
 pf_dependencies follows references, pf_dependents finds referrers, and pf_read
 reads or compares saved versions. Index results do not deliver evidence contents;
-read a version before registering a reference to it. These tools currently query
-captured history only; automatic stale checks and delta/cache reads are not enabled.
+read a version before registering a reference to it. Current-purpose pf_dependencies
+automatically checks expanded dependencies when enabled by the runner. Historical-only
+references and purpose=historical_only do not trigger checks. All expanded SQL views
+rerun on one read-only snapshot; approved SDK reads rerun, scripts never do. A passing
+predicate stops changes propagating to referrers. The checks report observations,
+not whether your conclusions are correct. Other tools do not run stale checks.
+Delta/cache reads are not enabled.
 Execution associations are observed facts, not claims of semantic support.
 Use vN handles, workspace-relative paths, exact SQL, or rN.M. A path, SQL or bare
 rN in a PF query selects the latest captured version, whereas text registration
@@ -93,10 +102,12 @@ PUBLIC_LAYERS = {'file_bytes', 'file_text', 'server_public_response', 'registere
 
 
 class PFQueries:
-    def __init__(self, registry):
+    def __init__(self, registry, *, stale_checks=True, refresh=None):
         if registry.mode != 'pf':
             raise ValueError('PF queries require PF mode')
         self.store, self.resolver = registry.store, registry.resolver
+        self.workspace = registry.workspace
+        self.stale_checks, self.refresh = stale_checks, refresh
 
     def decorate(self, capture, text, after):
         kind = self.store.read_event(capture.event)['request']['kind']
@@ -132,6 +143,7 @@ class PFQueries:
             raise ValueError('; '.join('.'.join(map(str, e['loc'])) + ': ' + e['msg']
                                       for e in exc.errors(include_input=False))) from exc
         offset, cutoff = 0, None
+        self.check_state = None
         self.cursor_name = 'pf_cursors:' + self.store.identity['branch_id']
         self.cursors = self.store.load_state(self.cursor_name) or {}
         if 'cursor' in values:
@@ -141,6 +153,7 @@ class PFQueries:
             if not saved or saved['operation'] != operation:
                 raise ValueError('Unknown query cursor; start a new query')
             values, offset, cutoff = saved['values'], saved['offset'], saved['cutoff']
+            self.check_state = saved.get('check_state')
         self._index(cutoff)
         self.operation, self.values = operation, values
         if operation == 'pf_search':
@@ -161,9 +174,29 @@ class PFQueries:
                 key = self._key(target)
                 return self._page([v for v in self.nodes if self._key(v) == key], offset, self._describe)
             return self._read(target, offset)
-        rows = self._trace(target, operation == 'pf_dependents')
+        checking = (operation == 'pf_dependencies' and values['purpose'] == 'current' and self.stale_checks)
+        if self.check_state:
+            rows = self.store.load_state(self.check_state)
+        else:
+            rows = self._trace(target, operation == 'pf_dependents')
+            if checking:
+                from .execution_capture import CURRENT_EVENT
+                from .pf_stale import StaleCheck
+                event = CURRENT_EVENT.get()
+                own_event = event is None
+                if own_event:
+                    event = self.store.begin_event('pf_dependencies', values)
+                token = CURRENT_EVENT.set(event)
+                try:
+                    rows = StaleCheck(self).run(rows)
+                    self.check_state = 'pf_check:' + event
+                    self.store.save_state(self.check_state, rows)
+                    if own_event:
+                        self.store.complete(event)
+                finally:
+                    CURRENT_EVENT.reset(token)
         return self._page(rows, offset, self._describe_edge, root=self._describe(target),
-                          stale_check='not_performed')
+                          stale_check='performed' if checking else 'not_performed')
 
     def _index(self, cutoff):
         # ponytail: rebuild O(versions + edges) per query/page; persist an index if
@@ -286,6 +319,11 @@ class PFQueries:
             # Query hashes include a branch, but inherited SQL has the same
             # identity when run/data source/policy/SQL/parameters are unchanged.
             return ('query', encoded([definition[1], *definition[3:]]))
+        if meta['layer'] == 'server_public_response' and event['result'].get('classification') == 'read':
+            request = event['request']['request']
+            return ('public_read', encoded([request['method'], request['path'], request.get('parsed')]))
+        if meta['layer'] == 'dashboard':
+            return ('dashboard', 'latest')
         return (meta['layer'], meta.get('object_id') or version)
 
     def _edge(self, source, target, kind, origin='automatic_capture', **details):
@@ -391,10 +429,17 @@ class PFQueries:
                       traversal_only=item['traversal_only'])
         if 'reference' in edge:
             result.update(edge['reference'])
+        if 'check' in item:
+            check = dict(item['check'])
+            check['current_version'] = self.resolver.handle(check['current_version']) if check['current_version'] else None
+            check['affected_paths'] = [[self.resolver.handle(v) for v in path] for path in check['affected_paths']]
+            result['check'] = check
         return result
 
     def _cursor(self, offset):
         value = dict(operation=self.operation, values=self.values, offset=offset, cutoff=self.cutoff)
+        if self.check_state:
+            value['check_state'] = self.check_state
         cursor = next((k for k, v in self.cursors.items() if v == value), None)
         if cursor is None:
             cursor = 'c' + str(len(self.cursors) + 1)

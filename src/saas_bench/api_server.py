@@ -185,7 +185,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._handle_query()
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_post()
-            elif self.path == '/checkpoint':
+            elif self.path in ('/checkpoint', '/pf-refresh'):
                 import secrets
                 expected_token = self.server._api_server.checkpoint_token
                 supplied_token = self.headers.get('X-Harness-Token', '')
@@ -193,6 +193,20 @@ class _APIHandler(BaseHTTPRequestHandler):
                     self._send_json({'error': 'Harness access required'}, 403)
                     return
                 body = self._read_body()
+                if self.path == '/pf-refresh':
+                    if (set(body) != {'versions', 'parent'} or not isinstance(body['parent'], str) or
+                            not isinstance(body['versions'], list) or
+                            not all(isinstance(v, str) for v in body['versions'])):
+                        self._send_json({'error': 'versions and parent are required'}, 400)
+                        return
+                    from .pf_refresh import refresh
+                    try:
+                        result = refresh(self.server._api_server, body['versions'], body['parent'])
+                    except (ValueError, KeyError, TimeoutError, SnapshotUnavailable) as exc:
+                        self._send_json({'error': type(exc).__name__}, 400)
+                        return
+                    self._send_json({'versions': result})
+                    return
                 if set(body) != {'expected_day'} or not isinstance(body['expected_day'], int):
                     self._send_json({'success': False, 'error': 'expected_day is required; no other fields allowed'}, 400)
                     return

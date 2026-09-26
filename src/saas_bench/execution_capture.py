@@ -18,6 +18,8 @@ OBJECT_FIELDS = dict(project_id='research_project', customer_id='customer', grou
                      thread_id='enterprise_thread', post_id='social_post', agent_post_id='agent_social_post',
                      reply_to_post_id='social_post', discovered_group_id='customer_group',
                      plan='plan', channel='ad_channel')
+READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_projects',
+                        'get_market_overview', 'get_group_insights'})
 
 
 class CapturedText(str):
@@ -136,8 +138,7 @@ def finish_http(store, event, status, headers, body, execution):
         value = {}
     request = store.read_event(event)['request']['request']
     tool = (request.get('parsed') or {}).get('tool') if isinstance(request.get('parsed'), dict) else None
-    reads = {'get_social_posts', 'get_cost_info', 'list_research_projects', 'get_market_overview', 'get_group_insights'}
-    classification = 'read' if request['method'] == 'GET' or tool in reads else 'write_receipt'
+    classification = 'read' if request['method'] == 'GET' or tool in READ_TOOLS else 'write_receipt'
     objects, dates, outcomes = [], [], []
     scalar_objects = dict(OBJECT_FIELDS)
     keyed_objects = dict(by_group='customer_group', by_customer='customer', by_plan='plan',
@@ -187,7 +188,8 @@ def finish_http(store, event, status, headers, body, execution):
         outcome = 'partially_succeeded' if any(item['success'] for item in outcomes) else 'failed'
     store.complete(event, outcome,
                    http_status=status, headers=headers, classification=classification,
-                   public_success=value.get('success'), item_outcomes=outcomes, receive_state='unknown')
+                   public_success=value.get('success'), item_outcomes=outcomes, receive_state='unknown',
+                   **{k: execution[k] for k in ('refresh_of', 'day', 'snapshot_ref', 'refresh_error') if k in execution})
 
 
 def public_handler(method):
@@ -201,7 +203,7 @@ def public_handler(method):
             return receive_client(handler)
         if not store or not store.execution_capture:
             return method(handler)
-        if handler.path in ('/health', '/game-status', '/checkpoint'):
+        if handler.path in ('/health', '/game-status', '/checkpoint', '/pf-refresh'):
             handler._control_capture = True
             try:
                 return method(handler)

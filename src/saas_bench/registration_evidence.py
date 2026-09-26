@@ -157,7 +157,7 @@ def select_row(rows, columns, selector):
     matches = [i for i, row in enumerate(rows) if all(k in row and equal(row[k], v)
                 for k, v in selector['row'].items())]
     if len(matches) != 1:
-        raise ValueError('Row selector must match exactly one row')
+        raise ValueError('Row selector must match exactly one row; matched ' + ('no rows' if not matches else 'multiple rows'))
     return matches[0]
 
 

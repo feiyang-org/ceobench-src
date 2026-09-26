@@ -149,25 +149,7 @@ def execute_query(server, sql, *, metadata=None):
     deadline = time.monotonic() + server.QUERY_TIMEOUT_SECONDS
     try:
         with query_snapshot(server, deadline, metadata) as (conn, _):
-            metadata['attempted_sql'] = sql
-            cursor = conn.execute(sql)
-            metadata['executed_sql'] = sql
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            raw = cursor.fetchmany(ROW_LIMIT + 1)
-            metadata['losses'] = ['blob_coercion'] if any(
-                isinstance(value, bytes) for row in raw[:ROW_LIMIT] for value in row) else []
-            check_deadline(deadline)
-            result = {'success': True, 'columns': columns,
-                      'rows': [dict(row) for row in raw[:ROW_LIMIT]],
-                      'row_count': min(len(raw), ROW_LIMIT)}
-            if len(raw) > ROW_LIMIT:
-                result['truncated'] = True
-                result['warning'] = (
-                    f'Result exceeded {ROW_LIMIT} rows and was truncated. '
-                    'Add a LIMIT clause to your query, or use COUNT/GROUP BY to '
-                    'aggregate results instead of fetching all rows.'
-                )
-            return result
+            return execute_snapshot(conn, sql, deadline, metadata)
     except sqlite3.Error as exc:
         code = getattr(exc, 'sqlite_errorcode', None)
         if code in (sqlite3.SQLITE_AUTH, sqlite3.SQLITE_READONLY):
@@ -175,3 +157,27 @@ def execute_query(server, sql, *, metadata=None):
         if code == sqlite3.SQLITE_INTERRUPT:
             raise TimeoutError('Query time limit exceeded') from exc
         raise
+
+
+def execute_snapshot(conn, sql, deadline, metadata):
+    """Execute one original query on an already authorized snapshot."""
+    check_deadline(deadline)
+    metadata.update(attempted_sql=sql, executed_sql=None)
+    cursor = conn.execute(sql)
+    metadata['executed_sql'] = sql
+    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+    raw = cursor.fetchmany(ROW_LIMIT + 1)
+    metadata['losses'] = ['blob_coercion'] if any(
+        isinstance(value, bytes) for row in raw[:ROW_LIMIT] for value in row) else []
+    check_deadline(deadline)
+    result = {'success': True, 'columns': columns,
+              'rows': [dict(row) for row in raw[:ROW_LIMIT]],
+              'row_count': min(len(raw), ROW_LIMIT)}
+    if len(raw) > ROW_LIMIT:
+        result['truncated'] = True
+        result['warning'] = (
+            f'Result exceeded {ROW_LIMIT} rows and was truncated. '
+            'Add a LIMIT clause to your query, or use COUNT/GROUP BY to '
+            'aggregate results instead of fetching all rows.'
+        )
+    return result

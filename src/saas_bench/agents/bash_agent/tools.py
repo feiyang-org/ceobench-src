@@ -205,7 +205,7 @@ class BashAgentToolExecutor:
 
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
                  bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
-                 text_registry=None):
+                 text_registry=None, pf_stale_checks=True, pf_refresh=None):
         """Initialize the tool executor.
 
         Args:
@@ -223,7 +223,7 @@ class BashAgentToolExecutor:
         self.pf_queries = None
         if text_registry and text_registry.mode == 'pf':
             from saas_bench.pf_queries import PFQueries
-            self.pf_queries = PFQueries(text_registry)
+            self.pf_queries = PFQueries(text_registry, stale_checks=pf_stale_checks, refresh=pf_refresh)
         self.capture = None
         self.preserved_process = None
 

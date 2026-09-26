@@ -93,6 +93,7 @@ class BashAgentRunner:
         sql_capture: Optional[bool] = None,
         execution_capture: Optional[bool] = None,
         text_registration: Optional[str] = None,
+        pf_stale_checks: Optional[bool] = None,
     ):
         from saas_bench.model_usage import load_pricing
         self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
@@ -104,6 +105,10 @@ class BashAgentRunner:
             if text_registration is not None and text_registration != saved_registration:
                 raise ValueError('Resume text registration configuration mismatch')
             text_registration = saved_registration
+            saved_stale = saved_manifest.get('pf_stale_checks', False)
+            if pf_stale_checks is not None and pf_stale_checks != saved_stale:
+                raise ValueError('Resume stale check configuration mismatch')
+            pf_stale_checks = saved_stale
             saved_capture = bool(saved_manifest.get('sql_evidence'))
             saved_execution = (saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution'
             if execution_capture is not None and execution_capture != saved_execution:
@@ -133,6 +138,9 @@ class BashAgentRunner:
                 saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
             run_kind = saved['run_kind']
         self.text_registration = text_registration or 'off'
+        self.pf_stale_checks = (self.text_registration == 'pf' if pf_stale_checks is None else pf_stale_checks)
+        if self.pf_stale_checks and self.text_registration != 'pf':
+            raise ValueError('Automatic stale checks require PF mode')
         if self.text_registration not in ('off', 'git', 'prefix', 'pf'):
             raise ValueError('Invalid text registration mode')
         if self.text_registration in ('prefix', 'pf'):
@@ -402,7 +410,7 @@ class BashAgentRunner:
     def _http_post(self, path: str, data: Optional[Dict] = None, timeout: float = 1800) -> Dict:
         body = json.dumps(data or {}).encode()
         headers = {'Content-Type': 'application/json'}
-        if path == '/checkpoint':
+        if path in ('/checkpoint', '/pf-refresh'):
             headers['X-Harness-Token'] = self._checkpoint_token
         req = urllib.request.Request(
             self._server_url(path), data=body,
@@ -410,6 +418,9 @@ class BashAgentRunner:
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read())
+
+    def _pf_refresh(self, versions, parent):
+        return self._http_post('/pf-refresh', dict(versions=versions, parent=parent), timeout=180)['versions']
 
     def _get_cash(self) -> float:
         """Use the same status receipt as the run loop."""
@@ -700,6 +711,8 @@ __pycache__/
             manifest['sql_evidence'] = self.sql_evidence_config
         if self.text_registration != 'off':
             manifest['text_registration'] = self.text_registration
+        if self.text_registration == 'pf':
+            manifest['pf_stale_checks'] = self.pf_stale_checks
         if self.pricing_registration:
             manifest['pricing'] = self.pricing_registration
         manifest = json.loads(json.dumps(manifest))
@@ -884,6 +897,7 @@ __pycache__/
             if (saved_manifest.get('text_registration') == 'prefix' and
                     expected_manifest.get('text_registration') in ('git', 'pf')):
                 expected_manifest['text_registration'] = 'prefix'
+                expected_manifest.pop('pf_stale_checks', None)
         if saved_manifest != expected_manifest:
             raise ValueError('Checkpoint configuration differs from run manifest')
         if self.sql_evidence_config:
@@ -1011,6 +1025,7 @@ __pycache__/
             require_sandbox=self.run_kind == 'formal', stop_on_timeout=True,
             evidence_store=self.evidence_store,
             text_registry=registry,
+            pf_stale_checks=self.pf_stale_checks, pf_refresh=self._pf_refresh,
         )
 
         tool_descriptions = get_bash_agent_tool_descriptions(registry is not None, self.text_registration == 'pf')
@@ -1055,6 +1070,7 @@ __pycache__/
             'label': self.label,
             'public_dir_override': os.environ.get('NOVAMIND_PUBLIC_DIR') or None,
             'text_registration': self.text_registration,
+            'pf_stale_checks': self.pf_stale_checks,
         }
         with open(self.workspace_dir / "config.json", 'w') as f:
             json.dump(config, f, indent=2)
@@ -1480,6 +1496,8 @@ def main():
     parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
     parser.add_argument('--pricing-file', type=Path, help='JSON with source, basis, and exact-model USD/1k token rates')
     parser.add_argument('--execution-capture', action=argparse.BooleanOptionalAction, default=None, help='Capture public receipts, files, Bash and model source occurrences')
+    parser.add_argument('--pf-stale-checks', action=argparse.BooleanOptionalAction, default=None,
+                        help='Automatic current-purpose PF dependency checks; default on in PF, disable for offline ablation')
     parser.add_argument('--text-registration', choices=['off', 'git', 'prefix', 'pf'], default=None,
                         help='Shared text tools; prefix privately binds evidence, pf validates delivered evidence; default off')
     parser.add_argument('--sql-capture', action=argparse.BooleanOptionalAction, default=None,
@@ -1501,6 +1519,7 @@ def main():
         run_kind=args.run_kind,
         pricing_file=args.pricing_file,
         sql_capture=args.sql_capture, execution_capture=args.execution_capture, text_registration=args.text_registration,
+        pf_stale_checks=args.pf_stale_checks,
     )
 
     result = runner.run(verbose=not args.quiet)
