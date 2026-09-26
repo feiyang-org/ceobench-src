@@ -122,8 +122,9 @@ class _Stream(httpx.SyncByteStream):
 
 
 class ModelUsage:
-    def __init__(self, path, role, pricing=None, evidence_store=None):
+    def __init__(self, path, role, pricing=None, evidence_store=None, token_counter=None):
         self.evidence_store = evidence_store
+        self.token_counter = token_counter
         self.source_records = []
         self.context_id = uuid.uuid4().hex if evidence_store else None
         self.path = Path(path) if path else None
@@ -235,8 +236,15 @@ class ModelUsage:
         return client
 
     def call(self, api, request, invoke, **context):
+        replacements = []
         if self.evidence_store:
             from .execution_capture import text_sources
+            from .pf_read import prepare_request
+            try:
+                replacements = prepare_request(self.evidence_store, request, self.context_id, self.token_counter)
+            except Exception as exc:
+                self.evidence_store.fail(exc)
+                raise
             self.source_records = text_sources(request)
         call_id = uuid.uuid4().hex
         started = datetime.now(timezone.utc)
@@ -272,3 +280,6 @@ class ModelUsage:
                                error=error, cost_usd=cost, pricing=self.pricing.get(served_model))
             finally:
                 _CALL.reset(token)
+                if replacements:
+                    from .pf_read import restore_request
+                    restore_request(request, replacements)

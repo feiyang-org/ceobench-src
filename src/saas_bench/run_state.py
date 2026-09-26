@@ -165,7 +165,10 @@ def clone_sql_run(source, destination, branch_id, *, text_registration=None, pf_
             raise ValueError('Registration forks must change prefix to git or pf')
         manifest['text_registration'] = text_registration
         if text_registration == 'pf':
+            from .payload_tokens import tokenizer_config
             manifest['pf_stale_checks'] = True if pf_stale_checks is None else pf_stale_checks
+            config = manifest['configuration']
+            manifest['pf_read_tokenizer'] = tokenizer_config(config['provider'], config['model'])
     from contextlib import closing
     import sqlite3
     with closing(sqlite3.connect(f'file:{directory / "sql-evidence.sqlite"}?mode=ro', uri=True)) as conn:

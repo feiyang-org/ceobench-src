@@ -23,9 +23,10 @@ READ_TOOLS = frozenset({'get_social_posts', 'get_cost_info', 'list_research_proj
 
 
 class CapturedText(str):
-    def __new__(cls, text, origins=()):
+    def __new__(cls, text, origins=(), pf_read=None):
         value = super().__new__(cls, text)
         value.origins = list(origins)
+        value.pf_read = pf_read
         return value
 
 
@@ -115,7 +116,7 @@ class ExecutionCapture:
         if self.event:
             self.safe(self.store.complete, self.event, status, **self.facts)
         origins = [origin(version, text)] if version else []
-        return CapturedText(text, origins + self.origins) if text is not None else None
+        return CapturedText(text, origins + self.origins, getattr(text, 'pf_read', None)) if text is not None else None
 
 
 def capture_http(handler, raw):
@@ -376,6 +377,8 @@ def text_sources(value, pointer=''):
     result = []
     if isinstance(value, CapturedText):
         result.append(dict(pointer=pointer, text=str(value), origins=value.origins))
+        if value.pf_read is not None:
+            result[-1]['pf_read'] = value.pf_read
     elif isinstance(value, dict):
         for key, item in value.items():
             result.extend(text_sources(item, pointer + '/' + str(key).replace('~', '~0').replace('/', '~1')))
@@ -400,7 +403,7 @@ def restore_sources(value, records):
         key = int(key) if isinstance(target, list) else key.replace('~1', '/').replace('~0', '~')
         if target[key] != record['text']:
             raise ValueError('Private source state differs from conversation snapshot')
-        target[key] = CapturedText(target[key], record['origins'])
+        target[key] = CapturedText(target[key], record['origins'], record.get('pf_read'))
 
 
 def model_request(store, raw, sources, call_id, attempt_id, context_id):
@@ -425,6 +428,9 @@ def model_request(store, raw, sources, call_id, attempt_id, context_id):
                                     attempt_id=attempt_id, json_pointer=source['pointer'],
                                     send_state_event_id=event))
     store.version(event, 'occurrences', encoded(occurrences), layer='model_source_occurrences')
+    if any(source.get('pf_read') for source in sources):
+        from .pf_read import record_request
+        record_request(store, event, body, sources, context_id)
     return event
 
 

@@ -712,7 +712,9 @@ __pycache__/
         if self.text_registration != 'off':
             manifest['text_registration'] = self.text_registration
         if self.text_registration == 'pf':
+            from saas_bench.payload_tokens import tokenizer_config
             manifest['pf_stale_checks'] = self.pf_stale_checks
+            manifest['pf_read_tokenizer'] = tokenizer_config(self.provider, self.model)
         if self.pricing_registration:
             manifest['pricing'] = self.pricing_registration
         manifest = json.loads(json.dumps(manifest))
@@ -898,6 +900,7 @@ __pycache__/
                     expected_manifest.get('text_registration') in ('git', 'pf')):
                 expected_manifest['text_registration'] = 'prefix'
                 expected_manifest.pop('pf_stale_checks', None)
+                expected_manifest.pop('pf_read_tokenizer', None)
         if saved_manifest != expected_manifest:
             raise ValueError('Checkpoint configuration differs from run manifest')
         if self.sql_evidence_config:
@@ -988,6 +991,10 @@ __pycache__/
             if os.environ.get('BOSSBENCH_LLM_REPLAY_DB') or os.environ.get('ORACLE_MODE') == '1':
                 raise ValueError('Formal runs cannot enable replay or oracle mode')
         self._prepare_manifest()
+        self.payload_token_counter = None
+        if self.text_registration == 'pf':
+            from saas_bench.payload_tokens import load_counter
+            self.payload_token_counter = load_counter(self.provider, self.model)
         self._NextDayTimeoutError = NextDayTimeoutError
 
         # ── Step 1: Copy public/ and create session via CLI ──
@@ -1042,7 +1049,8 @@ __pycache__/
             workspace_path=self.agent_workspace,
             total_days=self.total_days,
             anthropic_fallback_model=self.anthropic_fallback_model,
-            usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing, self.evidence_store),
+            usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing,
+                                      self.evidence_store, self.payload_token_counter),
             text_registration=registry is not None,
         )
 

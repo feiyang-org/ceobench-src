@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, ValidationError, model_validator
 
-from .execution_capture import CapturedText, OBJECT_FIELDS, origin
+from .execution_capture import CapturedText, OBJECT_FIELDS
 from .registration_schema import BusinessObject, Input, Text
 from .sql_evidence import encoded
 
@@ -57,6 +57,7 @@ class Read(Page):
     target: Target | None = None
     mode: Literal['history', 'content', 'diff'] = 'content'
     baseline: Target | None = None
+    full: bool = False
 
 
 MODELS = dict(pf_search=Search, pf_dependencies=Dependencies, pf_dependents=Dependents, pf_read=Read)
@@ -67,7 +68,7 @@ def tool_definitions():
         'pf_search': 'Find captured evidence and registered text revisions by exact business object kind/id. Returns an index, not evidence contents. Object IDs come only from public fields or explicit declarations.',
         'pf_dependencies': 'Trace dependencies of a captured file or registered text. Explicit references first; include_execution also follows observed execution associations. With the runner stale check enabled, purpose=current refreshes all expanded SQL views and approved public reads, compares current files and evaluates reference predicates. Historical-only paths are skipped. A passing predicate stops downstream propagation; failures and unknown checks retain paths. Scripts never rerun. Results are advisory. purpose=historical_only retrieves saved history without checks.',
         'pf_dependents': 'Find references to an exact captured version, with paths and reference purposes. Defaults to current active registered texts, traversing old revisions to reach them; current_only=false also returns superseded and retired endpoints. Historical-only paths are labeled, never marked invalid. include_execution also returns observed execution associations.',
-        'pf_read': 'Read immutable evidence (mode=content), list versions of its object (history), or compare baseline to target (diff). Paths, SQL and bare rN select the latest captured version; rN.M and vN select an exact version. Diff requires the same file, query view, or registered object. SQL comparison preserves types and duplicate rows and separately reports raw order. Content/diff are paged at 30000 characters. A diff does not count as reading the target.',
+        'pf_read': 'Read immutable evidence (mode=content), list versions of its object (history), or compare baseline to target (diff). Content automatically uses FULL, DELTA or UNCHANGED when the current request contains a complete recoverable baseline and compact output costs fewer tokens. Set full=true with mode=content to request full text. Paths, SQL and bare rN select the latest captured version; rN.M and vN select an exact version. Diff requires the same file, query view, or registered object. SQL comparison preserves types and duplicate rows and separately reports raw order. Content/diff are paged at 30000 characters. A diff does not count as reading the target.',
     }
     return [dict(name=name, description=descriptions[name] +
                  ' Continue a page with only its cursor; pagination uses a fixed snapshot.',
@@ -85,7 +86,12 @@ references and purpose=historical_only do not trigger checks. All expanded SQL v
 rerun on one read-only snapshot; approved SDK reads rerun, scripts never do. A passing
 predicate stops changes propagating to referrers. The checks report observations,
 not whether your conclusions are correct. Other tools do not run stale checks.
-Delta/cache reads are not enabled.
+Content reads may return FULL, DELTA or UNCHANGED. DELTA lists [start,end,text]
+replacements using zero-based Unicode character offsets in the original baseline;
+apply all replacements together. UNCHANGED reuses the named baseline exactly.
+Only complete baselines and verified difference chains in this request qualify.
+Use pf_read with full=true for full text. Repeating the same target immediately
+after a compact read also returns full text once per target and context.
 Execution associations are observed facts, not claims of semantic support.
 Use vN handles, workspace-relative paths, exact SQL, or rN.M. A path, SQL or bare
 rN in a PF query selects the latest captured version, whereas text registration
@@ -99,6 +105,16 @@ older versions. Keep next_cursor to continue the same snapshot using only cursor
 PUBLIC_LAYERS = {'file_bytes', 'file_text', 'server_public_response', 'registered_text',
                  'registered_script', 'executed_code', 'stdout', 'stderr', 'dashboard',
                  'query_model_projection', 'tool_return'}
+
+
+def evidence_key(version, meta, query, result, request):
+    if meta['layer'] == 'server_public_response' and query:
+        return ('query', encoded([query[1], *query[3:]]).decode())
+    if meta['layer'] == 'server_public_response' and result.get('classification') == 'read':
+        return ('public_read', encoded([request['method'], request['path'], request.get('parsed')]).decode())
+    if meta['layer'] == 'dashboard':
+        return ('dashboard', 'latest')
+    return (meta['layer'], meta.get('object_id') or version)
 
 
 class PFQueries:
@@ -170,6 +186,8 @@ class PFQueries:
             mode = values['mode']
             if (mode == 'diff') != ('baseline' in values):
                 raise ValueError('baseline is required only for diff')
+            if values['full'] and mode != 'content':
+                raise ValueError('full is supported only for content reads')
             if mode == 'history':
                 key = self._key(target)
                 return self._page([v for v in self.nodes if self._key(v) == key], offset, self._describe)
@@ -236,7 +254,7 @@ class PFQueries:
                         for i, result in enumerate(body.get('rows', [])) for key, value in result.items()
                         if key in OBJECT_FIELDS and type(value) in (str, int)]
                 self.latest[self._key(row['version_id'])] = row['version_id']
-            elif meta['layer'] in ('agent_declaration', 'model_source_occurrences', 'workspace_boundary'):
+            elif meta['layer'] in ('agent_declaration', 'model_source_occurrences', 'model_reconstructions', 'workspace_boundary'):
                 private.append((row['version_id'], row['event_id'], meta['layer']))
         files, execution_outputs, execution_inputs = {}, defaultdict(list), defaultdict(list)
         codes = defaultdict(list)
@@ -286,7 +304,7 @@ class PFQueries:
                     self._edge(source, target, 'reference', origin='agent_declaration',
                                reference=ref, reason=reason or ('captured_version_unavailable' if target not in self.nodes else None),
                                missing=target not in self.nodes)
-            elif layer == 'model_source_occurrences':
+            elif layer in ('model_source_occurrences', 'model_reconstructions'):
                 event = self.events[event_id]
                 if event['result'].get('send_state') == 'response_received' and event['result'].get('status') == 'succeeded':
                     for item in value:
@@ -314,17 +332,7 @@ class PFQueries:
     def _key(self, version):
         row = self.nodes[version]
         meta, event = row['meta'], self.events[row['event_id']]
-        if meta['layer'] == 'server_public_response' and event['query']:
-            definition = event['query']
-            # Query hashes include a branch, but inherited SQL has the same
-            # identity when run/data source/policy/SQL/parameters are unchanged.
-            return ('query', encoded([definition[1], *definition[3:]]))
-        if meta['layer'] == 'server_public_response' and event['result'].get('classification') == 'read':
-            request = event['request']['request']
-            return ('public_read', encoded([request['method'], request['path'], request.get('parsed')]))
-        if meta['layer'] == 'dashboard':
-            return ('dashboard', 'latest')
-        return (meta['layer'], meta.get('object_id') or version)
+        return evidence_key(version, meta, event['query'], event['result'], event['request'].get('request'))
 
     def _edge(self, source, target, kind, origin='automatic_capture', **details):
         if target not in self.nodes and origin != 'agent_declaration':
@@ -493,5 +501,6 @@ class PFQueries:
                       next_cursor=self._cursor(end) if end < len(content) else None,
                       truncated_reason='character_limit' if end < len(content) else None)
         prefix = encoded(header).decode() + '\n'
-        origins = [origin(target, content, offset, end, len(prefix))] if self.values['mode'] == 'content' else []
-        return CapturedText(prefix + content[offset:end], origins)
+        from .pf_read import capture_read
+        return capture_read(self, target, prefix + content[offset:end],
+                            offset, end, len(content))

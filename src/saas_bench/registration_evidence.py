@@ -267,6 +267,8 @@ class EvidenceResolver:
                     event['result'].get('status') != 'succeeded'):
                 continue
             occurrences = json.loads(self.content(occurrence_version)[1])
+            if meta['created_by_event'] + ':reconstructed' in event['outputs']:
+                occurrences += json.loads(self.content(meta['created_by_event'] + ':reconstructed')[1])
             # Newest acquired evidence in the last actual request wins, regardless of
             # message field ordering (old tool messages often recur in the same request).
             for candidate in candidates:
