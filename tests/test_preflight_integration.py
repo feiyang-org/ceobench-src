@@ -72,6 +72,53 @@ def advance(runner):
                         for h in ('cash_1wk', 'cash_4wk', 'cash_12wk', 'cash_26wk')}}, timeout=120)
 
 
+def test_agent_zipapp_excludes_engine_and_survives_restore(offline_runner, packed_public):
+    import shlex
+    import zipfile
+    from saas_bench.run_state import file_hash
+
+    runner = offline_runner()
+    expected = ['__main__.py', '_client_capture.pyc', '_public_cli.pyc']
+    # Inspect bytes from the actual sandbox with sitecustomize disabled. Import
+    # restrictions cannot protect engine code or decryption keys in a zipapp.
+    probe = "import json, zipfile; print(json.dumps(sorted(zipfile.ZipFile('novamind-operation').namelist())))"
+    command = 'python -S -c ' + shlex.quote(probe)
+    assert json.loads(runner._execute_tool('bash', {'command': command})) == expected
+    client_hash = file_hash(packed_public / 'novamind-client')
+    assert file_hash(runner.agent_workspace / 'novamind-operation') == client_hash
+    with zipfile.ZipFile(packed_public / 'novamind-operation') as archive:
+        assert 'saas_bench/server_entry.pyc' in archive.namelist()
+    denied = runner._execute_tool('bash', {'command': 'NOVAMIND_SERVER_MODE=1 ./novamind-operation --help'})
+    assert 'Simulation server is managed by the host Runner.' in denied
+    assert '[exit code: 1]' in denied
+    query = runner._execute_tool('bash', {'command': './novamind-operation query "SELECT COUNT(*) AS n FROM ledger"'})
+    assert json.loads(query)['rows'][0]['n'] >= 0
+    assert advance(runner)['success']
+    runner._commit_weeks_up_to(7)
+    runner._save_checkpoint(7)
+    runner._stop_server()
+    restored = offline_runner(runner.workspace_dir)
+    assert file_hash(restored.agent_workspace / 'novamind-operation') == client_hash
+    assert json.loads(restored._execute_tool('bash', {'command': command})) == expected
+    assert advance(restored)['success']
+
+
+def test_agent_cannot_reinitialize_simulator(offline_runner):
+    runner = offline_runner()
+    funding = './novamind-operation query "SELECT day, amount FROM ledger WHERE category=\'initial_funding\'"'
+    before = json.loads(runner._execute_tool('bash', {'command': funding}))['rows']
+    probe = ("import os, urllib.error, urllib.request\n"
+             "url = 'http://127.0.0.1:' + os.environ['NOVAMIND_API_PORT'] + '/reinitialize'\n"
+             "try: urllib.request.urlopen(urllib.request.Request(url, data=b'{}', method='POST'))\n"
+             "except urllib.error.HTTPError as error: print(error.code)\n")
+    runner._execute_tool('write_file', {'path': 'reinit_probe.py', 'content': probe})
+    assert runner._execute_tool('bash', {'command': 'python -S reinit_probe.py'}).strip() == '404'
+    # A rejected control request must not leave writes for the next week to commit.
+    assert json.loads(runner._execute_tool('bash', {'command': funding}))['rows'] == before
+    assert advance(runner)['success']
+    assert json.loads(runner._execute_tool('bash', {'command': funding}))['rows'] == before
+
+
 def business_state(runner):
     directory = checkpoint_directory(runner.workspace_dir, runner._load_checkpoint())
     conn = load_session_db(directory / 'world.nmdb')

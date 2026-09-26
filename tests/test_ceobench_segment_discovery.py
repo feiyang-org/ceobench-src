@@ -48,3 +48,24 @@ def test_market_research_discovers_one_group_and_charges_cash(
         (discovered_group_id,),
     ).fetchone()
     assert snapshot["snapshot_day"] == 0
+
+
+@pytest.mark.parametrize("discover_prob,exhaust_first", [(1.0, False), (0.0, False), (1.0, True)])
+def test_market_research_commits_before_returning(
+    make_initialized_sim,
+    make_agent_tools,
+    discover_prob,
+    exhaust_first,
+):
+    # Public SQL refuses snapshots while the world has an open transaction.
+    config = BenchmarkConfig(seed=123, market_research_discover_prob=discover_prob)
+    conn, _sim, config = make_initialized_sim(config=config, seed=123)
+    conn.commit()
+    tools = make_agent_tools(conn, config, seed=123)
+    while exhaust_first and get_undiscovered_groups(conn):
+        assert tools.research_market().success
+    attempts = conn.execute("SELECT COUNT(*) FROM segment_discovery").fetchone()[0]
+
+    assert tools.research_market().success
+    assert not conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) FROM segment_discovery").fetchone()[0] == attempts + 1

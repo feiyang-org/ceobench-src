@@ -164,8 +164,12 @@ BASH_AGENT_TOOL_DEFS = [
 ]
 
 
-def get_bash_agent_tool_descriptions() -> List[Dict[str, Any]]:
+def get_bash_agent_tool_descriptions(text_registration=False) -> List[Dict[str, Any]]:
     """Get OpenAI Responses API-compatible tool descriptions for the bash agent."""
+    definitions = BASH_AGENT_TOOL_DEFS
+    if text_registration:
+        from saas_bench.registration_schema import tool_definitions
+        definitions = definitions + tool_definitions()
     return [
         {
             'type': 'function',
@@ -173,7 +177,7 @@ def get_bash_agent_tool_descriptions() -> List[Dict[str, Any]]:
             'description': t['description'],
             'parameters': t['parameters'],
         }
-        for t in BASH_AGENT_TOOL_DEFS
+        for t in definitions
     ]
 
 
@@ -197,7 +201,8 @@ class BashAgentToolExecutor:
     """Executes bash_agent tools within a working directory."""
 
     def __init__(self, workspace_path: Path, env: Optional[Dict[str, str]] = None,
-                 bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None):
+                 bash_timeout: int = 1200, require_sandbox: bool = False, stop_on_timeout: bool = False, evidence_store=None,
+                 text_registry=None):
         """Initialize the tool executor.
 
         Args:
@@ -211,6 +216,7 @@ class BashAgentToolExecutor:
         self.require_sandbox = require_sandbox
         self.stop_on_timeout = stop_on_timeout
         self.evidence_store = evidence_store
+        self.text_registry = text_registry
         self.capture = None
         self.preserved_process = None
 
@@ -236,6 +242,9 @@ class BashAgentToolExecutor:
             'search_files': self._exec_search_files,
             'glob_files': self._exec_glob_files,
         }
+        if self.text_registry:
+            dispatch.update({f'text_{op}': lambda args, op=op: self.text_registry.execute(op, args)
+                             for op in ('create', 'revise', 'retire', 'list')})
         handler = dispatch.get(tool_name)
         if handler is None:
             return f"Error: Unknown tool '{tool_name}'"
@@ -263,6 +272,8 @@ class BashAgentToolExecutor:
                         'unobserved_internal_file_reads', 'unobserved_intermediate_file_versions',
                         'unobserved_pipe_streams', 'unobserved_program_data_dependencies']
             result = handler(args)
+            if capture:
+                capture.origins.extend(getattr(result, 'origins', []))
             if tool_name != 'bash' and result.startswith('Error:'):
                 status = 'failed'
             elif capture and capture.facts.get('timed_out'):
@@ -323,6 +334,7 @@ class BashAgentToolExecutor:
     # encryption is meaningless.
     _FORBIDDEN_SANDBOX_ENV = frozenset({
         'NMDB_KEY',
+        'CEOBENCH_CHECKPOINT_TOKEN',
     })
 
     @classmethod
@@ -531,6 +543,8 @@ class BashAgentToolExecutor:
             )
         if self.capture:
             self.capture.facts.update(process_started=True, pid=proc.pid)
+            sink = os.fstat(proc.stdout.fileno())
+            self.capture.facts['stdout_sink'] = [sink.st_dev, sink.st_ino]
         try:
             raw_stdout, raw_stderr = boundary.communicate(proc, self.bash_timeout)
             if self.capture:
@@ -640,6 +654,8 @@ class BashAgentToolExecutor:
         result = []
         if stdout:
             result.append(origin(self.capture.event + ':stdout', stdout))
+            from saas_bench.execution_capture import query_projection
+            result.extend(self.capture.safe(query_projection, self.capture, stdout) or [])
         if stderr:
             result.append(origin(self.capture.event + ':stderr', stderr,
                                  target=(len(stdout) + 1 if stdout else 0) + len('[stderr]\n')))
@@ -675,7 +691,9 @@ class BashAgentToolExecutor:
         target = 0
         for i, line in enumerate(lines, start=start + 1):
             prefix = f'{i:6d}\t'
-            self._source(version, content, source_start, source_start + len(line), target + len(prefix))
+            # The inserted separator is the original newline between these lines.
+            newline = int(i < start + len(lines))
+            self._source(version, content, source_start, source_start + len(line) + newline, target + len(prefix))
             numbered.append(prefix + line)
             source_start += len(line) + 1
             target += len(prefix) + len(line) + 1

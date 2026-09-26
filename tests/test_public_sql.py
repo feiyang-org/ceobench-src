@@ -145,6 +145,28 @@ def test_timeout_transaction_and_unknown_world(server, monkeypatch):
     with pytest.raises(SnapshotUnavailable): execute_query(server, 'SELECT 1')
 
 
+@pytest.mark.parametrize('tool,args', [
+    ('set_targeted_ad_spend', {'targeted_spend': {'social_media': {'S1': 10}}}),
+    ('set_targeted_ops_spend', {'targeted_spend': {'S1': 10}}),
+    ('set_targeted_dev_spend', {'targeted_spend': {'S1': 10}}),
+    ('set_ads_strength', {'global_strength': 0.1}),
+    ('set_lead_promotion', {'global_promotion': 1}),
+    ('set_promotion', {'global_promotion': 1}),
+])
+def test_config_override_success_allows_immediate_public_query(server, tool, args):
+    from saas_bench.tools import AgentTools
+    server.tools = AgentTools(server.conn, 0, server.script_workspace)
+    before = execute_query(server, 'SELECT amount FROM ledger')['rows']
+    assert server.execute_tool(tool, args).success
+    assert execute_query(server, 'SELECT amount FROM ledger')['rows'] == before
+    assert not server.conn.in_transaction
+    # A successful configuration action must persist its history independently
+    # of the next weekly advance or another tool's incidental commit.
+    db_path = server.conn.execute('PRAGMA database_list').fetchone()[2]
+    with sqlite3.connect(db_path) as independent:
+        assert independent.execute('SELECT tool_name FROM config_overrides').fetchall() == [(tool,)]
+
+
 def request(server, body):
     req = urllib.request.Request(f'http://127.0.0.1:{server.port}/query', json.dumps(body).encode(), {'Content-Type':'application/json'})
     try: response = urllib.request.urlopen(req, timeout=5)

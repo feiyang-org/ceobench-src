@@ -2166,6 +2166,7 @@ class AgentTools:
 
         record_config_override(self.conn, self.current_day, 'set_targeted_ad_spend', 'targeted_ad_spend',
                                {'targeted_spend': targeted_spend})
+        self.conn.commit()
         return ToolResult(True, result_msg, {
             'targeted_spend': targeted_spend,
             'total_per_day': total_per_day,
@@ -2311,6 +2312,7 @@ class AgentTools:
                 'by_customer': {str(k): v for k, v in c.items()},
             },
         )
+        self.conn.commit()
         return ToolResult(True, result_msg, {
             'by_group': g,
             'by_plan': p,
@@ -2362,6 +2364,7 @@ class AgentTools:
 
         record_config_override(self.conn, self.current_day, 'set_targeted_dev_spend', 'targeted_dev_spend',
                                {'targeted_spend': targeted_spend})
+        self.conn.commit()
         return ToolResult(True, result_msg, {
             'targeted_spend': targeted_spend,
             'total_extra_per_day': total_extra,
@@ -2424,6 +2427,7 @@ class AgentTools:
             'by_group': self.config.ads_strength_by_group,
             'by_customer': {str(k): v for k, v in self.config.ads_strength_by_customer.items()},
         })
+        self.conn.commit()
         return ToolResult(True, "Ads strength updated.", {
             'global': self.config.ads_strength_global,
             'by_group': self.config.ads_strength_by_group,
@@ -2507,6 +2511,7 @@ class AgentTools:
             'by_channel': self.config.lead_promotion_by_channel,
             'by_channel_group': self.config.lead_promotion_by_channel_group,
         })
+        self.conn.commit()
         return ToolResult(True, "Lead promotion updated.", {
             'global': self.config.lead_promotion_global,
             'by_group': self.config.lead_promotion_by_group,
@@ -2597,6 +2602,7 @@ class AgentTools:
             'by_customer': {str(k): v for k, v in self.config.promotion_by_customer.items()},
             'by_group_plan': self.config.promotion_by_group_plan,
         })
+        self.conn.commit()
         return ToolResult(True, "Promotion updated.", {
             'global': self.config.promotion_global,
             'by_group': self.config.promotion_by_group,
@@ -4171,6 +4177,7 @@ os.chdir('{self.workspace_path}')
                 "INSERT INTO segment_discovery (day, cost, success, discovered_group_id, remaining_undiscovered) VALUES (?, ?, 0, NULL, 0)",
                 (self.current_day, cost)
             )
+            self.conn.commit()
             return ToolResult(True,
                 f"Market research complete (${cost:,.0f}). No new segments to discover — all segments have been identified.",
                 data={'cost': cost})
@@ -4234,6 +4241,7 @@ os.chdir('{self.workspace_path}')
                     (group_id, snapshot_day, snapshot_c_max, snapshot_q_min, snapshot_market_cap)
                 VALUES (?, ?, ?, ?, ?)
             """, (discovered_gid, self.current_day, snap_c_max, snap_q_min, snap_market_cap))
+            self.conn.commit()
 
             return ToolResult(True,
                 f"=== Market Research Success ===\n"
@@ -4252,6 +4260,7 @@ os.chdir('{self.workspace_path}')
                 "INSERT INTO segment_discovery (day, cost, success, discovered_group_id, remaining_undiscovered) VALUES (?, ?, 0, NULL, ?)",
                 (self.current_day, cost, remaining)
             )
+            self.conn.commit()
             return ToolResult(True,
                 f"Market research complete (${cost:,.0f}). No new segments discovered this time. "
                 f"Try again for another chance.",

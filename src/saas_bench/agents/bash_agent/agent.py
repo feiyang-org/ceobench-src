@@ -59,6 +59,7 @@ class BashAgent(BaseAgent):
         total_days: int = 3650,
         anthropic_fallback_model: Optional[str] = None,
         usage_recorder: Optional[ModelUsage] = None,
+        text_registration: bool = False,
     ):
         if not tool_descriptions:
             raise ValueError('BashAgent requires tools; an empty list cannot produce a valid action')
@@ -96,6 +97,9 @@ class BashAgent(BaseAgent):
 
         # Build system prompt
         self.system_prompt = system_prompt or self._default_system_prompt()
+        if text_registration:
+            from saas_bench.registration_schema import REGISTRATION_PROMPT
+            self.system_prompt += REGISTRATION_PROMPT
 
         # Agent state
         self.conversation: List[Message] = []
@@ -137,7 +141,7 @@ class BashAgent(BaseAgent):
         """Build the default system prompt.
 
         Loads the bash_agent system_prompt.md and fills in
-        {simulator_instructions} and {total_days}.
+        simulator instructions and configured days, weeks and years.
 
         ORACLE MODE: when env var ORACLE_MODE=1, prepend system_prompt_oracle.md
         as a preamble. The oracle preamble explicitly overrides the "hidden
@@ -162,10 +166,11 @@ class BashAgent(BaseAgent):
 
         prompt = template.replace('{simulator_instructions}', sim_text)
 
-        # Replace {total_days} placeholder with actual value
+        # Fill duration consistently for all experiment groups.
         total_years = self.total_days / 365
         years_str = f"{total_years:.0f}" if total_years == int(total_years) else f"{total_years:.1f}"
         prompt = prompt.replace('{total_days}', str(self.total_days))
+        prompt = prompt.replace('{total_weeks}', str((self.total_days + 6) // 7))
         prompt = prompt.replace('{total_years}', years_str)
 
         if os.environ.get("ORACLE_MODE") == "1":
@@ -184,6 +189,8 @@ class BashAgent(BaseAgent):
         """Read MEMORY.md once when building a new week's system prompt."""
         prompt = self.system_prompt
         memory_path = self.workspace_path / 'MEMORY.md'
+        if not memory_path.resolve().is_relative_to(self.workspace_path.resolve()):
+            raise ValueError('MEMORY.md must stay within the agent workspace')
         if memory_path.exists():
             try:
                 original_memory = memory_path.read_bytes()
@@ -1126,8 +1133,8 @@ class BashAgent(BaseAgent):
                 }
             ]
 
-            from .tools import get_bash_agent_anthropic_tools
-            tools = get_bash_agent_anthropic_tools()
+            tools = [dict(name=t['name'], description=t['description'], input_schema=t['parameters'])
+                     for t in self.tool_descriptions]
             if tools:
                 tools[-1]['cache_control'] = {"type": "ephemeral"}
 

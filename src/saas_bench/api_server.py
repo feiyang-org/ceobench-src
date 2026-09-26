@@ -186,13 +186,17 @@ class _APIHandler(BaseHTTPRequestHandler):
             elif self.path == '/daily-scripts':
                 self._handle_daily_scripts_post()
             elif self.path == '/checkpoint':
+                import secrets
+                expected_token = self.server._api_server.checkpoint_token
+                supplied_token = self.headers.get('X-Harness-Token', '')
+                if not expected_token or not secrets.compare_digest(supplied_token, expected_token):
+                    self._send_json({'error': 'Harness access required'}, 403)
+                    return
                 body = self._read_body()
                 if set(body) != {'expected_day'} or not isinstance(body['expected_day'], int):
                     self._send_json({'success': False, 'error': 'expected_day is required; no other fields allowed'}, 400)
                     return
                 self._send_json(self.server._api_server.checkpoint(body['expected_day']))
-            elif self.path == '/reinitialize':
-                self._handle_reinitialize()
             else:
                 self._send_json({"error": f"Unknown endpoint: {self.path}"}, 404)
         except Exception as exc:
@@ -347,20 +351,6 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": True, "data": {"output": str(result)}, "message": str(result)})
         except Exception as e:
             self._send_internal_error(e, op="call")
-
-    def _handle_reinitialize(self):
-        """Handle reinitialize request: POST /reinitialize."""
-        try:
-            server: NovaMindAPIServer = self.server._api_server
-            # Force reload of the simulation module
-            if 'saas_bench.simulation' in sys.modules:
-                # Delete cached module to force reload
-                del sys.modules['saas_bench.simulation']
-            # Reinitialize the simulator to set up _group_rngs
-            server.simulator.initialize()
-            self._send_json({"success": True, "message": "Simulator reinitialized"})
-        except Exception as e:
-            self._send_internal_error(e, op="reinitialize")
 
     def _handle_next_week(self):
         """Handle next-week advancement: POST /next-week.
@@ -694,7 +684,7 @@ class NovaMindAPIServer:
     def __init__(self, tools: AgentTools, simulator=None, conn=None,
                  day_callback=None, dashboard_callback=None,
                  shock_manager=None, event_logger=None, script_workspace=None,
-                 require_sandbox=False, sql_evidence=None):
+                 require_sandbox=False, sql_evidence=None, checkpoint_token=None):
         """Initialize the API server.
 
         Args:
@@ -734,6 +724,7 @@ class NovaMindAPIServer:
         self._advance_lock = threading.Lock()
         self._operation_failed = False
         self.checkpoint_callback = None
+        self.checkpoint_token = checkpoint_token
         self._last_dashboard: str = ""
         self._last_day_result = None
         self._daily_scripts: Dict[str, str] = {}  # name -> content snapshot

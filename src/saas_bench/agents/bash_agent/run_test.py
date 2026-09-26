@@ -92,6 +92,7 @@ class BashAgentRunner:
         pricing_file: Optional[Path] = None,
         sql_capture: Optional[bool] = None,
         execution_capture: Optional[bool] = None,
+        text_registration: Optional[str] = None,
     ):
         from saas_bench.model_usage import load_pricing
         self.pricing_registration = load_pricing(pricing_file) if pricing_file else None
@@ -99,6 +100,10 @@ class BashAgentRunner:
         if continue_from:
             saved_manifest = json.loads((Path(continue_from) / 'manifest.json').read_text())
             saved = saved_manifest['configuration']
+            saved_registration = saved_manifest.get('text_registration', 'off')
+            if text_registration is not None and text_registration != saved_registration:
+                raise ValueError('Resume text registration configuration mismatch')
+            text_registration = saved_registration
             saved_capture = bool(saved_manifest.get('sql_evidence'))
             saved_execution = (saved_manifest.get('sql_evidence') or {}).get('capture_scope') == 'execution'
             if execution_capture is not None and execution_capture != saved_execution:
@@ -127,6 +132,13 @@ class BashAgentRunner:
             seed, scenario, total_days, initial_cash, reasoning_effort = (
                 saved[k] for k in ('seed', 'scenario', 'total_days', 'initial_cash', 'reasoning_effort'))
             run_kind = saved['run_kind']
+        self.text_registration = text_registration or 'off'
+        if self.text_registration not in ('off', 'git', 'prefix', 'pf'):
+            raise ValueError('Invalid text registration mode')
+        if self.text_registration in ('prefix', 'pf'):
+            if execution_capture is False:
+                raise ValueError('Prefix/PF registration requires execution capture')
+            execution_capture = True
         if execution_capture:
             if sql_capture is False:
                 raise ValueError('Execution capture requires SQL capture')
@@ -389,9 +401,12 @@ class BashAgentRunner:
 
     def _http_post(self, path: str, data: Optional[Dict] = None, timeout: float = 1800) -> Dict:
         body = json.dumps(data or {}).encode()
+        headers = {'Content-Type': 'application/json'}
+        if path == '/checkpoint':
+            headers['X-Harness-Token'] = self._checkpoint_token
         req = urllib.request.Request(
             self._server_url(path), data=body,
-            headers={'Content-Type': 'application/json'},
+            headers=headers,
         )
         resp = urllib.request.urlopen(req, timeout=timeout)
         return json.loads(resp.read())
@@ -541,16 +556,9 @@ __pycache__/
     def _initialize_from_public_repo(self):
         """Copy the published layout into the agent workspace and create a session.
 
-        After the zipapp refactor the published repo is just two artifacts:
-
-            novamind-operation    # zipapp (engine + CLI)
-            docs/                 # reference material (incl. SDK source)
-
-        Flow:
-        1. Copy those two into agent_workspace.
-        2. Create a session via the HOST-SIDE zipapp invoked in server mode,
-           so the agent never sees simulator bytecode directly.
-        3. Return the session metadata.
+        Copy novamind-client as novamind-operation plus docs into the workspace.
+        Create the session with the full host novamind-operation zipapp; its
+        simulator bytecode and database decryption modules stay on the host.
 
         public/ must be built first via `uv run python scripts/build_public.py`.
         """
@@ -573,9 +581,8 @@ __pycache__/
                 ignore=shutil.ignore_patterns('__pycache__'),
             )
 
-        # Copy novamind-operation (zipapp). This is the ONLY executable the
-        # agent has — no separate novamind-server, no install.sh, nothing else.
-        src_op = public_dir / "novamind-operation"
+        # Only client code goes into the sandbox, including its initial Git tree.
+        src_op = public_dir / "novamind-client"
         dst_op = self.agent_workspace / "novamind-operation"
         if not src_op.exists():
             raise FileNotFoundError(
@@ -592,7 +599,7 @@ __pycache__/
         env = self._server_environment()
         result = subprocess.run(
             [
-                sys.executable, str(src_op),
+                sys.executable, str(public_dir / "novamind-operation"),
                 "--base", str(self.agent_workspace),
                 "new-session",
                 "--days", str(self.total_days),
@@ -643,11 +650,15 @@ __pycache__/
 
     def _server_environment(self) -> Dict[str, str]:
         """Environment for host-side simulator processes."""
+        import secrets
+        if not getattr(self, '_checkpoint_token', None):
+            self._checkpoint_token = secrets.token_urlsafe(32)
         env = os.environ.copy()
         env["NOVAMIND_SERVER_MODE"] = "1"
         env['CEOBENCH_RUN_MANIFEST'] = str(self.workspace_dir / 'manifest.json')
         env['CEOBENCH_RUN_KIND'] = self.run_kind
         env['CEOBENCH_CHECKPOINT_ROOT'] = str(self.workspace_dir / 'checkpoints')
+        env['CEOBENCH_CHECKPOINT_TOKEN'] = self._checkpoint_token
         env['CEOBENCH_SIMULATOR_USAGE_LOG'] = str(self.logs_dir / 'simulator_requests.jsonl')
         env['CEOBENCH_MODEL_SESSION'] = str(uuid.uuid5(uuid.NAMESPACE_URL, str(self.workspace_dir))) + ':simulator'
         if self.sql_evidence_config:
@@ -687,6 +698,8 @@ __pycache__/
                             self.scenario, ScenarioPack(name='Default', description='Balanced scenario'))))
         if self.sql_evidence_config:
             manifest['sql_evidence'] = self.sql_evidence_config
+        if self.text_registration != 'off':
+            manifest['text_registration'] = self.text_registration
         if self.pricing_registration:
             manifest['pricing'] = self.pricing_registration
         manifest = json.loads(json.dumps(manifest))
@@ -868,6 +881,9 @@ __pycache__/
             if file_hash(directory / 'manifest.json') != self.sql_evidence_config['source_manifest_sha256']:
                 raise ValueError('Clone source manifest mismatch')
             expected_manifest['sql_evidence'] = saved_manifest['sql_evidence']
+            if (saved_manifest.get('text_registration') == 'prefix' and
+                    expected_manifest.get('text_registration') in ('git', 'pf')):
+                expected_manifest['text_registration'] = 'prefix'
         if saved_manifest != expected_manifest:
             raise ValueError('Checkpoint configuration differs from run manifest')
         if self.sql_evidence_config:
@@ -980,6 +996,12 @@ __pycache__/
             from saas_bench.sql_evidence import SQLEvidenceStore
             self.evidence_store = SQLEvidenceStore(self.workspace_dir / 'sql-evidence.sqlite', self.sql_evidence_config)
 
+        registry = None
+        if self.text_registration != 'off':
+            from saas_bench.text_registry import TextRegistry
+            registry = TextRegistry(self.agent_workspace, self.text_registration, self.evidence_store,
+                                    sim_day=lambda: self.agent.current_day)
+
         # ── Step 3: Create tool executor + agent ──
         # Pass NOVAMIND_API_PORT so the CLI (./novamind-operation) connects to
         # the already-running server instead of trying to start a new one.
@@ -988,9 +1010,10 @@ __pycache__/
             env={"NOVAMIND_API_PORT": str(self._server_port)},
             require_sandbox=self.run_kind == 'formal', stop_on_timeout=True,
             evidence_store=self.evidence_store,
+            text_registry=registry,
         )
 
-        tool_descriptions = get_bash_agent_tool_descriptions()
+        tool_descriptions = get_bash_agent_tool_descriptions(registry is not None)
         from saas_bench.model_usage import ModelUsage
 
         self.agent = BashAgent(
@@ -1005,6 +1028,7 @@ __pycache__/
             total_days=self.total_days,
             anthropic_fallback_model=self.anthropic_fallback_model,
             usage_recorder=ModelUsage(self.logs_dir / 'agent_requests.jsonl', 'agent', self._pricing, self.evidence_store),
+            text_registration=registry is not None,
         )
 
         # Wire the per-session conversation snapshot path. The agent writes
@@ -1030,6 +1054,7 @@ __pycache__/
             'session_id': self._session_id,
             'label': self.label,
             'public_dir_override': os.environ.get('NOVAMIND_PUBLIC_DIR') or None,
+            'text_registration': self.text_registration,
         }
         with open(self.workspace_dir / "config.json", 'w') as f:
             json.dump(config, f, indent=2)
@@ -1455,6 +1480,8 @@ def main():
     parser.add_argument('--run-kind', choices=['engineering', 'pilot', 'formal'])
     parser.add_argument('--pricing-file', type=Path, help='JSON with source, basis, and exact-model USD/1k token rates')
     parser.add_argument('--execution-capture', action=argparse.BooleanOptionalAction, default=None, help='Capture public receipts, files, Bash and model source occurrences')
+    parser.add_argument('--text-registration', choices=['off', 'git', 'prefix', 'pf'], default=None,
+                        help='Shared text tools; prefix privately binds evidence, pf validates delivered evidence; default off')
     parser.add_argument('--sql-capture', action=argparse.BooleanOptionalAction, default=None,
                         help='Privately capture SQL responses; defaults off for new runs')
     args = parser.parse_args()
@@ -1473,7 +1500,7 @@ def main():
         label=args.label,
         run_kind=args.run_kind,
         pricing_file=args.pricing_file,
-        sql_capture=args.sql_capture, execution_capture=args.execution_capture,
+        sql_capture=args.sql_capture, execution_capture=args.execution_capture, text_registration=args.text_registration,
     )
 
     result = runner.run(verbose=not args.quiet)

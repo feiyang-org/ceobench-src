@@ -63,7 +63,7 @@ def observed(fn):
 def urlopen(request, *args, **kwargs):
     state = _CALLS.get()
     context = os.environ.get(_CONTEXT)
-    if state is None or not context or request.full_url.rsplit('/', 1)[-1] in ('health', 'game-status', 'checkpoint', 'reinitialize'):
+    if state is None or not context or request.full_url.rsplit('/', 1)[-1] in ('health', 'game-status', 'checkpoint'):
         return urllib.request.urlopen(request, *args, **kwargs)
     call = uuid.uuid4().hex
     request.add_header('X-Capture-Context', context)
@@ -103,7 +103,13 @@ def print(*args, **kwargs):
     if state is not None and target in (sys.stdout, sys.stderr):
         text = io.StringIO()
         builtins.print(*args, **dict(kwargs, file=text))
-        state['projection'].append({'stream': 'stderr' if target is sys.stderr else 'stdout', 'text': text.getvalue()})
+        try:
+            sink = os.fstat(target.fileno())
+            sink = [sink.st_dev, sink.st_ino]
+        except (OSError, AttributeError, io.UnsupportedOperation):
+            sink = None
+        state['projection'].append({'stream': 'stderr' if target is sys.stderr else 'stdout',
+                                    'text': text.getvalue(), 'sink': sink})
     return builtins.print(*args, **kwargs)
 
 
