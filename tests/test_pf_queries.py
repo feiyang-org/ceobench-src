@@ -8,6 +8,7 @@ import re
 import pytest
 
 from saas_bench.pf_queries import MODELS, PFQueries
+from saas_bench.registration_evidence import HANDLES
 from saas_bench.sql_evidence import SQLEvidenceStore, encoded
 from test_sql_evidence import identity, request, settled
 from test_text_registry import workspace, captured, call, declaration, send
@@ -257,7 +258,7 @@ def test_non_pf_modes_cannot_use_any_query_or_receive_handles(workspace, tmp_pat
     for tool in MODELS:
         assert executor.execute(tool, {}).startswith('Error: Unknown tool')
     assert not executor.execute('read_file', {'path': 'evidence.json'}).endswith(']')
-    assert store.load_state('registration_handles:' + store.identity['branch_id']) is None
+    assert store.load_state(HANDLES) is None
 
 
 def test_private_layers_siblings_postfork_versions_and_bad_inputs_are_inaccessible(workspace, tmp_path):
@@ -298,7 +299,7 @@ def test_invalid_diff_does_not_allocate_unshown_handles(workspace, tmp_path):
     store.complete(event)
     result = executor.execute('pf_read', dict(mode='diff', baseline={'path': 'a.txt'}, target={'path': 'b.txt'}))
     assert 'same captured object' in result
-    assert store.load_state('registration_handles:' + store.identity['branch_id']) is None
+    assert store.load_state(HANDLES) is None
 
 
 def test_empty_failed_truncated_and_binary_history_are_distinct(workspace, tmp_path):
@@ -341,7 +342,10 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         assert set(MODELS) <= {t['name'] for t in child.agent.tool_descriptions}
         command = './novamind-operation query "SELECT COUNT(*) AS n FROM ledger" > query.json'
         output = child._execute_tool('bash', {'command': command})
-        assert '[q: v' in output and 'query.json: v' in output
+        assert re.search(r'\n\[q: v\d+ \| 写: query\.json v\d+\]$', output), output
+        # A non-zero exit still delivered the SQL result and wrote the file.
+        failed = child._execute_tool('bash', {'command': command.replace('query.json', 'failed.json') + '; exit 3'})
+        assert re.search(r'\n\[q: v\d+ \| 写: failed\.json v\d+\]$', failed), failed
         with closing(child.evidence_store.connect()) as conn:
             count = conn.execute('SELECT count(*) FROM requests WHERE query_id IS NOT NULL').fetchone()[0]
         traced = json.loads(child._execute_tool('pf_dependencies', dict(
@@ -355,3 +359,56 @@ def test_packed_pf_query_restore_and_group_boundary(offline_runner, tmp_path):
         header = json.loads(result.split('\n', 1)[0])
         reread = restored._execute_tool('pf_read', dict(target={'version': header['target']['version']}))
         assert reread.split('\n', 1)[1] == 'prefix evidence'
+
+
+def test_bash_handles_group_queries_and_writes_even_after_a_failed_exit(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    output = executor.execute('bash', {'command': 'printf 1 > one.txt; printf 2 > two.txt; exit 1'})
+    assert re.search(r'\n\[写: one\.txt v\d+ two\.txt v\d+\]$', output), output
+    many = ' '.join(f'printf {i} > f{i}.txt;' for i in range(10))
+    output = executor.execute('bash', {'command': many})
+    assert output.endswith(' | 另有 2 项]') and output.count('.txt v') == 8, output
+
+
+def test_forks_keep_lineage_handles_and_continue_numbering(workspace, tmp_path):
+    from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor
+    from saas_bench.text_registry import TextRegistry
+    store, registry, executor = captured(workspace, tmp_path)
+    for name, content in (('a.txt', 'A'), ('b.txt', 'B')):
+        (workspace / name).write_text(content)
+    assert executor.execute('read_file', {'path': 'a.txt'}).endswith('[v1]')
+    assert executor.execute('read_file', {'path': 'b.txt'}).endswith('[v2]')
+    receipt = store.snapshot(tmp_path / 'child.sqlite')
+    child_store = SQLEvidenceStore(tmp_path / 'child.sqlite', identity(
+        'child', capture_scope='execution', parent_branch='prefix', fork_seq=receipt['cutoff']))
+    child = BashAgentToolExecutor(workspace, evidence_store=child_store,
+                                  text_registry=TextRegistry(workspace, 'pf', child_store))
+    (workspace / 'c.txt').write_text('C')
+    # The first handle shown after the fork continues the parent's numbering.
+    assert child.execute('read_file', {'path': 'c.txt'}).endswith('[v3]')
+    assert read(child, target={'version': 'v1'})[1] == 'A'
+    assert read(child, target={'version': 'v2'})[1] == 'B'
+    # The parent keeps its own table; a handle never denotes two versions in one lineage.
+    (workspace / 'd.txt').write_text('D')
+    assert executor.execute('read_file', {'path': 'd.txt'}).endswith('[v3]')
+    with pytest.raises(AssertionError, match='unavailable version handle'):
+        read(child, target={'version': 'v9'})
+
+
+def test_path_dependents_survive_boundary_snapshots_of_unchanged_bytes(workspace, tmp_path):
+    store, registry, executor = captured(workspace, tmp_path)
+    send(store, executor.execute('read_file', {'path': 'evidence.json'}))
+    call(registry, 'create', **declaration({'path': 'evidence.json'}))
+    before = query(executor, 'pf_dependents', target={'path': 'evidence.json'})
+    assert [r['source']['record'] for r in before['items']] == ['r1.1']
+    # Each Bash boundary stores new versions of unchanged files; the reference still matches.
+    executor.execute('bash', {'command': 'echo hi'})
+    executor.execute('bash', {'command': 'echo again'})
+    for extra in ({}, {'include_execution': True}):
+        after = query(executor, 'pf_dependents', target={'path': 'evidence.json'}, **extra)
+        assert 'r1.1' in [r['source'].get('record') for r in after['items']]
+        assert not any('observed_as' in r for r in after['items'])
+    # Changed bytes are a different node: the old reference is not a referrer of the new content.
+    (workspace / 'evidence.json').write_text('{"n":8}')
+    executor.execute('bash', {'command': 'true'})
+    assert query(executor, 'pf_dependents', target={'path': 'evidence.json'})['items'] == []

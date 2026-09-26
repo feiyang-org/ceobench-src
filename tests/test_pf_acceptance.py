@@ -172,6 +172,10 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
         final = original.replace('记录 012:', '修订 012:').replace('记录 041:', '修订 041:').removesuffix('\r\n')
         delta2 = captured_file(final)
         assert send('predicate fails; second delta')[-1]['mode'] == 'DELTA'
+        # Only a full read in the request right after the compact read is a recovery pair.
+        recovery = read(target={'path': 'facts.txt'}, full=True)
+        row = send('adjacent explicit full recovery')[-1]
+        assert row['mode'] == 'FULL' and row['recovery_of'] == delta2.pf_read['id']
 
         # The same F -> A -> V paths must retain each concrete unknown reason.
         for label, amounts, unavailable, reason in [
@@ -228,9 +232,9 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
 
         diff = read(target={'path': 'facts.txt'}, baseline={'version': json.loads(full.split('\n')[0])['target']['version']}, mode='diff')
         assert send('active diff counted separately')[-1]['mode'] == 'DIFF'
-        recovery = read(target={'path': 'facts.txt'}, full=True)
-        row = send('explicit full recovery')[-1]
-        assert row['mode'] == 'FULL' and row['recovery_of'] == delta2.pf_read['id']
+        read(target={'path': 'facts.txt'}, full=True)
+        row = send('non-adjacent explicit full')[-1]
+        assert row['mode'] == 'FULL' and row['reason'] == 'requested_full' and row['recovery_of'] is None
 
         # Restore private source identities from a serialized context, then prune its base.
         sources = text_sources(request)
@@ -250,12 +254,12 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
         row = send('new week starts without a baseline')[0]
         assert row['mode'] == 'FULL' and row['reason'] == 'no_complete_base'
 
-    # Recount wire payloads independently; the explicit recovery pair and sole
-    # materialization step above determine adjustments, not accounting() flags.
+    # Recount wire payloads independently; the adjacent recovery pair above determines
+    # adjustments, not accounting() flags. Materialized replays already cost full text.
     paired = {delta2.pf_read['id'], recovery.pf_read['id']}
     table = []
     for req, wire in zip(requests, wires, strict=True):
-        actual = full_cost = conservative = diff_cost = extra = 0
+        actual = full_cost = conservative = diff_cost = extra = materialized = 0
         for item in req['reads']:
             cost = counter.count(at_pointer(wire, item['json_pointer']))
             baseline = counter.count(store.get_content(item['full_version'])[1].decode())
@@ -266,15 +270,19 @@ def test_constructed_trajectory_queries_and_request_costs(workspace, tmp_path, s
             full_cost += baseline
             if item['read_id'] not in paired:
                 conservative += baseline - cost
-            if req['label'] == 'pruned intermediate baseline' and item['read_id'] == delta2.pf_read['id']:
+            if item['read_id'] == recovery.pf_read['id']:
                 extra += cost
+            if req['label'] == 'pruned intermediate baseline' and item['read_id'] == delta2.pf_read['id']:
+                materialized += cost
         table.append(dict(request=req['label'], modes=[r['mode'] for r in req['reads']],
             actual_tokens=actual, full_tokens=full_cost, conservative_savings=conservative,
-            extra_full_tokens=extra, net_saved_tokens=conservative - extra, active_diff_tokens=diff_cost))
+            recovery_replay_tokens=extra, materialized_full_tokens=materialized,
+            net_saved_tokens=conservative - extra, active_diff_tokens=diff_cost))
     summary = accounting(store)
     assert summary['known_gross_saved_tokens'] == sum(r['full_tokens'] - r['actual_tokens'] for r in table)
     assert summary['known_conservative_saved_tokens'] == sum(r['conservative_savings'] for r in table)
-    assert summary['known_materialization_tokens'] == sum(r['extra_full_tokens'] for r in table) > 0
+    assert summary['known_recovery_replay_tokens'] == sum(r['recovery_replay_tokens'] for r in table) > 0
+    assert summary['materialized_full_tokens'] == sum(r['materialized_full_tokens'] for r in table) > 0
     assert summary['net_saved_tokens'] == sum(r['net_saved_tokens'] for r in table)
     assert summary['active_diff_tokens'] == sum(r['active_diff_tokens'] for r in table) > 0
     assert summary['recovery_pairs'] == 1 and summary['missing_token_counts'] == 0

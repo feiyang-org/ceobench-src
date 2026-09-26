@@ -305,7 +305,9 @@ class BashAgentToolExecutor:
                         capture.facts['changed_paths'] = sorted(k for k in before.keys() | after.keys()
                             if {x:v for x,v in before.get(k, {}).items() if x != 'version'} !=
                                {x:v for x,v in after.get(k, {}).items() if x != 'version'})
-                if self.pf_queries and result is not None and status == 'succeeded':
+                # A failed or timed-out Bash command may still have delivered SQL output or
+                # written files; decorate whatever this execution actually captured.
+                if self.pf_queries and result is not None and status != 'result_unknown':
                     result = capture.safe(self.pf_queries.decorate, capture, result, after) or result
                 result = capture.finish(result, status)
                 if status == 'result_unknown':

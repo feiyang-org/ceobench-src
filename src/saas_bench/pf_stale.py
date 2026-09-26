@@ -218,10 +218,11 @@ class StaleCheck:
         return version, None
 
     def _propagate(self, rows):
+        node = self.q._node
         outgoing = defaultdict(list)
         for row in rows:
             if not row['historical_only']:
-                outgoing[row['edge']['source']].append(row)
+                outgoing[node(row['edge']['source'])].append(row)
 
         def causes(row, path):
             target, check = row['edge']['target'], row['check']
@@ -230,8 +231,8 @@ class StaleCheck:
             if check['predicate_result'] == 'holds':
                 return []
             found = [path + ([target] if target else [])] if check['affected'] else []
-            if target and target not in path:
-                for child in outgoing[target]:
+            if target and node(target) not in {node(v) for v in path}:
+                for child in outgoing[node(target)]:
                     found.extend(causes(child, path + [target]))
             return found
 

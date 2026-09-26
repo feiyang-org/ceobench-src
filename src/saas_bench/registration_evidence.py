@@ -8,6 +8,10 @@ import re
 import subprocess
 
 
+# Private state name of the lineage-wide vN handle table.
+HANDLES = 'registration_handles'
+
+
 def git_reference(workspace, evidence):
     path = evidence['path']
     commit = evidence.get('commit')
@@ -214,8 +218,9 @@ class EvidenceResolver:
         return version, meta.get('object_id') or version, body.decode(), 'other'
 
     def handle(self, version):
-        # Branch-qualified state prevents a fork from inheriting another branch's handles.
-        name = 'registration_handles:' + self.store.identity['branch_id']
+        # One lineage-wide table: forks copy the evidence database and keep numbering,
+        # so a handle an agent saw or wrote down never changes meaning.
+        name = HANDLES
         handles = self.store.load_state(name) or {}
         if version not in handles.values():
             handles['v' + str(len(handles) + 1)] = version
@@ -226,7 +231,7 @@ class EvidenceResolver:
         versions = self.versions()
         explicit = None
         if 'version' in evidence:
-            handles = self.store.load_state('registration_handles:' + self.store.identity['branch_id']) or {}
+            handles = self.store.load_state(HANDLES) or {}
             explicit = handles.get(evidence['version'])
             if explicit is None:
                 raise ValueError('Unknown version handle; use a path or SQL instead')

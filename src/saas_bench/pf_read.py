@@ -6,6 +6,7 @@ from itertools import accumulate
 import json
 
 from .execution_capture import CapturedText, CURRENT_EVENT, at_pointer, origin, text_sources
+from .registration_evidence import HANDLES
 from .sql_evidence import encoded
 
 
@@ -130,7 +131,9 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         current = store.read_event(meta['created_by_event'])['request']
         adjacent = old['event_id'].split('/')[1] == store.identity['branch_id']
         adjacent = adjacent and prior_seq < old['seq'] < last_seq < current['seq']
-        if meta['force_full'] or (adjacent and meta['target'] not in spent):
+        # Only a compact read delivered in the immediately preceding request is recovered;
+        # an explicit full read elsewhere is an ordinary FULL read without pairing.
+        if adjacent and (meta['force_full'] or meta['target'] not in spent):
             if item['read_id'] not in spent:
                 store.save_state(spent_key, [*spent, item['read_id'], meta['target']])
                 return dict(choice, reason='requested_full' if meta['force_full'] else 'adjacent_recovery',
@@ -153,7 +156,7 @@ def _choose(store, read_id, meta, full, available, counter, context, recent):
         valid = False
     if not valid:
         return dict(choice, reason='delta_verification_failed')
-    handles = store.load_state('registration_handles:' + store.identity['branch_id']) or {}
+    handles = store.load_state(HANDLES) or {}
     handle = next((k for k, v in handles.items() if v == base), 'v' + str(len(handles) + 1))
     mode = 'UNCHANGED' if target == data['text'] else 'DELTA'
     payload = _compact(full, mode, handle, edits)
@@ -311,7 +314,7 @@ def accounting(store):
         reads.extend(dict(item, request_event=row['event_id']) for item in ledger)
     paired = {item['recovery_of'] for item in reads if item.get('recovery_of')}
     recovery_reads = {item['read_id'] for item in reads if item.get('recovery_of')}
-    gross, conservative, materialization, diff_tokens, missing, diff_missing = 0, 0, 0, 0, 0, 0
+    gross, conservative, replay, materialized, diff_tokens, missing, diff_missing = 0, 0, 0, 0, 0, 0, 0
     for item in reads:
         actual, full = item['actual_tokens'], item['full_tokens']
         if item['mode'] == 'DIFF':
@@ -322,18 +325,24 @@ def accounting(store):
             missing += 1
             continue
         gross += full - actual
-        if item['read_id'] not in paired | recovery_reads:
+        if item['read_id'] in recovery_reads:
+            # The recovered full text never occurs in the full-read counterfactual, so
+            # every occurrence of it is extra input on top of the zeroed compact read.
+            replay += actual
+        elif item['read_id'] not in paired:
             conservative += full - actual
         if item['materialization']:
-            materialization += actual
+            # Already sent as full text: zero saving against the counterfactual, no deduction.
+            materialized += actual
     first = {item['read_id']: item for item in reversed(reads)}
     return dict(reads=len(first), occurrences=len(reads), excluded_occurrences=dict(excluded),
         read_modes=dict(Counter(v['mode'] for v in first.values())),
         occurrence_modes=dict(Counter(v['mode'] for v in reads)),
         reasons=dict(Counter(v['reason'] for v in reads)), recovery_pairs=len(paired),
         missing_token_counts=missing, known_gross_saved_tokens=gross,
-        known_conservative_saved_tokens=conservative, known_materialization_tokens=materialization,
-        net_saved_tokens=None if missing else conservative - materialization,
+        known_conservative_saved_tokens=conservative, known_recovery_replay_tokens=replay,
+        materialized_full_tokens=materialized,
+        net_saved_tokens=None if missing else conservative - replay,
         active_diff_tokens=None if diff_missing else diff_tokens, active_diff_missing_counts=diff_missing)
 
 

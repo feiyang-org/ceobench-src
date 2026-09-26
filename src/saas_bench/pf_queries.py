@@ -9,6 +9,7 @@ from typing import Annotated, Literal
 from pydantic import Field, ValidationError, model_validator
 
 from .execution_capture import CapturedText, OBJECT_FIELDS
+from .registration_evidence import HANDLES
 from .registration_schema import BusinessObject, Input, Text
 from .sql_evidence import encoded
 
@@ -66,8 +67,8 @@ MODELS = dict(pf_search=Search, pf_dependencies=Dependencies, pf_dependents=Depe
 def tool_definitions():
     descriptions = {
         'pf_search': 'Find captured evidence and registered text revisions by exact business object kind/id. Returns an index, not evidence contents. Object IDs come only from public fields or explicit declarations.',
-        'pf_dependencies': 'Trace dependencies of a captured file or registered text. Explicit references first; include_execution also follows observed execution associations. With the runner stale check enabled, purpose=current refreshes all expanded SQL views and approved public reads, compares current files and evaluates reference predicates. Historical-only paths are skipped. A passing predicate stops downstream propagation; failures and unknown checks retain paths. Scripts never rerun. Results are advisory. purpose=historical_only retrieves saved history without checks.',
-        'pf_dependents': 'Find references to an exact captured version, with paths and reference purposes. Defaults to current active registered texts, traversing old revisions to reach them; current_only=false also returns superseded and retired endpoints. Historical-only paths are labeled, never marked invalid. include_execution also returns observed execution associations.',
+        'pf_dependencies': 'Trace dependencies of a captured file or registered text. Explicit references first; purpose=current always also follows observed execution associations, so upstream SQL of derived files is included; for purpose=historical_only, include_execution=true adds them. With the runner stale check enabled, purpose=current refreshes all expanded SQL views and approved public reads, compares current files and evaluates reference predicates. Historical-only paths are skipped. A passing predicate stops downstream propagation; failures and unknown checks retain paths. Scripts never rerun. Results are advisory. purpose=historical_only retrieves saved history without checks.',
+        'pf_dependents': 'Find references to an exact captured version, with paths and reference purposes. Defaults to current active registered texts, traversing old revisions to reach them; current_only=false also returns superseded and retired endpoints. Historical-only paths are labeled, never marked invalid. A file path or version also matches references to any captured observation of the same bytes. include_execution also returns observed execution associations.',
         'pf_read': 'Read immutable evidence (mode=content), list versions of its object (history), or compare baseline to target (diff). Content automatically uses FULL, DELTA or UNCHANGED when the current request contains a complete recoverable baseline and compact output costs fewer tokens. Set full=true with mode=content to request full text. Paths, SQL and bare rN select the latest captured version; rN.M and vN select an exact version. Diff requires the same file, query view, or registered object. SQL comparison preserves types and duplicate rows and separately reports raw order. Content/diff are paged at 30000 characters. A diff does not count as reading the target.',
     }
     return [dict(name=name, description=descriptions[name] +
@@ -142,12 +143,16 @@ class PFQueries:
                 WHERE r.event_id IN children AND r.query_id IS NOT NULL
                 AND json_extract(v.metadata, '$.layer')='server_public_response'
                 ORDER BY v.rowid''', (capture.event,)).fetchall()
-        entries = [('q', row[0]) for row in queries]
-        entries += [(path, after[path]['version']) for path in capture.facts.get('changed_paths', [])
+        entries = [('q', None, row[0]) for row in queries]
+        entries += [('写', path, after[path]['version']) for path in capture.facts.get('changed_paths', [])
                     if after and after.get(path, {}).get('version')]
         if not entries:
             return text
-        displayed = [label + ': ' + self.resolver.handle(version) for label, version in entries[:8]]
+        # Only displayed entries receive handles: [q: v40 v41 | 写: forecast.json v42].
+        groups = {}
+        for group, path, version in entries[:8]:
+            groups.setdefault(group, []).append((path + ' ' if path else '') + self.resolver.handle(version))
+        displayed = [group + ': ' + ' '.join(items) for group, items in groups.items()]
         if len(entries) > 8:
             displayed.append(f'另有 {len(entries) - 8} 项')
         return str(text) + '\n[' + ' | '.join(displayed) + ']'
@@ -160,7 +165,7 @@ class PFQueries:
                                       for e in exc.errors(include_input=False))) from exc
         offset, cutoff = 0, None
         self.check_state = None
-        self.cursor_name = 'pf_cursors:' + self.store.identity['branch_id']
+        self.cursor_name = 'pf_cursors'
         self.cursors = self.store.load_state(self.cursor_name) or {}
         if 'cursor' in values:
             if set(args) != {'cursor'}:
@@ -192,7 +197,11 @@ class PFQueries:
                 key = self._key(target)
                 return self._page([v for v in self.nodes if self._key(v) == key], offset, self._describe)
             return self._read(target, offset)
-        checking = (operation == 'pf_dependencies' and values['purpose'] == 'current' and self.stale_checks)
+        # Design 3.4: every query view on the way reruns, including a derived file's
+        # upstream on the capture layer, so current-purpose tracing follows execution.
+        current = operation == 'pf_dependencies' and values['purpose'] == 'current'
+        self.follow_execution = values['include_execution'] or current
+        checking = current and self.stale_checks
         if self.check_state:
             rows = self.store.load_state(self.check_state)
         else:
@@ -328,6 +337,14 @@ class PFQueries:
             edges.sort(key=lambda e: e['origin'] != 'agent_declaration')
         for edges in self.incoming.values():
             edges.sort(key=lambda e: e['origin'] != 'agent_declaration')
+        # Reads, edits and every Bash boundary snapshot store their own version of
+        # unchanged bytes; traversal treats identical bytes of one path as one node.
+        self.same_bytes, self.members = {}, defaultdict(list)
+        for version, row in self.nodes.items():
+            if row['meta']['layer'] == 'file_bytes':
+                key = (row['meta']['object_id'], row['content_hash'])
+                self.same_bytes[version] = key
+                self.members[key].append(version)
 
     def _key(self, version):
         row = self.nodes[version]
@@ -351,7 +368,7 @@ class PFQueries:
 
     def _target(self, target):
         if 'version' in target:
-            handles = self.store.load_state('registration_handles:' + self.store.identity['branch_id']) or {}
+            handles = self.store.load_state(HANDLES) or {}
             version = handles.get(target['version'])
             if version not in self.nodes:
                 raise ValueError('Unknown or unavailable version handle; use a path or SQL instead')
@@ -400,36 +417,53 @@ class PFQueries:
         result['model_reads'] = dict(count=len(reads), last=reads[-1] if reads else None)
         return result
 
+    def _node(self, version):
+        return self.same_bytes.get(version, version)
+
+    def _edges(self, node, reverse):
+        """Edges of a version and of every captured observation of the same file bytes."""
+        members = self.members.get(self.same_bytes.get(node), [node])
+        edges, side = (self.incoming, 'target') if reverse else (self.outgoing, 'source')
+        result = []
+        for member in members:
+            for edge in edges[member]:
+                if edge['kind'] == 'same_content_observation':
+                    continue
+                result.append(edge if member == node else dict(edge, **{side: node, 'observed_as': member}))
+        result.sort(key=lambda e: e['origin'] != 'agent_declaration')
+        return result
+
     def _trace(self, root, reverse):
-        edges = self.incoming if reverse else self.outgoing
-        queue, scheduled, rows = deque([(root, [root], False)]), {(root, False)}, []
+        follow = self.follow_execution
+        queue, scheduled, rows = deque([(root, [root], False)]), {(self._node(root), False)}, []
         while queue:
             node, path, historical = queue.popleft()
-            for edge in edges[node]:
-                if edge['origin'] != 'agent_declaration' and not self.values['include_execution']:
+            for edge in self._edges(node, reverse):
+                if edge['origin'] != 'agent_declaration' and not follow:
                     continue
                 target = edge['source'] if reverse else edge['target']
                 current = (not reverse or not self.values['current_only'] or target not in self.records or
                            (self.latest[self._key(target)] == target and self.records[target]['status'] == 'active'))
                 pure_history = historical or edge.get('reference', {}).get('purpose') == 'historical_only'
-                cycle = target in path
+                cycle = target is not None and self._node(target) in {self._node(v) for v in path}
                 depth_limit = len(path) >= self.values['depth']
-                more = any(e['origin'] == 'agent_declaration' or self.values['include_execution'] for e in edges[target])
+                more = target is not None and any(e['origin'] == 'agent_declaration' or follow
+                                                  for e in self._edges(target, reverse))
                 stop = ('missing' if target is None else 'cycle' if cycle else
-                        'already_expanded' if (target, pure_history) in scheduled else
+                        'already_expanded' if (self._node(target), pure_history) in scheduled else
                         'depth_limit' if depth_limit and more else None)
                 # Older revisions can lead to active referrers; filter endpoints, not traversal.
                 if current or stop == 'depth_limit':
                     rows.append(dict(edge=edge, path=path + ([target] if target else []),
                                      historical_only=pure_history, stop=stop, traversal_only=not current))
                 if target and not stop and not depth_limit:
-                    scheduled.add((target, pure_history))
+                    scheduled.add((self._node(target), pure_history))
                     queue.append((target, path + [target], pure_history))
         return rows
 
     def _describe_edge(self, item):
         edge = item['edge']
-        result = {k: v for k, v in edge.items() if k not in ('source', 'target', 'reference')}
+        result = {k: v for k, v in edge.items() if k not in ('source', 'target', 'reference', 'observed_as')}
         result.update(source=self._describe(edge['source']),
                       target=self._describe(edge['target']) if edge['target'] else None,
                       path=[self.resolver.handle(v) for v in item['path']],

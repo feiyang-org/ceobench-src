@@ -165,10 +165,15 @@ def test_derived_file_reports_upstream_query_without_rerunning_script(workspace,
     version = store.version(parent, 'file', '{"n":42}', layer='file_bytes', object_id='derived.json')
     store.version(parent, 'workspace_after', encoded({'derived.json': {'version': version}}), layer='workspace_boundary')
     store.complete(parent, changed_paths=['derived.json'])
-    cite(store, registry, executor, version, select={'path': '/n'}, predicate={'type': 'threshold', 'op': '>', 'value': 40})
+    # The agent reads the derived file itself; that observation shares bytes with the Bash output.
+    send(store, executor.execute('read_file', {'path': 'derived.json'}))
+    call(registry, 'create', **declaration(references=[dict(
+        evidence={'path': 'derived.json'}, purpose='current', select={'path': '/n'},
+        predicate={'type': 'threshold', 'op': '>', 'value': 40})]))
     server.conn.execute('UPDATE ledger SET amount=1')
     server.conn.commit()
-    rows = forward(executor, 'r1', include_execution=True, depth=4)['items']
+    # Default arguments: current-purpose tracing reruns the derived file's upstream SQL.
+    rows = forward(executor, 'r1')['items']
     assert rows[0]['check']['predicate_result'] == 'holds' and rows[0]['check']['version_changed'] is False
     sql_rows = [row for row in rows if row['target'].get('sql')]
     assert len(sql_rows) == 1 and sql_rows[0]['check']['notice'] == 'version_changed'

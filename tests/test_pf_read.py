@@ -102,9 +102,13 @@ def test_trajectory_reconstructs_and_accounts_actual_replays(workspace, tmp_path
     paired = {delta2.pf_read['id'], full_again.pf_read['id']}
     expected = sum(item['full_tokens'] - item['actual_tokens']
                    for ledger in ledgers for item in ledger if item['read_id'] not in paired)
-    expected -= sum(item['actual_tokens'] for ledger in ledgers for item in ledger if item['materialization'])
+    # Every occurrence of the recovered full text is extra input; materialization is not.
+    expected -= sum(item['actual_tokens'] for ledger in ledgers for item in ledger
+                    if item['read_id'] == full_again.pf_read['id'])
     summary = accounting(store)
     assert summary['net_saved_tokens'] == expected
+    assert summary['materialized_full_tokens'] == sum(
+        item['actual_tokens'] for ledger in ledgers for item in ledger if item['materialization']) > 0
     assert summary['recovery_pairs'] == 1 and summary['occurrences'] == sum(map(len, ledgers))
     assert summary['read_modes'] == {'FULL': 3, 'UNCHANGED': 1, 'DELTA': 2}
     for event in (e1, e2, e3, e4, e5, e6, e7):
@@ -140,9 +144,29 @@ def test_adjacent_recovery_once_and_explicit_full_always(workspace, tmp_path):
     assert ledger[-1]['mode'] == 'UNCHANGED'
     again = read(executor, target={'path': 'facts.txt'}, full=True)[2]
     _, ledger = deliver(store, [full, compact, recovery, repeat, again])
-    assert ledger[-1]['reason'] == 'requested_full'
-    assert accounting(store)['net_saved_tokens'] == 0
+    assert ledger[-1]['reason'] == 'requested_full' and ledger[-1]['recovery_of'] == repeat.pf_read['id']
+    # Both compact reads are zeroed and both recovered full texts are extra input.
+    summary = accounting(store)
+    assert summary['recovery_pairs'] == 2 and summary['known_conservative_saved_tokens'] == 0
+    assert summary['net_saved_tokens'] == -summary['known_recovery_replay_tokens'] < 0
 
+
+
+def test_explicit_full_pairs_only_with_the_immediately_preceding_compact_read(workspace, tmp_path):
+    store, _, executor = captured(workspace, tmp_path)
+    full = captured_file(executor, sample())
+    deliver(store, [full])
+    compact = read(executor, target={'path': 'facts.txt'})[2]
+    _, ledger = deliver(store, [full, compact])
+    assert ledger[-1]['mode'] == 'UNCHANGED'
+    # Another request separates the compact read from the explicit full request.
+    deliver(store, [full, compact])
+    late = read(executor, target={'path': 'facts.txt'}, full=True)[2]
+    _, ledger = deliver(store, [full, compact, late])
+    assert ledger[-1]['mode'] == 'FULL' and ledger[-1]['reason'] == 'requested_full'
+    assert ledger[-1]['recovery_of'] is None
+    summary = accounting(store)
+    assert summary['recovery_pairs'] == 0 and summary['known_conservative_saved_tokens'] > 0
 
 def test_missing_base_diff_failed_delivery_and_truncation(workspace, tmp_path):
     store, registry, executor = captured(workspace, tmp_path)
@@ -180,11 +204,22 @@ def test_fallback_costs_verification_and_negative_net(workspace, tmp_path, monke
     compact = read(executor, target={'path': 'facts.txt'})[2]
     _, first = deliver(store, [full, compact])
     assert first[-1]['mode'] == 'UNCHANGED'
-    # Replayed full materializations can outweigh all earlier compact savings.
+    saved = first[-1]['full_tokens'] - first[-1]['actual_tokens']
+    # A materialized replay already costs the counterfactual full text: zero, not negative.
     for _ in range(3):
         _, ledger = deliver(store, [compact])
-        assert ledger[0]['materialization']
-    assert accounting(store)['net_saved_tokens'] < 0
+        assert ledger[0]['materialization'] and ledger[0]['actual_tokens'] == ledger[0]['full_tokens']
+    assert accounting(store)['net_saved_tokens'] == saved
+    # Replays of a recovered full text are deducted and can outweigh earlier savings.
+    deliver(store, [full], context='recovery')
+    zeroed = read(executor, target={'path': 'facts.txt'})[2]
+    deliver(store, [full, zeroed], context='recovery')
+    recovered = read(executor, target={'path': 'facts.txt'})[2]
+    replays = [deliver(store, [full, zeroed, recovered], context='recovery')[1] for _ in range(4)]
+    assert replays[0][-1]['reason'] == 'adjacent_recovery'
+    summary = accounting(store)
+    assert summary['known_recovery_replay_tokens'] == sum(r[-1]['actual_tokens'] for r in replays)
+    assert summary['net_saved_tokens'] == saved - summary['known_recovery_replay_tokens'] < 0
     small = captured_file(executor, 'x', path='small.txt')
     smaller = read(executor, target={'path': 'small.txt'})[2]
     _, ledger = deliver(store, [small, smaller])
@@ -316,6 +351,6 @@ def test_agent_snapshot_restore_pruning_and_new_week(workspace, tmp_path):
     second.conversation.append(Message('tool', current, tool_call_id='new-week'))
     second._call_openai()
     assert json.loads(wires[-1]['messages'][-1]['content'].split('\n')[0])['delivery'] == 'FULL'
-    assert accounting(store)['known_materialization_tokens'] > 0
+    assert accounting(store)['materialized_full_tokens'] > 0
     store.assert_healthy()
     client.close()

@@ -9,6 +9,7 @@ import pytest
 
 from saas_bench.agents.bash_agent.agent import BashAgent
 from saas_bench.agents.bash_agent.tools import BashAgentToolExecutor, get_bash_agent_tool_descriptions
+from saas_bench.registration_evidence import HANDLES
 from test_text_registry import captured, declaration, git, send, workspace
 from test_public_sql import server
 from test_preflight_integration import offline_runner, packed_public, advance
@@ -228,7 +229,7 @@ def test_prefix_lifecycle_is_byte_identical_to_git(workspace, tmp_path, monkeypa
     for forbidden in ('delivered_in', 'version_id', 'git_content_matches', head):
         assert forbidden not in prefix.path.read_text()
         assert forbidden not in json.dumps(outputs)
-    assert not store.load_state('registration_handles:' + store.identity['branch_id'])
+    assert not store.load_state(HANDLES)
     # Once created, common list must not consult the evidence resolver at all.
     monkeypatch.setattr(prefix.resolver, 'resolve', lambda *a: pytest.fail('list resolved dependencies'))
     assert prefix.execute('list', {}) == control.execute('list', {})
